@@ -18,6 +18,34 @@ import triton.language as tl
 from triton.runtime.jit import TensorWrapper, reinterpret
 from triton.language.extra import libdevice
 
+from triton._internal_testing import (
+    integral_dtypes,
+    int_dtypes,
+    str_to_triton_dtype,
+    uint_dtypes,
+    float_dtypes,
+    float_dtypes_with_bfloat16,
+    dtypes,
+    dtypes_with_bfloat16,
+    is_cuda,
+    is_interpreter,
+    is_hopper,
+    is_hip,
+    is_hip_cdna,
+    is_hip_mi200,
+    is_hip_mi300,
+    is_hip_mi350,
+    is_xpu,
+    get_arch,
+    is_cpu,
+    torch_float8_dtypes,
+    torch_dtypes,
+    numpy_random,
+    to_triton,
+    torch_dtype_name,
+    to_numpy,
+)
+from triton.runtime.errors import InterpreterError
 
 def is_interpreter():
     return os.environ.get('TRITON_INTERPRET', '0') == '1'
@@ -1606,6 +1634,12 @@ def test_cast(dtype_x, dtype_z, bitcast, size, num_ctas, device):
 
     if is_hip() and (dtype_z in ("bfloat16", "float8_e4m3fn") or dtype_x == "float8_e4m3fn"):
         pytest.skip(f'test_cast{(dtype_x, dtype_z)} cast to bfloat16 not supported on HIP.')
+
+    # bf16 vector cast is broken in LLVM for large vectors:
+    #   https://github.com/llvm/llvm-project/issues/92471
+    # TODO: Remove the change after the bug is fixed.
+    if is_cpu() and dtype_x == 'bfloat16' and size > 128:
+        size = 128
 
     torch.manual_seed(0)
     # This is tricky because numpy doesn't have bfloat, and torch doesn't have uints.
