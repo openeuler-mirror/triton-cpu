@@ -1413,6 +1413,7 @@ def test_noinline(mode, device):
 # ---------------
 # test atomics
 # ---------------
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize(
     "op, dtype_x_str, mode, sem",
@@ -1493,6 +1494,7 @@ def test_atomic_rmw(op, dtype_x_str, mode, sem, device):
     assert f"atom.global.gpu.{sem_str}" in h.asm["ptx"]
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_atomic_rmw_predicate(num_ctas, device):
@@ -1508,6 +1510,7 @@ def test_atomic_rmw_predicate(num_ctas, device):
     assert x.item() == 63
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("shape, axis, num_ctas, dtype_x_str",
                          [(shape, axis, num_ctas, dtype_x_str)
@@ -1549,6 +1552,7 @@ def test_tensor_atomic_rmw(shape, axis, num_ctas, dtype_x_str, device):
     np.testing.assert_equal(old_ref, to_numpy(old_tri))
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_tensor_atomic_rmw_block(num_ctas, device):
@@ -1568,6 +1572,7 @@ def test_tensor_atomic_rmw_block(num_ctas, device):
     assert torch.min(x).item() == 0.0
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("sem", [None, 'acquire', 'release', 'acq_rel', 'relaxed'])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
@@ -1605,6 +1610,7 @@ def test_atomic_cas(sem, num_ctas, device):
     assert f"atom.global.{sem_str}" in h.asm["ptx"]
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("sem", [None, 'acquire', 'release', 'acq_rel', 'relaxed'])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
