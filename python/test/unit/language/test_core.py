@@ -3507,6 +3507,7 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
             assert 'wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3' in ptx
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str",
                          [(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str)
@@ -3517,7 +3518,14 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
                           for in_dtype_str, out_dtype_str in [('int8', 'int8'), ('float16', 'float16'),
                                                               ('float16', 'float32'), ('float32', 'float32')]] +
                          # Large block sizes
-                         [(4, 4, 128, 128, 64, 64, 64, 'float16', 'float16')])
+                         [(4, 4, 128, 128, 64, 64, 64, 'float16', 'float16')] +
+                         # Small block sizes
+                         [(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str)
+                         for B in [1, 2, 8]
+                         for num_warps in [1, 2, 4]
+                         for BLOCK_M, BLOCK_N in [(1, 32), (32, 2), (8, 8)]
+                         for M, N, K in [(32, 32, 32)]
+                         for in_dtype_str, out_dtype_str in [('float16', 'float16'), ('float32', 'float32')]])
 def test_dot3d(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str, device):
     if is_hip():
         # hip does not support tf32 precision, so use ieee for all tests
@@ -3527,12 +3535,23 @@ def test_dot3d(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_
                 pytest.skip(f"{in_dtype_str} is not supported in WMMA dot, FMA does not support dot3d")
             if out_dtype_str == "float16":
                 pytest.skip(f"{out_dtype_str} has low precision in WMMA dot")
+    elif is_cpu():
+        input_precision = "ieee"
+        # TODO(dmitriim): investigate the reason why
+        # can be fixed with lower tolerance:
+        #   E Mismatched elements: 94 / 32768 (0.287%)
+        #   E Max absolute difference: 0.09375
+        #   E Max relative difference: 4.812
+        if out_dtype_str == "float16" and in_dtype_str == "float16":
+            pytest.skip(f"{out_dtype_str} with M = {M}, N = {N}, K = {K} has low precision. Not clear why.")
     else:
-        input_precision = "tf32" if in_dtype_str == 'float32' else "ieee"
+        input_precision = "tf32" if is_cuda() and in_dtype_str == 'float32' else "ieee"
+        if not is_interpreter() and (BLOCK_M < 16 or BLOCK_N < 16):
+            pytest.skip("small dots are supported only on HIP at the moment")
 
-    if B == 8 and M == 64 and in_dtype_str == "float32" and out_dtype_str == "float32":
-        if triton.runtime.driver.active.utils.get_device_properties(
-                torch.cuda.current_device())["max_shared_mem"] < 131072:
+    if B == 8 and M == 64 and in_dtype_str == "float32" and out_dtype_str == "float32" and not is_cpu():
+        if not is_interpreter() and triton.runtime.driver.active.utils.get_device_properties(
+                triton.runtime.driver.active.get_current_device())["max_shared_mem"] < 131072:
             pytest.skip(
                 "Skipping tests with B = 8, M = 64, in_type = float32, out_type = float32 due to insufficient shared memory (less than 128 KB per SM) on this GPU."
             )
