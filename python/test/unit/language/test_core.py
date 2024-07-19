@@ -311,6 +311,16 @@ def test_empty_kernel(dtype_x, device):
     kernel[(1, )](x, SIZE=SIZE, num_warps=4)
 
 
+@pytest.mark.cpu
+def test_empty_kernel_scalar_arg(device):
+
+    @triton.jit
+    def kernel(x):
+        pass
+
+    kernel[(1, )](2)
+
+
 # generic test functions
 def _test_unary(dtype_x, expr, numpy_expr=None, device='cuda', num_ctas=1):
     check_type_supported(dtype_x, device)  # early return if dtype_x is not supported
