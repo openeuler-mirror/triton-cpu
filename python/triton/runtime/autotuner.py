@@ -125,10 +125,11 @@ class Autotuner(KernelInterface):
             self.post_hook(args, exception=None)
 
         try:
-            if self.use_cuda_graph:
-                return do_bench_cudagraph(kernel_call, rep=self.num_reps, quantiles=(0.5, 0.2, 0.8))
-            return do_bench(kernel_call, warmup=self.num_warmups, rep=self.num_reps, quantiles=(0.5, 0.2, 0.8))
-        except (OutOfResources, CompileTimeAssertionFailure):
+            device = driver.active.get_current_target().backend
+            return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8), device_type=device)
+        except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
+            if verbose:
+                print(f"Autotuning failed with {e}")
             return [float("inf"), float("inf"), float("inf")]
 
     def run(self, *args, **kwargs):
