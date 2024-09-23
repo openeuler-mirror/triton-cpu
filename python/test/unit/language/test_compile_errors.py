@@ -4,6 +4,16 @@ import triton
 import triton.language as tl
 from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
 import traceback
+from triton._internal_testing import is_interpreter, is_cuda, is_hip, is_hip_mi300, is_hip_mi350
+
+
+def format_exception(type, value, tb):
+    list_msg = traceback.format_exception(type, value, tb, chain=False)
+    return "\n".join(list_msg)
+
+
+def is_cpu():
+    return not is_interpreter() and triton.runtime.driver.active.get_current_target().backend == "cpu"
 
 
 def test_err_undefined_variable():
