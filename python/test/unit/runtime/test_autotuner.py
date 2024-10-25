@@ -4,12 +4,19 @@ import triton
 import triton.language as tl
 import pytest
 
+from triton._internal_testing import is_cuda
+
 
 @pytest.mark.parametrize('use_cuda_graph', [False, True])
 def test_kwargs(use_cuda_graph: bool, device: str):
-    N = 1024
-    src = torch.randn(N, device=device)
-    dst = torch.empty(N, device=device)
+
+    if not is_cuda() and use_cuda_graph:
+        pytest.xfail("CUDA is not available")
+        pytest.skip("Use cuda graph without cuda looks strange")
+
+    M, N = 1024, 16
+    src = torch.randn(M * N, device=device)
+    dst = torch.empty(M * N, device=device)
 
     configs = [triton.Config(kwargs={'BLOCK_SIZE': 32}), triton.Config(kwargs={'BLOCK_SIZE': 128})]
 
