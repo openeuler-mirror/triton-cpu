@@ -8,10 +8,8 @@ import pytest
 import triton
 import triton.language as tl
 
-from triton._internal_testing import is_cuda, is_hip, is_mi_300
+from triton._internal_testing import is_cuda, is_hip, is_mi_300, is_cpu
 
-def is_cpu():
-    return not is_interpreter() and triton.runtime.driver.active.get_current_target().backend == "cpu"
 
 def matching_int(dtype):
     if dtype.primitive_bitwidth == 8:
