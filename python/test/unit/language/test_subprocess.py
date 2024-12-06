@@ -6,8 +6,6 @@ from collections import Counter
 
 import pytest
 
-import triton
-
 dir_path = os.path.dirname(os.path.realpath(__file__))
 print_path = os.path.join(dir_path, "print_helper.py")
 assert_path = os.path.join(dir_path, "assert_helper.py")
