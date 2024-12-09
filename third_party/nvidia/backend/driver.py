@@ -379,7 +379,19 @@ class CudaDriver(GPUDriver):
         warp_size = 32
         return GPUTarget("cuda", capability, warp_size)
 
+    def get_active_torch_device(self):
+        import torch
+        return torch.device("cuda", self.get_current_device())
+
+    def get_device_interface(self):
+        import torch
+        return torch.cuda
+
     @staticmethod
     def is_active():
         import torch
         return torch.cuda.is_available() and (torch.version.hip is None)
+
+    def get_benchmarker(self):
+        from triton.testing import do_bench
+        return do_bench

@@ -440,3 +440,19 @@ class HIPDriver(GPUDriver):
         arch = device_properties['arch']
         warp_size = device_properties['warpSize']
         return GPUTarget("hip", arch.split(':')[0], warp_size)
+
+    def get_active_torch_device(self):
+        import torch
+        # when using hip devices, the device string in pytorch is "cuda"
+        return torch.device("cuda", self.get_current_device())
+
+    def get_benchmarker(self):
+        from triton.testing import do_bench
+        return do_bench
+
+    def get_empty_cache_for_benchmark(self):
+        import torch
+
+        # It's the same as the Nvidia backend.
+        cache_size = 256 * 1024 * 1024
+        return torch.empty(int(cache_size // 4), dtype=torch.int, device='cuda')

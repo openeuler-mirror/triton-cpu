@@ -42,6 +42,8 @@ try:
 except ModuleNotFoundError:
     HAS_APEX = False
 
+DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
 
 @triton.jit
 def _layer_norm_fwd_fused(
@@ -293,7 +295,7 @@ device = triton.runtime.driver.active.get_current_target().backend
 dtype = torch.float32 if device == 'cpu' else torch.float16
 
 
-def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
+def test_layer_norm(M, N, dtype, eps=1e-5, device=DEVICE):
     # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
@@ -331,7 +333,7 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
         plot_name='layer-norm-backward',
         args={'M': 4096, 'dtype': dtype, 'mode': 'backward'},
     ))
-def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda'):
+def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device=DEVICE):
     # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
