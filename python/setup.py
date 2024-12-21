@@ -714,7 +714,7 @@ setup(
             "numpy<2.0.0",
             "pytest",
             "scipy>=1.7.1",
-            "llnl-hatchet",
+            # "llnl-hatchet", # TODO: Re-enable this, not available on macos-arm64
         ],
         "tutorials": [
             "matplotlib",
