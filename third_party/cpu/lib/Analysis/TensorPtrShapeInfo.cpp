@@ -92,7 +92,7 @@ private:
   void
   setToEntryState(dataflow::Lattice<TensorPtrShapeInfo> *lattice) override {
     propagateIfChanged(
-        lattice, lattice->join(getPessimisticValueState(lattice->getAnchor())));
+        lattice, lattice->join(getPessimisticValueState(lattice->getPoint())));
   }
 
 public:
@@ -101,7 +101,7 @@ public:
       dataflow::Lattice<TensorPtrShapeInfo>>::getLatticeElement;
   using FuncShapeInfoMapT = DenseMap<FunctionOpInterface, TensorPtrShapeInfo>;
 
-  LogicalResult visitOperation(
+  void visitOperation(
       Operation *op,
       ArrayRef<const dataflow::Lattice<TensorPtrShapeInfo> *> operands,
       ArrayRef<dataflow::Lattice<TensorPtrShapeInfo> *> results) override;
@@ -125,7 +125,7 @@ SmallVector<int64_t> copyConstOrDynamic(OperandRange ops) {
   return res;
 }
 
-LogicalResult ShapeInfoAnalysis::visitOperation(
+void ShapeInfoAnalysis::visitOperation(
     Operation *op,
     ArrayRef<const dataflow::Lattice<TensorPtrShapeInfo> *> operands,
     ArrayRef<dataflow::Lattice<TensorPtrShapeInfo> *> results) {
@@ -151,7 +151,7 @@ LogicalResult ShapeInfoAnalysis::visitOperation(
   for (auto *result : results)
     propagateIfChanged(result, result->join(res));
 
-  return success();
+  return;
 }
 
 } // namespace
