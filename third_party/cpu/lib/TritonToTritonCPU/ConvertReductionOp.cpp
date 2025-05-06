@@ -92,8 +92,9 @@ struct ReduceOpConversion : public OpConversionPattern<triton::ReduceOp> {
     Type resTy = getTypeConverter()->convertType(op.getType(0));
     Value acc = buildInitValue(op.getLoc(), resTy, reductionKind, rewriter);
     int64_t axis = op.getAxis();
+    ArrayAttr axisAttr = rewriter.getI64ArrayAttr(axis);
     rewriter.replaceOpWithNewOp<vector::MultiDimReductionOp>(
-        op, resTy, reductionKind, src, acc, axis);
+        op, resTy, reductionKind, src, acc, axisAttr);
     return success();
   }
 
