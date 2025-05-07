@@ -23,9 +23,9 @@ import torch
 import triton
 import triton.language as tl
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
+DEVICE = triton.runtime.driver.active.get_active_torch_device().type
 GPU_BLOCK_SIZE = 1024
-CPU_BLOCK_SIZE = 4096
+CPU_BLOCK_SIZE = 128
 # Single Thread Threshold
 CPU_ST_THRESHOLD = 65536
 USE_GPU = False
@@ -121,7 +121,7 @@ def add(x: torch.Tensor, y: torch.Tensor, output: torch.Tensor, device):
     if output is None:
         # We need to preallocate the output.
         output = torch.empty_like(x)
-    assert x.device == DEVICE and y.device == DEVICE and output.device == DEVICE
+    assert x.device.type == DEVICE and y.device.type == DEVICE and output.device.type == DEVICE
     n_elements = output.numel()
     # The SPMD launch grid denotes the number of kernel instances that run in parallel.
     # It is analogous to CUDA launch grids. It can be either Tuple[int], or Callable(metaparameters) -> Tuple[int].
