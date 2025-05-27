@@ -2,6 +2,7 @@
 # Import order is significant here.
 
 from . import math
+from . import sme_matrix
 from . import extra
 from .standard import (
     argmax,
@@ -117,6 +118,7 @@ from .random import (
     randn4x,
     uint_to_uniform_float,
 )
+from .sme_matrix import (smeadd, smematmul, smesub, smetranspose)
 
 __all__ = [
     "PropagateNan",
@@ -221,6 +223,10 @@ __all__ = [
     "rsqrt",
     "sigmoid",
     "sin",
+    "smeadd",
+    "smematmul",
+    "smesub",
+    "smetranspose",
     "softmax",
     "sort",
     "split",

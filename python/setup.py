@@ -613,6 +613,25 @@ package_data = {
         (b.language_package_data for b in backends), [])
 }
 
+def find_file(filename, search_path):
+    from pathlib import Path
+    search_path = Path(search_path)
+    for filepath in search_path.rglob(filename):
+        return filepath
+    return None
+
+def copy_sme_matrix():
+    llvm_lib = os.getenv("LLVM_LIBRARY_DIR")
+    if llvm_lib is not None:
+        sme_matrix_path = find_file("libsme_matrix.so", llvm_lib)
+        if sme_matrix_path is not None:
+            shutil.copy(sme_matrix_path, os.path.join(os.path.dirname(__file__), "triton", "_C"))
+
+copy_sme_matrix()
+if (os.path.exists(os.path.join(os.path.dirname(__file__), "triton", "_C", "libsme_matrix.so"))):
+    package_data.update({
+        "triton/_C": ["libsme_matrix.so"]
+    })
 
 def get_language_extra_packages():
     packages = []
