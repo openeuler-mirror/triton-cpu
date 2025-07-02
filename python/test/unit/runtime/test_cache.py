@@ -424,7 +424,7 @@ def test_jit_warmup_cache(device) -> None:
     assert len(kernel_add.cache[device]) == 1
 
 
-def test_jit_debug() -> None:
+def test_jit_debug(device) -> None:
 
     @triton.jit
     def kernel_add(a, b, o, N: tl.constexpr):
