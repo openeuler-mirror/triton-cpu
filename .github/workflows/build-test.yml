@@ -26,7 +26,7 @@ jobs:
           echo INSTALL_IPEX=${{ env.INSTALL_IPEX }}
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Python 3.11
         uses: actions/setup-python@v5
@@ -55,7 +55,7 @@ jobs:
           - {runner: 'MacOS-latest ARM64', runs_on: ['macos-latest'], target-os: 'macos',  arch: 'arm64'}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
