@@ -5,6 +5,8 @@ from ..backends import DriverBase
 
 
 def _create_driver():
+    if os.environ.get("TRITON_USE_SHARED_BACKEND", "0") == "1":
+            return backends["triton_shared"].driver()
     if os.getenv("TRITON_CPU_BACKEND", "0") == "1":
         if "cpu" not in backends:
             raise RuntimeError("TRITON_CPU_BACKEND is set, but CPU backend is unavailable.")
@@ -69,7 +71,11 @@ class DriverConfig:
     def set_active_to_cpu(self):
         if "cpu" not in backends:
             raise RuntimeError("CPU backend is unavailable")
-        self.active = backends["cpu"].driver()
+
+        if os.environ.get("TRITON_USE_SHARED_BACKEND", "0") == "1":
+            self.active = backends["triton_shared"].driver()
+        else: 
+            self.active = backends["cpu"].driver()
 
     def set_active_to_gpu(self):
         active_gpus = [(name, backend.driver)

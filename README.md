@@ -24,7 +24,7 @@ git clone https://gitee.com/openeuler/llvm-project.git -b dev_19.1.7
 cd llvm-project
 mkdir build
 cd build
-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON ../llvm -DLLVM_ENABLE_PROJECTS="clang;mlir;llvm;lld" -DLLVM_TARGETS_TO_BUILD="host;NVPTX;AMDGPU"
+cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON ../llvm -DLLVM_ENABLE_PROJECTS="clang;mlir;llvm;lld" -DLLVM_TARGETS_TO_BUILD="host;NVPTX;AMDGPU" -DMLIR_ENABLE_BINDINGS_PYTHON=ON -DPython3_EXECUTABLE=$(which python) -DLLVM_ENABLE_RTTI=ON
 ninja
 ```
 3. Build openEuler Triton-CPU
@@ -39,6 +39,7 @@ export LLVM_LIBRARY_DIR=$LLVM_BUILD_DIR/lib
 export LLVM_SYSPATH=$LLVM_BUILD_DIR
 export PATH=$LLVM_BUILD_DIR/bin:$PATH
 export TRITON_BUILD_WITH_CLANG_LLD=true
+export TRITON_PLUGIN_DIRS=$(pwd)/triton-shared
 pip install -e python
 ```
 

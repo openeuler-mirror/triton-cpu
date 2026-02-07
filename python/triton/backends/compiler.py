@@ -8,6 +8,12 @@ from typing import Dict, Union
 from types import ModuleType
 
 
+## Define CPUFallbackException for handling CPU fallback scenarios
+class CPUFallbackException(Exception):
+    """Exception raised when a CPU fallback is required."""
+    pass
+
+
 @dataclass(frozen=True)
 class GPUTarget(object):
     # Target backend, e.g., cuda, hip

@@ -3,11 +3,12 @@ import hashlib
 import json
 from .._C.libtriton import get_cache_invalidating_env_vars, ir
 from ..backends import backends
-from ..backends.compiler import GPUTarget
+from ..backends.compiler import  GPUTarget, CPUFallbackException
 from .. import __version__
 from ..runtime.autotuner import OutOfResources
 from ..runtime.cache import get_cache_manager, get_dump_manager, get_override_manager
 from ..runtime.driver import driver
+
 # TODO: this shouldn't be here
 from dataclasses import dataclass
 from .code_generator import ast_to_ttir
@@ -225,6 +226,10 @@ def filter_traceback(e: BaseException):
 
 
 def compile(src, target=None, options=None):
+    old_src = src
+    old_options = options
+    if not hasattr(compile, '_fallback_attempted'):
+        compile._fallback_attempted = False
     if target is None:
         target = driver.active.get_current_target()
     assert isinstance(target, GPUTarget), "target must be of GPUTarget type"
@@ -286,7 +291,14 @@ def compile(src, target=None, options=None):
         raise
     use_ir_loc = os.environ.get("USE_IR_LOC", None)
     for ext, compile_ir in list(stages.items())[first_stage:]:
-        next_module = compile_ir(module, metadata)
+        try:
+            next_module = compile_ir(module, metadata)
+        except CPUFallbackException as e:
+            if not compile._fallback_attempted:
+                compile._fallback_attempted = True
+                driver.set_active_to_cpu()
+                return compile(old_src, GPUTarget("cpu", "cpu", 1), old_options)
+            raise RuntimeError(f"CPU backend fallback failed: {e}")
         ir_filename = f"{file_name}.{ext}"
         if (fn_override_manager is not None and fn_override_manager.has_file(ir_filename)):
             print(f"\nOverriding kernel with file {ir_filename}")
@@ -315,6 +327,13 @@ def compile(src, target=None, options=None):
 
 
 def make_backend(target):
+    # Handle CPU backend selection
+    if target.backend == "cpu":
+        if os.environ.get("TRITON_USE_SHARED_BACKEND", "0") == "1":
+            return backends["triton_shared"].compiler(target)
+        return backends["cpu"].compiler(target)
+    
+    print(f"Target: {target}")
     actives = [x.compiler for x in backends.values() if x.compiler.supports_target(target)]
     if len(actives) != 1:
         raise RuntimeError(

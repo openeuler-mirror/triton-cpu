@@ -166,8 +166,59 @@ if(TRITON_BUILD_PYTHON_MODULE)
     add_subdirectory(third_party/proton)
   endif()
 
+  get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
+  get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
+  get_property(extension_libs GLOBAL PROPERTY MLIR_EXTENSION_LIBS)
   get_property(triton_libs GLOBAL PROPERTY TRITON_LIBS)
   get_property(triton_plugins GLOBAL PROPERTY TRITON_PLUGINS)
+
+  set(test_libs
+    ${cuda_test_libs}
+    MLIRTestFuncToLLVM
+    MLIRAffineTransformsTestPasses
+    MLIRArithTestPasses
+    MLIRArmNeonTestPasses
+    MLIRArmSMETestPasses
+    MLIRBufferizationTestPasses
+    MLIRControlFlowTestPasses
+    MLIRDLTITestPasses
+    MLIRFuncTestPasses
+    MLIRGPUTestPasses
+    MLIRLinalgTestPasses
+    MLIRLoopLikeInterfaceTestPasses
+    MLIRMathTestPasses
+    MLIRTestMathToVCIX
+    MLIRMemRefTestPasses
+    MLIRMeshTest
+    MLIRNVGPUTestPasses
+    MLIRSCFTestPasses
+    MLIRShapeTestPasses
+    MLIRSPIRVTestPasses
+    MLIRTensorTestPasses
+    MLIRTestAnalysis
+    MLIRTestConvertToSPIRV
+    MLIRTestDialect
+    MLIRTestDynDialect
+    MLIRTestIR
+    MLIRTestOneToNTypeConversionPass
+    MLIRTestPass
+    MLIRTestReducer
+    MLIRTestTransforms
+    MLIRTilingInterfaceTestPasses
+    MLIRVectorTestPasses
+    MLIRTestVectorToSPIRV
+    MLIRLLVMTestPasses
+    )
+  set(test_libs ${test_libs}
+    MLIRTestPDLL
+    MLIRTestTransformDialect
+    )
+
+  set(test_libs ${test_libs}
+      MLIRTestPDLL
+      MLIRTestRewrite
+      )
+
   set(TRITON_LIBRARIES
     ${triton_libs}
     ${triton_plugins}
@@ -193,6 +244,17 @@ if(TRITON_BUILD_PYTHON_MODULE)
     MLIRSCFToControlFlow
     MLIRIndexToLLVM
     MLIRGPUToROCDLTransforms
+    ${dialect_libs}
+    ${conversion_libs}
+    ${extension_libs}
+    ${test_libs}
+
+    # Triton
+    TritonAnalysis
+    TritonTransforms
+    TritonGPUTransforms
+    TritonSharedAnalysis
+    TritonStructuredIR
 
     # LLVM
     LLVMPasses
