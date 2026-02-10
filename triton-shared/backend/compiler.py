@@ -90,6 +90,43 @@ class CPUBackend(BaseBackend):
         super().__init__(target)
         self.cpu_features = llvm.get_cpu_features()
         self.cpu_arch = llvm.get_cpu_tripple().split("-")[0]
+        # Only detect vscale on aarch64 with SVE; None means SVE unused
+        if self.cpu_arch == "aarch64" and "sve" in self.cpu_features:
+            self.sve_vscale = self._detect_sve_vscale()
+        else:
+            self.sve_vscale = None
+
+    def _detect_sve_vscale(self):
+        """Detect the SVE vector scale factor from hardware.
+
+        vscale = SVE_vector_length_in_bytes / 16.
+        Returns 1 for 128-bit SVE, 2 for 256-bit, etc.
+
+        Must only be called on aarch64 with SVE support.
+        Raises RuntimeError if detection fails — a silent fallback
+        would hide configuration errors that crash at runtime."""
+        try:
+            import ctypes
+            import tempfile
+            import subprocess
+            # Use a small C program to read RDVL
+            with tempfile.TemporaryDirectory() as tmpdir:
+                src = os.path.join(tmpdir, "rdvl.c")
+                exe = os.path.join(tmpdir, "rdvl")
+                Path(src).write_text(
+                    '#include <stdio.h>\n#include <stdint.h>\n'
+                    'int main(){uint64_t v;asm volatile("rdvl %0, #1":"=r"(v));'
+                    'printf("%lu",v/16);return 0;}\n'
+                )
+                subprocess.check_call(["gcc", "-march=armv8-a+sve", src, "-o", exe],
+                                       stderr=subprocess.DEVNULL)
+                result = subprocess.check_output([exe]).decode().strip()
+                vscale = int(result)
+                return max(vscale, 1)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to detect SVE vscale via rdvl: {exc}"
+            ) from exc
 
     def parse_options(self, opts) -> Any:
         args = {'arch': self.target.arch}
@@ -358,9 +395,10 @@ class CPUBackend(BaseBackend):
                     interchange=Attribute.parse("[0, 2, 1]"),
                 )
 
+                _tile = 4 * self.sve_vscale
                 tiled2 = structured.TileUsingForOp(
                     tiled1.results[0],
-                    sizes=[8, 8, 1],
+                    sizes=[_tile, _tile, 1],
                     interchange=Attribute.parse("[0, 1, 2]"),
                 )
 
@@ -574,7 +612,7 @@ class CPUBackend(BaseBackend):
 
             with InsertionPoint(sequence.body):
                 result = transform.legalize(
-                    vscale=2,
+                    vscale=self.sve_vscale,
                 )
                 transform.YieldOp([sequence.bodyTarget])
  
@@ -732,7 +770,7 @@ class CPUBackend(BaseBackend):
                     sequence.bodyTarget,
                     enable_arm_sve=True,
                     enable_index_optimizations=True,
-                    vscale_range=2,
+                    vscale_range=self.sve_vscale,
                 )
                 transform.YieldOp([sequence.bodyTarget])
  
