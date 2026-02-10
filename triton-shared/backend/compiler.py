@@ -878,14 +878,10 @@ class CPUBackend(BaseBackend):
                     transform.FailurePropagationMode.Propagate,
                     [sequence.bodyTarget],
                 )
-                    
                 
-                include5 = transform.IncludeOp(
-                    [],
-                    FlatSymbolRefAttr.get("main_type1_pipeline"),
-                    transform.FailurePropagationMode.Propagate,
-                    [sequence.bodyTarget],
-                )
+
+                # NOTE: pipeline_schedule skipped - requires unimplemented
+                # isMicroKernel PDL native constraint
                 
                 include6 = transform.IncludeOp(
                     [],
@@ -941,8 +937,7 @@ class CPUBackend(BaseBackend):
                 main_bufferize()
                 legalize_schedule()
                 main_type1("legalize_schedule", "legalize")
-                pipeline_schedule()
-                main_type1("pipeline_schedule", "pipeline")
+                # pipeline_schedule skipped - isMicroKernel not implemented
                 loops_schedule()
                 opt()
                 main_type2("loops_schedule", "loops")
