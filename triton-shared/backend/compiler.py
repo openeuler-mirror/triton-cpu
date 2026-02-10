@@ -1351,11 +1351,43 @@ class CPUBackend(BaseBackend):
             
             
             if FORCE_SME or FORCE_SVE or (self.cpu_arch == "aarch64" and {"sme", "sve"} & set(self.cpu_features)):
-                triton_shared.to_llir.add_transform_interpreter(pm)
-                triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm)
-                triton_shared.to_llir.add_convert_to_llvm(pm)
-                triton_shared.to_llir.add_canonicalizer(pm)
-                triton_shared.to_llir.add_strip_debug_info(pm)
+                # DEBUG: run passes one at a time and dump IR between each
+                _debug_dump = os.getenv("TRITON_DEBUG_SVE_PASSES", "")
+                if _debug_dump:
+                    _debug_dir = _debug_dump
+                    os.makedirs(_debug_dir, exist_ok=True)
+                    Path(os.path.join(_debug_dir, "00_input.mlir")).write_text(str(mod))
+                    
+                    pm1 = ir.pass_manager(context)
+                    triton_shared.to_llir.add_transform_interpreter(pm1)
+                    pm1.run(mod)
+                    Path(os.path.join(_debug_dir, "01_after_transform_interpreter.mlir")).write_text(str(mod))
+                    
+                    pm2 = ir.pass_manager(context)
+                    triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm2)
+                    pm2.run(mod)
+                    Path(os.path.join(_debug_dir, "02_after_erase_schedule.mlir")).write_text(str(mod))
+                    
+                    pm3 = ir.pass_manager(context)
+                    triton_shared.to_llir.add_convert_to_llvm(pm3)
+                    pm3.run(mod)
+                    Path(os.path.join(_debug_dir, "03_after_convert_to_llvm.mlir")).write_text(str(mod))
+                    
+                    pm4 = ir.pass_manager(context)
+                    triton_shared.to_llir.add_canonicalizer(pm4)
+                    pm4.run(mod)
+                    Path(os.path.join(_debug_dir, "04_after_canonicalize.mlir")).write_text(str(mod))
+                    
+                    pm5 = ir.pass_manager(context)
+                    triton_shared.to_llir.add_strip_debug_info(pm5)
+                    pm5.run(mod)
+                    Path(os.path.join(_debug_dir, "05_after_strip_debug.mlir")).write_text(str(mod))
+                else:
+                    triton_shared.to_llir.add_transform_interpreter(pm)
+                    triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm)
+                    triton_shared.to_llir.add_convert_to_llvm(pm)
+                    triton_shared.to_llir.add_canonicalizer(pm)
+                    triton_shared.to_llir.add_strip_debug_info(pm)
             else:
                 triton_shared.to_llir.add_convert_linalg_to_affine_loops(pm)
                 triton_shared.to_llir.add_empty_tensor_to_alloc_tensor(pm)
