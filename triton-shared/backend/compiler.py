@@ -90,6 +90,43 @@ class CPUBackend(BaseBackend):
         super().__init__(target)
         self.cpu_features = llvm.get_cpu_features()
         self.cpu_arch = llvm.get_cpu_tripple().split("-")[0]
+        # Only detect vscale on aarch64 with SVE; None means SVE unused
+        if self.cpu_arch == "aarch64" and "sve" in self.cpu_features:
+            self.sve_vscale = self._detect_sve_vscale()
+        else:
+            self.sve_vscale = None
+
+    def _detect_sve_vscale(self):
+        """Detect the SVE vector scale factor from hardware.
+
+        vscale = SVE_vector_length_in_bytes / 16.
+        Returns 1 for 128-bit SVE, 2 for 256-bit, etc.
+
+        Must only be called on aarch64 with SVE support.
+        Raises RuntimeError if detection fails — a silent fallback
+        would hide configuration errors that crash at runtime."""
+        try:
+            import ctypes
+            import tempfile
+            import subprocess
+            # Use a small C program to read RDVL
+            with tempfile.TemporaryDirectory() as tmpdir:
+                src = os.path.join(tmpdir, "rdvl.c")
+                exe = os.path.join(tmpdir, "rdvl")
+                Path(src).write_text(
+                    '#include <stdio.h>\n#include <stdint.h>\n'
+                    'int main(){uint64_t v;asm volatile("rdvl %0, #1":"=r"(v));'
+                    'printf("%lu",v/16);return 0;}\n'
+                )
+                subprocess.check_call(["gcc", "-march=armv8-a+sve", src, "-o", exe],
+                                       stderr=subprocess.DEVNULL)
+                result = subprocess.check_output([exe]).decode().strip()
+                vscale = int(result)
+                return max(vscale, 1)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to detect SVE vscale via rdvl: {exc}"
+            ) from exc
 
     def parse_options(self, opts) -> Any:
         args = {'arch': self.target.arch}
@@ -358,9 +395,10 @@ class CPUBackend(BaseBackend):
                     interchange=Attribute.parse("[0, 2, 1]"),
                 )
 
+                _tile = 4 * self.sve_vscale
                 tiled2 = structured.TileUsingForOp(
                     tiled1.results[0],
-                    sizes=[8, 8, 1],
+                    sizes=[_tile, _tile, 1],
                     interchange=Attribute.parse("[0, 1, 2]"),
                 )
 
@@ -574,7 +612,7 @@ class CPUBackend(BaseBackend):
 
             with InsertionPoint(sequence.body):
                 result = transform.legalize(
-                    vscale=2,
+                    vscale=self.sve_vscale,
                 )
                 transform.YieldOp([sequence.bodyTarget])
  
@@ -732,7 +770,7 @@ class CPUBackend(BaseBackend):
                     sequence.bodyTarget,
                     enable_arm_sve=True,
                     enable_index_optimizations=True,
-                    vscale_range=2,
+                    vscale_range=self.sve_vscale,
                 )
                 transform.YieldOp([sequence.bodyTarget])
  
@@ -840,14 +878,10 @@ class CPUBackend(BaseBackend):
                     transform.FailurePropagationMode.Propagate,
                     [sequence.bodyTarget],
                 )
-                    
                 
-                include5 = transform.IncludeOp(
-                    [],
-                    FlatSymbolRefAttr.get("main_type1_pipeline"),
-                    transform.FailurePropagationMode.Propagate,
-                    [sequence.bodyTarget],
-                )
+
+                # NOTE: pipeline_schedule skipped - requires unimplemented
+                # isMicroKernel PDL native constraint
                 
                 include6 = transform.IncludeOp(
                     [],
@@ -903,8 +937,7 @@ class CPUBackend(BaseBackend):
                 main_bufferize()
                 legalize_schedule()
                 main_type1("legalize_schedule", "legalize")
-                pipeline_schedule()
-                main_type1("pipeline_schedule", "pipeline")
+                # pipeline_schedule skipped - isMicroKernel not implemented
                 loops_schedule()
                 opt()
                 main_type2("loops_schedule", "loops")
@@ -1313,11 +1346,43 @@ class CPUBackend(BaseBackend):
             
             
             if FORCE_SME or FORCE_SVE or (self.cpu_arch == "aarch64" and {"sme", "sve"} & set(self.cpu_features)):
-                triton_shared.to_llir.add_transform_interpreter(pm)
-                triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm)
-                triton_shared.to_llir.add_convert_to_llvm(pm)
-                triton_shared.to_llir.add_canonicalizer(pm)
-                triton_shared.to_llir.add_strip_debug_info(pm)
+                # DEBUG: run passes one at a time and dump IR between each
+                _debug_dump = os.getenv("TRITON_DEBUG_SVE_PASSES", "")
+                if _debug_dump:
+                    _debug_dir = _debug_dump
+                    os.makedirs(_debug_dir, exist_ok=True)
+                    Path(os.path.join(_debug_dir, "00_input.mlir")).write_text(str(mod))
+                    
+                    pm1 = ir.pass_manager(context)
+                    triton_shared.to_llir.add_transform_interpreter(pm1)
+                    pm1.run(mod)
+                    Path(os.path.join(_debug_dir, "01_after_transform_interpreter.mlir")).write_text(str(mod))
+                    
+                    pm2 = ir.pass_manager(context)
+                    triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm2)
+                    pm2.run(mod)
+                    Path(os.path.join(_debug_dir, "02_after_erase_schedule.mlir")).write_text(str(mod))
+                    
+                    pm3 = ir.pass_manager(context)
+                    triton_shared.to_llir.add_convert_to_llvm(pm3)
+                    pm3.run(mod)
+                    Path(os.path.join(_debug_dir, "03_after_convert_to_llvm.mlir")).write_text(str(mod))
+                    
+                    pm4 = ir.pass_manager(context)
+                    triton_shared.to_llir.add_canonicalizer(pm4)
+                    pm4.run(mod)
+                    Path(os.path.join(_debug_dir, "04_after_canonicalize.mlir")).write_text(str(mod))
+                    
+                    pm5 = ir.pass_manager(context)
+                    triton_shared.to_llir.add_strip_debug_info(pm5)
+                    pm5.run(mod)
+                    Path(os.path.join(_debug_dir, "05_after_strip_debug.mlir")).write_text(str(mod))
+                else:
+                    triton_shared.to_llir.add_transform_interpreter(pm)
+                    triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm)
+                    triton_shared.to_llir.add_convert_to_llvm(pm)
+                    triton_shared.to_llir.add_canonicalizer(pm)
+                    triton_shared.to_llir.add_strip_debug_info(pm)
             else:
                 triton_shared.to_llir.add_convert_linalg_to_affine_loops(pm)
                 triton_shared.to_llir.add_empty_tensor_to_alloc_tensor(pm)
