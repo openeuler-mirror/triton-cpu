@@ -465,7 +465,17 @@ class CPUBackend(BaseBackend):
                 arg_attrs = [{"transform.consumed": UnitAttr.get()}],
             )
             with InsertionPoint(sequence.body):
-                vec = structured.VectorizeChildrenAndApplyPatternsOp(sequence.bodyTarget, vectorize_padding=True, vectorize_nd_extract=True) 
+                vec = structured.VectorizeChildrenAndApplyPatternsOp(sequence.bodyTarget, vectorize_padding=True, vectorize_nd_extract=True)
+                isInnerReduction = triton_shared.get_cpu_options_from_env().enable_warp_specialization
+                selectedLoweringStrategy = vector.VectorMultiReductionLowering.InnerReduction if isInnerReduction else vector.VectorMultiReductionLowering.InnerParallel
+                # Apply patterns to the target
+                with InsertionPoint(transform.ApplyPatternsOp(vec).patterns):
+                    # Add the lower_multi_reduction pattern
+                    vector.ApplyLowerMultiReductionPatternsOp(
+                        lowering_strategy=selectedLoweringStrategy
+                    )
+
+                # The transform modifies the IR in-place, so we yield the original handle to the modified IR
                 transform.YieldOp([vec])
 
         def bufferize_schedule():
