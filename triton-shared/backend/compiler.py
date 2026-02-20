@@ -1378,6 +1378,8 @@ class CPUBackend(BaseBackend):
                     Path(os.path.join(_debug_dir, "02_after_erase_schedule.mlir")).write_text(str(mod))
                     
                     pm3 = ir.pass_manager(context)
+                    triton_shared.to_llir.add_convert_math_to_libm(pm3)
+                    triton_shared.to_llir.add_convert_vector_to_llvm(pm3)
                     triton_shared.to_llir.add_convert_to_llvm(pm3)
                     pm3.run(mod)
                     Path(os.path.join(_debug_dir, "03_after_convert_to_llvm.mlir")).write_text(str(mod))
@@ -1394,6 +1396,8 @@ class CPUBackend(BaseBackend):
                 else:
                     triton_shared.to_llir.add_transform_interpreter(pm)
                     triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm)
+                    triton_shared.to_llir.add_convert_math_to_libm(pm)
+                    triton_shared.to_llir.add_convert_vector_to_llvm(pm)
                     triton_shared.to_llir.add_convert_to_llvm(pm)
                     triton_shared.to_llir.add_canonicalizer(pm)
                     triton_shared.to_llir.add_strip_debug_info(pm)
@@ -1405,6 +1409,8 @@ class CPUBackend(BaseBackend):
                 triton_shared.to_llir.add_convert_linalg_to_loops(pm)
                 triton_shared.to_llir.add_expand_strided_metadata(pm)
                 triton_shared.to_llir.add_convert_scf_to_cf(pm)
+                triton_shared.to_llir.add_convert_math_to_libm(pm)
+                triton_shared.to_llir.add_convert_vector_to_llvm(pm)
                 triton_shared.to_llir.add_convert_to_llvm(pm)
                 triton_shared.to_llir.add_strip_debug_info(pm)
 

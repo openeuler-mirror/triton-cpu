@@ -9,6 +9,7 @@
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/MathToLibm/MathToLibm.h"
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
@@ -446,6 +447,7 @@ void init_to_llvm(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_convert_arith_to_llvm",
                      createArithToLLVMConversionPass);
   ADD_PASS_WRAPPER_0("add_convert_math_to_llvm", createConvertMathToLLVMPass);
+  ADD_PASS_WRAPPER_0("add_convert_math_to_libm", createConvertMathToLibmPass);
   ADD_PASS_WRAPPER_0("add_convert_complex_to_llvm",
                      createConvertComplexToLLVMPass);
   ADD_PASS_WRAPPER_0("add_convert_vector_to_llvm",
