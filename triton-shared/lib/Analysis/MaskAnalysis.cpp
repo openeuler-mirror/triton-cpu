@@ -219,19 +219,27 @@ LogicalResult MaskState::addStates(const MaskState &lhsState,
 LogicalResult MaskState::minStateScalar(const MaskState &lhsState,
                                         const MaskState &rhsState, Location loc,
                                         OpBuilder &builder) {
+  // When one side is scalar (a boolean splatted from tt.splat), its
+  // value is either true (non-zero) or false (zero).  Instead of
+  // taking the min of the scalar dim with each per-dimension bound
+  // (which is meaningless for a boolean), we use compareOFRs: if the
+  // scalar is non-zero the result is the other side's dim bound,
+  // otherwise 0 (i.e. the entire dimension is masked out).
   if (lhsState.scalar && rhsState.scalar) {
     dims.push_back(minOFRs(lhsState.dims[0], rhsState.dims[0], loc, builder));
   } else if (lhsState.scalar) {
     for (uint32_t i = 0; i < rhsState.getRank(); i++) {
-      auto lhsDim = lhsState.dims[0];
-      auto rhsDim = rhsState.dims[i];
-      dims.push_back(minOFRs(lhsDim, rhsDim, loc, builder));
+      auto dim = compareOFRs(lhsState.scalar, builder.getIndexAttr(0),
+                            arith::CmpIPredicate::ne, rhsState.dims[i],
+                            builder.getIndexAttr(0), loc, builder);
+      dims.push_back(dim);
     }
   } else if (rhsState.scalar) {
     for (uint32_t i = 0; i < lhsState.getRank(); i++) {
-      auto lhsDim = lhsState.dims[i];
-      auto rhsDim = rhsState.dims[0];
-      dims.push_back(minOFRs(lhsDim, rhsDim, loc, builder));
+      auto dim = compareOFRs(rhsState.scalar, builder.getIndexAttr(0),
+                            arith::CmpIPredicate::ne, lhsState.dims[i],
+                            builder.getIndexAttr(0), loc, builder);
+      dims.push_back(dim);
     }
   } else {
     InFlightDiagnostic diag =
