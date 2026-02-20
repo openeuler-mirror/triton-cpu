@@ -493,7 +493,11 @@ class CPUBackend(BaseBackend):
                 
                 cast = transform.CastOp(transform.OperationType.get("tensor.empty"), matched.result)               
                 alloc = bufferization.EmptyTensorToAllocTensorOp(cast.result)
-                oneshot = bufferization.OneShotBufferizeOp(sequence.bodyTarget, bufferize_function_boundaries=True, memcpy_op="linalg.copy")
+                oneshot = bufferization.OneShotBufferizeOp(
+                    sequence.bodyTarget,
+                    bufferize_function_boundaries=True,
+                    allow_return_allocs_from_loops=True,
+                    memcpy_op="linalg.copy")
                 funcs = structured.MatchOp.match_op_names(
                     transform.AnyOpType.get(),
                     oneshot.result,
