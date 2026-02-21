@@ -5707,6 +5707,44 @@ def test_tl_range(device):
                 assert 'cp.async.wait_group 0x6' in ptx
 
 
+@pytest.mark.cpu
+@pytest.mark.interpreter
+def test_tl_range_modular_no_wraparound(device):
+    """Regression test for stacked wraparound d1 overflow.
+
+    When M is a multiple of BLOCK_SIZE_M, the modular indexing
+    (offs_am = ... % M) triggers the stacked wraparound codegen in
+    StructuredToMemref, but no actual wraparound occurs.  Before the
+    fix, d1 was computed as M (the full matrix height) instead of being
+    clamped to BLOCK_SIZE_M, causing an out-of-bounds
+    memref.reinterpret_cast and a segfault at runtime.
+    """
+    if is_hip():
+        pytest.skip("not supported in HIP")
+
+    # Deliberately choose M that is a multiple of BLOCK_SIZE_M so every
+    # block starts exactly on a row boundary and never wraps around.
+    M, N, K = 64, 64, 128
+    BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 64
+
+    a = torch.randn((M, K), device=device, dtype=torch.float32)
+    b = torch.randn((K, N), device=device, dtype=torch.float32)
+    c = torch.empty((M, N), dtype=torch.float32, device=device)
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    matmul_kernel[grid](
+        a, b, c, M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M, BLOCK_N, BLOCK_K, 0,
+        num_pipeline_stages=1,
+    )
+
+    ref_out = torch.matmul(a, b)
+    torch.testing.assert_close(ref_out, c, rtol=1e-3, atol=1e-3)
+
+
 @triton.jit(noinline=True)
 def maxnreg_noinline1(X):
     tl.store(X, 0)
