@@ -444,6 +444,11 @@ private:
         rewriter.create<arith::AddIOp>(loc, modRow, wrappedAroundOff);
     Value d1 = rewriter.create<arith::SubIOp>(loc, clampedOff, targetOffset);
     d1 = rewriter.create<arith::DivSIOp>(loc, d1, strideRow);
+    // Clamp d1 to rowSize so that the first chunk never exceeds the allocated
+    // block size. Without this, when the block does not actually wrap around
+    // (e.g. M is a multiple of BLOCK_SIZE_M), d1 could equal M which is larger
+    // than the block's row dimension, causing an out-of-bounds access.
+    d1 = rewriter.create<arith::MinSIOp>(loc, d1, rowSize);
 
     SmallVector<Value> sizes1{d1, colSize};
     memref::ReinterpretCastOp cast1 =
