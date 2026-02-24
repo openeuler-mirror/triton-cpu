@@ -1312,7 +1312,11 @@ private:
             .Default([&](Operation *op) { return nullptr; });
 
     if (!attr) {
-      auto attr = rewriter.getIntegerAttr(constantType, -1);
+      TypedAttr attr =
+        constantType.isIntOrIndex()
+            ? cast<TypedAttr>(rewriter.getIntegerAttr(constantType, -1))
+            : cast<TypedAttr>(rewriter.getFloatAttr(constantType, -1.0f));
+
       auto constOp = rewriter.create<arith::ConstantOp>(redOp->getLoc(),
                                                         constantType, attr);
       constOp->setAttr("invalid.constant", rewriter.getUnitAttr());
