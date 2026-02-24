@@ -221,6 +221,10 @@ PtrState::createStackedCastOps(ArrayRef<int64_t> resultShape,
       rewriter.create<arith::AddIOp>(loc, clampedOff, wrappedAroundOff);
   Value d1 = rewriter.create<arith::SubIOp>(loc, clampedOff, targetOffset);
   d1 = rewriter.create<arith::DivSIOp>(loc, d1, strideRow);
+  // Clamp d1 to rowSize: when the block does not actually wrap around,
+  // d1 can exceed rowSize (e.g. d1 = M when only BLOCK_SIZE_M rows are
+  // needed), causing a buffer overflow in the subsequent subview/copy.
+  d1 = rewriter.create<arith::MinSIOp>(loc, d1, rowSize);
 
   SmallVector<Value> sizes1{d1, colSize};
   memref::ReinterpretCastOp cast1 = rewriter.create<memref::ReinterpretCastOp>(
