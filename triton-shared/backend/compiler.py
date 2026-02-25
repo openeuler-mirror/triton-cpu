@@ -701,13 +701,17 @@ class CPUBackend(BaseBackend):
                 with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
                     vector.ApplyLowerContractionPatternsOp()
                     vector.ApplyTransferPermutationPatternsOp()
-                    vector.ApplyVectorReductionToContractPatternsOp()
+                    # Apply vector.ApplyLowerMultiReductionPatternsOp with lowering strategy = "inner-reduction"
+                    # InnerReduction and InnerParallel are the two strategies for lowering multi-reductions.
+                    # InnerReduction lowers the innermost reduction first, while InnerParallel lowers all reductions in parallel.
+                    # We use InnerReduction for simplicity.
+                    vector.ApplyLowerMultiReductionPatternsOp(lowering_strategy=vector.VectorMultiReductionLowering.InnerReduction)
 
                 # 3) add split_transfer_full_partial (strategy = "vector-transfer")
                 with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
                     vector.ApplyLowerContractionPatternsOp()
                     vector.ApplyTransferPermutationPatternsOp()
-                    vector.ApplyVectorReductionToContractPatternsOp()
+                    vector.ApplyLowerMultiReductionPatternsOp(lowering_strategy=vector.VectorMultiReductionLowering.InnerReduction)
                     # pass the split_transfer_strategy as a string attr
                     vector.ApplySplitTransferFullPartialPatternsOp(split_transfer_strategy=vector.VectorTransferSplit.VectorTransfer)
 
@@ -715,7 +719,7 @@ class CPUBackend(BaseBackend):
                 with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
                     vector.ApplyLowerContractionPatternsOp()
                     vector.ApplyTransferPermutationPatternsOp()
-                    vector.ApplyVectorReductionToContractPatternsOp()
+                    vector.ApplyLowerMultiReductionPatternsOp(lowering_strategy=vector.VectorMultiReductionLowering.InnerReduction)
                     vector.ApplySplitTransferFullPartialPatternsOp(split_transfer_strategy=vector.VectorTransferSplit.VectorTransfer)
                     vector.ApplyLowerTransferPatternsOp()
 
@@ -723,7 +727,7 @@ class CPUBackend(BaseBackend):
                 with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
                     vector.ApplyLowerContractionPatternsOp()
                     vector.ApplyTransferPermutationPatternsOp()
-                    vector.ApplyVectorReductionToContractPatternsOp()
+                    vector.ApplyLowerMultiReductionPatternsOp(lowering_strategy=vector.VectorMultiReductionLowering.InnerReduction)
                     vector.ApplySplitTransferFullPartialPatternsOp(split_transfer_strategy=vector.VectorTransferSplit.VectorTransfer)
                     vector.ApplyLowerTransferPatternsOp()
                     # full_unroll is a boolean attribute
@@ -733,7 +737,7 @@ class CPUBackend(BaseBackend):
                 with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
                     vector.ApplyLowerContractionPatternsOp()
                     vector.ApplyTransferPermutationPatternsOp()
-                    vector.ApplyVectorReductionToContractPatternsOp()
+                    vector.ApplyLowerMultiReductionPatternsOp(lowering_strategy=vector.VectorMultiReductionLowering.InnerReduction)
                     vector.ApplySplitTransferFullPartialPatternsOp(split_transfer_strategy=vector.VectorTransferSplit.VectorTransfer)
                     vector.ApplyLowerTransferPatternsOp()
                     vector.ApplyTransferToScfPatternsOp(full_unroll=True)
@@ -743,7 +747,7 @@ class CPUBackend(BaseBackend):
                 with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
                     vector.ApplyLowerContractionPatternsOp()
                     vector.ApplyTransferPermutationPatternsOp()
-                    vector.ApplyVectorReductionToContractPatternsOp()
+                    vector.ApplyLowerMultiReductionPatternsOp(lowering_strategy=vector.VectorMultiReductionLowering.InnerReduction)
                     vector.ApplySplitTransferFullPartialPatternsOp(split_transfer_strategy=vector.VectorTransferSplit.VectorTransfer)
                     vector.ApplyLowerTransferPatternsOp()
                     vector.ApplyTransferToScfPatternsOp(full_unroll=True)
