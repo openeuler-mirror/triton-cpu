@@ -427,34 +427,45 @@ class CPUBackend(BaseBackend):
                     ["func.func"]
                 )
 
-                alt = transform.AlternativesOp(
-                    [],  # results_
-                    2,                            # number of alternatives
-                    scope=funcs                   # %funcs
+                #["func.func"] result has multiple elements for noinline cases.
+                #["linalg.matmul"] MatchOp only accepts single element
+                # (a module or a function). ForeachOp will iterate through
+                # all functions.
+                foreach = transform.ForeachOp(
+                    [],
+                    funcs,
                 )
-
-                block0 = alt.regions[0].blocks.append(transform.AnyOpType.get())
-                f = block0.arguments[0]
-                with InsertionPoint(block0):
-                    mm = structured.MatchOp.match_op_names(
-                        f,
-                        ["linalg.matmul"] 
+                foreachBody = foreach.body.blocks.append(transform.AnyOpType.get())
+                f = foreachBody.arguments[0]
+                with InsertionPoint(foreachBody):
+                    alt = transform.AlternativesOp(
+                        [],       # results_
+                        2,        # number of alternatives
+                        scope=f   # %funcs
                     )
-                    producer0 = transform.GetProducerOfOperand(transform.AnyOpType.get(), mm.results, 1)
-                    producer1 = transform.GetProducerOfOperand(transform.AnyOpType.get(), mm.results, 2)
-                    hoisted0 = structured.HoistPadOp(transform.AnyOpType.get(), producer0, 4, transpose=[1, 0])
-                    hoisted1 = structured.HoistPadOp(transform.AnyOpType.get(), producer1, 3, transpose=[0, 1])
-                    transform.YieldOp([])
 
-                block1 = alt.regions[1].blocks.append(transform.AnyOpType.get())
-                f = block1.arguments[0]
-                with InsertionPoint(block1):
-                    mm = structured.MatchOp.match_op_names(
-                        f,
-                        ["linalg.matmul"] 
-                    )
-                    transform.YieldOp([])
+                    block0 = alt.regions[0].blocks.append(transform.AnyOpType.get())
+                    altf0 = block0.arguments[0]
+                    with InsertionPoint(block0):
+                        mm = structured.MatchOp.match_op_names(
+                            altf0,
+                            ["linalg.matmul"]
+                        )
+                        producer0 = transform.GetProducerOfOperand(transform.AnyOpType.get(), mm.results, 1)
+                        producer1 = transform.GetProducerOfOperand(transform.AnyOpType.get(), mm.results, 2)
+                        hoisted0 = structured.HoistPadOp(transform.AnyOpType.get(), producer0, 4, transpose=[1, 0])
+                        hoisted1 = structured.HoistPadOp(transform.AnyOpType.get(), producer1, 3, transpose=[0, 1])
+                        transform.YieldOp([])
 
+                    block1 = alt.regions[1].blocks.append(transform.AnyOpType.get())
+                    altf1 = block1.arguments[0]
+                    with InsertionPoint(block1):
+                        mm = structured.MatchOp.match_op_names(
+                            altf1,
+                            ["linalg.matmul"]
+                        )
+                        transform.YieldOp([])
+                    transform.YieldOp([])
                 transform.YieldOp([sequence.bodyTarget])
 
         def vectorize_schedule():
@@ -563,27 +574,30 @@ class CPUBackend(BaseBackend):
                 with InsertionPoint(transform.ApplyPatternsOp(cse).patterns):
                     structured.apply_patterns_linalg_tiling_canonicalization()
                     loop.apply_patterns_scf_for_loop_canonicalization()
-                
-                ## match looplike
-                looplike = structured.MatchOp.__base__(
-                    transform.AnyOpType.get(),
-                    cse.result,
-                    interface=structured.MatchInterfaceEnum.LoopLikeInterface
+                foreach = transform.ForeachOp(
+                    [],
+                    cse,
                 )
-                ## apply licm
-                transform.apply_licm(
-                    looplike.result,
-                )
-                ## match func from cse
-                funcs = structured.MatchOp.match_op_names(
-                    transform.AnyOpType.get(),
-                    cse.result,
-                    ["func.func"]
-                )
+                foreachBody = foreach.body.blocks.append(transform.AnyOpType.get())
+                f = foreachBody.arguments[0]
+
+                with InsertionPoint(foreachBody):
+                    ## match looplike
+                    looplike = structured.MatchOp.__base__(
+                        transform.AnyOpType.get(),
+                        f,
+                        interface=structured.MatchInterfaceEnum.LoopLikeInterface
+                    )
+                    ## apply licm
+                    transform.apply_licm(
+                        looplike,
+                    )
+                    transform.YieldOp([])
+
                 ## hoist redudant vector transfers
                 a = transform.structured.HoistRedundantVectorTransfersOp(
                     transform.AnyOpType.get(),
-                    funcs.result,
+                    cse.result,
                 )
 
                 b = transform.structured.HoistRedundantVectorCastsOp(
@@ -1286,7 +1300,7 @@ class CPUBackend(BaseBackend):
     def _extract_mlir_function(self, filepath: str) -> None:
         """
         Reads an MLIR source file, retains external llvm.func declarations and
-        extracts the first llvm.func definition with a body, then overwrites the file
+        extracts the multiple llvm.func definition with it's body, then overwrites the file
         with these declarations followed by the function body.
 
         Args:
@@ -1295,7 +1309,8 @@ class CPUBackend(BaseBackend):
         with open(filepath, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
-        decl_pattern = re.compile(r"^\s*llvm\.func\b.*\)(?:\s*->.*)?\s*$")
+        #Line without "{" Considered as llvm.func declaration
+        decl_pattern = re.compile(r"^\s*llvm\.func\b.*\)[^{]*$")
         body_start_pattern = re.compile(r"^\s*llvm\.func\b.*\{")
 
         decl_lines = []
@@ -1319,8 +1334,10 @@ class CPUBackend(BaseBackend):
             else:
                 body_lines.append(line)
                 brace_balance += line.count('{') - line.count('}')
+
+                #Resetting in_body flag after finishing a llvm.func definition.
                 if brace_balance == 0:
-                    break
+                    in_body=False
 
         if not body_lines:
             return
@@ -1432,7 +1449,7 @@ class CPUBackend(BaseBackend):
     def _llir_to_bin(self, llir: str, metadata):
         pattern = r"define void @(\w+)\(.+"
         matches = re.findall(pattern, llir)
-        assert len(matches) == 1
+        assert len(matches) != 0
         metadata["name"] = matches[0]
         with tempfile.TemporaryDirectory() as tmpdir:
             src_path = os.path.join(tmpdir, "kernel.ll")
