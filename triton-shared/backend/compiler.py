@@ -1387,6 +1387,11 @@ class CPUBackend(BaseBackend):
                     triton_shared.to_llir.add_strip_debug_info(pm5)
                     pm5.run(mod)
                     Path(os.path.join(_debug_dir, "05_after_strip_debug.mlir")).write_text(str(mod))
+
+                    pm6 = ir.pass_manager(context)
+                    triton_shared.to_llir.add_llvm_legalize_float8_types(pm6)
+                    pm6.run(mod)
+                    Path(os.path.join(_debug_dir, "06_after_legalize_float8.mlir")).write_text(str(mod))
                 else:
                     triton_shared.to_llir.add_transform_interpreter(pm)
                     triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm)
@@ -1395,6 +1400,7 @@ class CPUBackend(BaseBackend):
                     triton_shared.to_llir.add_convert_to_llvm(pm)
                     triton_shared.to_llir.add_canonicalizer(pm)
                     triton_shared.to_llir.add_strip_debug_info(pm)
+                    triton_shared.to_llir.add_llvm_legalize_float8_types(pm)
             else:
                 triton_shared.to_llir.add_convert_linalg_to_affine_loops(pm)
                 triton_shared.to_llir.add_empty_tensor_to_alloc_tensor(pm)
