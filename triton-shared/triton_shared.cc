@@ -22,6 +22,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/Transforms/LegalizeFloat8Types.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 // #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -466,6 +467,8 @@ void init_to_llvm(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_test_transform_dialect_erase_schedule",
                      createTestTransformDialectEraseSchedulePass);
   ADD_PASS_WRAPPER_0("add_strip_debug_info", createStripDebugInfoPass);
+  ADD_PASS_WRAPPER_0("add_llvm_legalize_float8_types",
+                     LLVM::createLegalizeFloat8TypesPass);
   ADD_PASS_WRAPPER_0("add_convert_to_llvm", createConvertToLLVMPass);
 }
 
