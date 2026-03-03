@@ -1207,9 +1207,12 @@ private:
   bool requiresF32Conversion(const Type elemType, Operation *redOp) const {
     // Only if it is a binaryOp and types mismatch
     if (isa<arith::AddFOp>(redOp) || isa<arith::SubFOp>(redOp) ||
-        isa<arith::MulFOp>(redOp) || isa<arith::DivFOp>(redOp)) {
+        isa<arith::MulFOp>(redOp) || isa<arith::DivFOp>(redOp) ||
+        isa<triton::ReduceReturnOp>(redOp)) {
       auto lhsType = elemType;
-      auto rhsType = redOp->getOperand(1).getType();
+      auto rhsType = (isa<triton::ReduceReturnOp>(redOp)) ?
+                        redOp->getOperand(0).getType():
+                        redOp->getOperand(1).getType();
       return (lhsType != rhsType) && (isa<FloatType>(rhsType)) &&
              rhsType.getIntOrFloatBitWidth() == 32;
     }
@@ -1257,6 +1260,8 @@ private:
                                                unsigned accArgIdx) {
     Value accArg = block.getArgument(accArgIdx);
     for (Operation &opInner : block.getOperations()) {
+      if(isa<triton::ReduceReturnOp>(&opInner))
+          return &opInner;
       if (&opInner == block.getTerminator())
         break;
       for (Value operand : opInner.getOperands())
@@ -1309,6 +1314,8 @@ private:
             .Case([&](arith::OrIOp) {
               return rewriter.getIntegerAttr(constantType, 0);
             })
+            .Case<triton::ReduceReturnOp>(
+                [&](auto) { return rewriter.getIntegerAttr(constantType, 0); })
             .Default([&](Operation *op) { return nullptr; });
 
     if (!attr) {
