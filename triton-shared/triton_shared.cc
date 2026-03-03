@@ -23,6 +23,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/Transforms/LegalizeFloat8Types.h"
+#include "mlir/Dialect/LLVMIR/Transforms/PromoteI1ToI8.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 // #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -470,6 +471,7 @@ void init_to_llvm(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_llvm_legalize_float8_types",
                      LLVM::createLegalizeFloat8TypesPass);
   ADD_PASS_WRAPPER_0("add_convert_to_llvm", createConvertToLLVMPass);
+  ADD_PASS_WRAPPER_0("add_promote_i1_to_i8", LLVM::createPromoteI1ToI8Pass);
 }
 
 // Loading passes is necessary when using the transform schedule, however, they
