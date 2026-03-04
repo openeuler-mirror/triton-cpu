@@ -1708,15 +1708,29 @@ void PtrAnalysis::initializeMaybeStructuredArgs(Operation *op) {
 
 LogicalResult PtrAnalysis::rewriteStoreOp(triton::StoreOp op,
                                           bool useUnsafeMask) {
-  auto ptr = ptrMap.lookupOrNull(op.getPtr());
+  auto opPtr = op.getPtr();
+  auto ptr = ptrMap.lookupOrNull(opPtr);
   auto val = op.getValue();
   auto mask = op.getMask();
   auto loc = op.getLoc();
 
+  // Create a tts.make_tptr op for the operation pointer,
+  // if that hasn't been done yet.
   if (!ptr) {
-    op->emitRemark("PtrAnalysis: pointer is not replace with tts.make_tptr so "
-                   "storeOp cannot be rewritten");
-    return failure();
+    // Fail if cannot replace the pointer
+    PtrState state;
+    OpBuilder builder(op);
+    if (visitOperand(opPtr, state, loc, builder).failed() || // cannot visit op
+        !state.isStructured() ||                      // state isn't structured
+        !isa<RankedTensorType>(op.getPtr().getType()) // not a ranked tensor
+    ) {
+      op->emitRemark("PtrAnalysis: cannot make tts.make_tptr for the pointer");
+      return failure();
+    }
+
+    // Create a tts.make_tptr operation for the pointer.
+    ptr = state.createTTSMakeTensorPtrOp(builder, loc).getResult();
+    ptrMap.map(opPtr, ptr);
   }
 
   auto ptrType = dyn_cast<triton::PointerType>(ptr.getType());
