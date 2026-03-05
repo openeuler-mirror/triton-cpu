@@ -339,21 +339,23 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
     Value idx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     SmallVector<Value, 1> indices{idx};
 
-    Value atomic;
-
     if (mask) {
       auto ifOp = rewriter.create<scf::IfOp>(
           loc, mask,
           /*thenBuilder=*/
           [&](OpBuilder &b, Location l) {
-            atomic = b.create<memref::AtomicRMWOp>(l, kindAttr, val, memref,
-                                                   indices);
-            b.create<scf::YieldOp>(l);
+            Value atomic = b.create<memref::AtomicRMWOp>(l, kindAttr, val,
+                                                         memref, indices);
+            b.create<scf::YieldOp>(l, atomic);
           },
           /*elseBuilder=*/
-          [&](OpBuilder &b, Location l) { b.create<scf::YieldOp>(l); });
+          [&](OpBuilder &b, Location l) {
+            Value defaultVal = b.create<arith::ConstantOp>(
+                loc, rewriter.getZeroAttr(val.getType()));
+            b.create<scf::YieldOp>(l, defaultVal);
+          });
 
-      rewriter.replaceOp(op, atomic);
+      rewriter.replaceOp(op, ifOp.getResult(0));
     } else {
       // Replace with memref.atomic_rmw
       rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kindAttr, val,
