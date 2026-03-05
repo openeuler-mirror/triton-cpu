@@ -341,23 +341,34 @@ class CPULauncher(object):
         constants_aux = {i: v for i, v in constants.items()}
         for i, v in constants_aux.items():
           signature[i] = "constexpr"
+        # Sort signature by original parameter index so that _generate_launcher's
+        # PyArg_ParseTuple format matches the order produced by __call__'s insert
+        # logic.  Without this, constexpr entries appended at the end of the dict
+        # cause a positional mismatch when they have indices interleaved with
+        # non-constexpr parameters.
+        signature = dict(sorted(signature.items()))
         launcher_src = _generate_launcher(constants, signature, kernel_placeholder_name)
-        # Save constants and signature as attributes of the launcher to use in __call__ 
-        self.constants = constants
+        # Save only the tl.constexpr constants that are NOT sent by jit.py
+        # and must be inserted by __call__.  Specialized scalar constants (e.g.
+        # strides specialized to 1) are already included in the non-constexpr
+        # values that jit.py sends, and must not be inserted again.
+        constexpr_indices = set(getattr(src.fn, 'constexpr_indices', []))
+        self.constants = {k: v for k, v in constants.items() if k in constexpr_indices}
         # Later KERNEL_NAME_PLACEHOLDER will be used to assign the kernel name
         # in the following launch function.
         self.launch = compile_module(launcher_src, kernel_placeholder_name)
 
     def __call__(self, *args, **kwargs):
-        ## Add constanst to args
+        ## Insert tl.constexpr values back into their original parameter positions.
+        ## The non-constexpr values arrive contiguously after 9 preamble args
+        ## (without gaps for constexprs).  We insert each constexpr value at its
+        ## original index (processing in ascending order so earlier inserts shift
+        ## later positions correctly), matching the sorted signature order that
+        ## _generate_launcher's PyArg_ParseTuple format expects.
         args = list(args)
-        offset = 9 ## skips first 9 args
-        for idx, val in self.constants.items():
-          adjusted_idx = idx + offset
-          if adjusted_idx >= len(args):
-            # Extend the list with `None` (or any default) up to the needed length
-            args.extend([None] * (adjusted_idx + 1 - len(args)))
-          args[adjusted_idx] = val
+        offset = 9  ## skips first 9 preamble args
+        for idx, val in sorted(self.constants.items()):
+            args.insert(idx + offset, val)
         self.launch(*args, **kwargs)
 
 
