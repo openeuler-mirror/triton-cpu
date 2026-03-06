@@ -290,10 +290,6 @@ public:
       for (auto &use : val.getUses()) {
         auto user = use.getOwner();
 
-        // Atomic op will be lowered to MLIR in later pass
-        if (dyn_cast<triton::AtomicRMWOp>(user))
-          continue;
-
         auto res =
             llvm::TypeSwitch<Operation *, LogicalResult>(user)
                 .Case<triton::PtrToIntOp>([&](triton::PtrToIntOp op) {
