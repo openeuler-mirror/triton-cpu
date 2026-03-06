@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Union
 from types import ModuleType
 
-# Table that associates strings to AttrsDescriptor (sub)classes.
+# Table that associatesPUFallbackException for handling CPU fallback scenarios
+class CPUFallbackException(Exception):
+    """Exception raised when a CPU fallback is required."""
+    pass
+
 # In this way we can dynamically select the correct class
 # constructor
 _descriptor_table = {}
