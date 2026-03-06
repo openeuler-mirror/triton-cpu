@@ -349,6 +349,7 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
             b.create<scf::YieldOp>(l, atomic);
           },
           /*elseBuilder=*/
+          // Yield a default value to make sure ifOp is defined in every branch.
           [&](OpBuilder &b, Location l) {
             Value defaultVal = b.create<arith::ConstantOp>(
                 loc, rewriter.getZeroAttr(val.getType()));
