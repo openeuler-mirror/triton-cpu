@@ -4,6 +4,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 
 namespace mlir {
 namespace triton {
@@ -16,19 +17,16 @@ using namespace mlir;
 
 namespace {
 
-class CallOpConversion : public mlir::RewritePattern {
+class CallOpConversion : public OpRewritePattern<LLVM::CallOp> {
 public:
-  CallOpConversion(mlir::MLIRContext *context)
-      : mlir::RewritePattern(LLVM::CallOp::getOperationName(), 1, context) {}
+  CallOpConversion(mlir::MLIRContext *context, bool ftz)
+      : OpRewritePattern<LLVM::CallOp>(context, 1), ftz(ftz) {}
 
   LogicalResult
-  matchAndRewrite(mlir::Operation *op,
+  matchAndRewrite(LLVM::CallOp callOp,
                   mlir::PatternRewriter &rewriter) const override {
-    auto callOp = cast<LLVM::CallOp>(op);
-    if (isPredicatedLoadNT(callOp)) {
-      return convertPredicatedLoad(callOp, rewriter, /*nt=*/true);
-    } else if (isPredicatedLoad(callOp)) {
-      return convertPredicatedLoad(callOp, rewriter, /*nt=*/false);
+    if (isPredicatedLoad(callOp)) {
+      return convertPredicatedLoad(callOp, rewriter);
     } else if (isPredicatedStore(callOp)) {
       return convertPredicatedStore(callOp, rewriter);
     } else if (isWrappedLLVMIntrinsic(callOp)) {
@@ -40,18 +38,42 @@ public:
 
 private:
   bool isPredicatedLoad(LLVM::CallOp callOp) const {
-    return callOp.getCallee().value().find(mlir::LLVM::AMD::Predicated_Load) !=
-           llvm::StringRef::npos;
+    return callOp.getCallee().value().contains(mlir::LLVM::AMD::predicatedLoad);
   }
 
-  bool isPredicatedLoadNT(LLVM::CallOp callOp) const {
-    return callOp.getCallee().value().find(
-               mlir::LLVM::AMD::Predicated_Load_NT) != llvm::StringRef::npos;
+  bool isPredicatedLoadCA(LLVM::CallOp callOp) const {
+    return callOp.getCallee().value().contains(
+        mlir::LLVM::AMD::predicatedLoadCA);
+  }
+
+  bool isPredicatedLoadCG(LLVM::CallOp callOp) const {
+    return callOp.getCallee().value().contains(
+        mlir::LLVM::AMD::predicatedLoadCG);
+  }
+
+  bool isPredicatedLoadCV(LLVM::CallOp callOp) const {
+    return callOp.getCallee().value().contains(
+        mlir::LLVM::AMD::predicatedLoadCV);
   }
 
   bool isPredicatedStore(LLVM::CallOp callOp) const {
-    return callOp.getCallee().value().find(mlir::LLVM::AMD::Predicated_Store) !=
-           llvm::StringRef::npos;
+    return callOp.getCallee().value().contains(
+        mlir::LLVM::AMD::predicatedStore);
+  }
+
+  bool isPredicatedStoreCS(LLVM::CallOp callOp) const {
+    return callOp.getCallee().value().contains(
+        mlir::LLVM::AMD::predicatedStoreCS);
+  }
+
+  bool isPredicatedStoreCG(LLVM::CallOp callOp) const {
+    return callOp.getCallee().value().contains(
+        mlir::LLVM::AMD::predicatedStoreCG);
+  }
+
+  bool isPredicatedStoreWT(LLVM::CallOp callOp) const {
+    return callOp.getCallee().value().contains(
+        mlir::LLVM::AMD::predicatedStoreWT);
   }
 
   bool isWrappedLLVMIntrinsic(LLVM::CallOp callOp) const {
@@ -79,7 +101,16 @@ private:
     rewriter.setInsertionPointToEnd(currentBlock);
     rewriter.create<LLVM::CondBrOp>(loc, pred, trueBlock, afterStore);
     rewriter.setInsertionPointToStart(trueBlock);
-    auto storeOp = rewriter.create<LLVM::StoreOp>(loc, val, ptr);
+    /*
+                  | vialatile | non-tmp | gcn instr gfx94
+    LLVM::StoreOp | 0         | 0       | (cg) global store
+                  | 0         | 1       | (cs) global store nt
+                  | 1         | 0/1     | (wt) global store sc0 sc1
+    */
+    bool vialatileFlag = isPredicatedStoreWT(callOp);
+    bool nonTmpFlag = isPredicatedStoreCS(callOp);
+    auto storeOp = rewriter.create<LLVM::StoreOp>(
+        loc, val, ptr, /*alignment=*/0, vialatileFlag, nonTmpFlag);
     rewriter.create<LLVM::BrOp>(loc, afterStore);
     rewriter.setInsertionPointToStart(afterStore);
     rewriter.eraseOp(callOp);
@@ -87,8 +118,7 @@ private:
   }
 
   LogicalResult convertPredicatedLoad(LLVM::CallOp callOp,
-                                      mlir::PatternRewriter &rewriter,
-                                      bool nt) const {
+                                      mlir::PatternRewriter &rewriter) const {
     auto operands = callOp.getOperands();
     auto result = callOp.getResult();
 
@@ -108,10 +138,16 @@ private:
     rewriter.setInsertionPointToEnd(currentBlock);
     rewriter.create<LLVM::CondBrOp>(loc, pred, trueBlock, falseBlock);
     rewriter.setInsertionPointToStart(trueBlock);
-    auto loadOp = nt ? rewriter.create<LLVM::LoadOp>(
-                           loc, elemTy, ptr, /*alignment=*/0,
-                           /*isVolatile=*/false, /*isNonTemporal=*/true)
-                     : rewriter.create<LLVM::LoadOp>(loc, elemTy, ptr);
+    /*
+                 | vialatile | non-tmp | gcn instr gfx94
+    LLVM::LoadOp | 0         | 0       | (ca) global load
+                 | 0/1       | 1       | (cg) global load nt
+                 | 1         | 0       | (cv) flat load sc0 sc1
+    */
+    bool vialatileFlag = isPredicatedLoadCV(callOp);
+    bool nonTmpFlag = isPredicatedLoadCG(callOp);
+    auto loadOp = rewriter.create<LLVM::LoadOp>(
+        loc, elemTy, ptr, /*alignment=*/0, vialatileFlag, nonTmpFlag);
     rewriter.create<LLVM::BrOp>(loc, loadOp->getResult(0), afterLoad);
     rewriter.setInsertionPointToStart(falseBlock);
     rewriter.create<LLVM::BrOp>(loc, falseVal, afterLoad);
@@ -151,13 +187,25 @@ private:
           rewriter.create<LLVM::FPToSIOp>(loc, returnType, op->getResult(0));
     } else if (calleeName == "__triton_hip_fast_fdividef") {
       assert(operands.size() == 2);
-      auto name = StringAttr::get(callOp.getContext(), "llvm.amdgcn.rcp.f32");
-      LLVM::FastmathFlagsAttr defaultFlags{};
-      auto rcpOp = rewriter.create<LLVM::CallIntrinsicOp>(
-          loc, returnType, name, operands[1], defaultFlags);
+      const char *intrinsic = "llvm.amdgcn.rcp.f32";
+      auto rcpOp = LLVM::createLLVMIntrinsicCallOp(rewriter, loc, intrinsic,
+                                                   returnType, operands[1]);
 
+      LLVM::FastmathFlagsAttr defaultFlags{};
       replacementOp = rewriter.create<LLVM::FMulOp>(
           loc, returnType, operands[0], rcpOp->getResult(0), defaultFlags);
+    } else if (calleeName == "__triton_hip_fast_expf") {
+      assert(operands.size() == 1);
+      assert(operands[0].getType().getIntOrFloatBitWidth() == 32);
+      const double log2e = 1.4426950408889634;
+      LLVM::FastmathFlagsAttr defaultFlags{};
+      auto mulOp = rewriter.create<LLVM::FMulOp>(
+          loc, rewriter.getF32Type(), operands[0],
+          LLVM::createConstantF32(loc, rewriter, log2e), defaultFlags);
+      const char *intrinsic = ftz ? "llvm.amdgcn.exp2.f32" : "llvm.exp2.f32";
+
+      replacementOp = LLVM::createLLVMIntrinsicCallOp(
+          rewriter, loc, intrinsic, returnType, mulOp->getResult(0));
     }
 
     if (replacementOp) {
@@ -167,23 +215,25 @@ private:
 
     return mlir::failure();
   }
+
+private:
+  bool ftz;
 };
 
 struct ConvertBuiltinFuncToLLVM
     : public triton::impl::ConvertBuiltinFuncToLLVMBase<
           ConvertBuiltinFuncToLLVM> {
+  explicit ConvertBuiltinFuncToLLVM(bool ftz) { this->ftz = ftz; }
+
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
 
-    // Disable block merging because of:
-    // https://github.com/llvm/llvm-project/issues/63230
-    // TODO(giuseros): enable block merging once the above ticket is completed
     GreedyRewriteConfig config;
-    config.enableRegionSimplification = GreedySimplifyRegionLevel::Normal;
+    config.enableRegionSimplification = GreedySimplifyRegionLevel::Aggressive;
 
     RewritePatternSet patterns(context);
-    patterns.add<CallOpConversion>(context);
+    patterns.add<CallOpConversion>(context, this->ftz);
 
     if (mlir::applyPatternsAndFoldGreedily(mod, std::move(patterns), config)
             .failed()) {
@@ -197,8 +247,9 @@ struct ConvertBuiltinFuncToLLVM
 namespace mlir {
 namespace triton {
 
-std::unique_ptr<OperationPass<ModuleOp>> createConvertBuiltinFuncToLLVMPass() {
-  return std::make_unique<ConvertBuiltinFuncToLLVM>();
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertBuiltinFuncToLLVMPass(bool ftz) {
+  return std::make_unique<ConvertBuiltinFuncToLLVM>(ftz);
 }
 
 } // namespace triton

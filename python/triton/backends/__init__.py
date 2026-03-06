@@ -28,7 +28,6 @@ def _find_concrete_subclasses(module, base_class):
 
 @dataclass(frozen=True)
 class Backend:
-    name: str = ""
     compiler: BaseBackend = None
     driver: DriverBase = None
 
@@ -43,7 +42,7 @@ def _discover_backends():
             continue
         compiler = _load_module(name, os.path.join(root, name, 'compiler.py'))
         driver = _load_module(name, os.path.join(root, name, 'driver.py'))
-        backends[name] = Backend(name, _find_concrete_subclasses(compiler, BaseBackend),
+        backends[name] = Backend(_find_concrete_subclasses(compiler, BaseBackend),
                                  _find_concrete_subclasses(driver, DriverBase))
     return backends
 

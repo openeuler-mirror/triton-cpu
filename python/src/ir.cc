@@ -1,4 +1,5 @@
-﻿#include <pybind11/functional.h>
+#include <optional>
+#include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -6,8 +7,9 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
-#include "mlir/Dialect/Index/IR/IndexOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
@@ -21,12 +23,11 @@
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Transforms/LocationSnapshot.h"
-#include "mlir/Transforms/Passes.h"
 
-#include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/SourceMgr.h"
 
@@ -156,6 +157,7 @@ void init_triton_ir(py::module &&m) {
       .value("WB", CacheModifier::WB)
       .value("CS", CacheModifier::CS)
       .value("WT", CacheModifier::WT)
+      .value("CV", CacheModifier::CV)
       .export_values();
 
   py::enum_<MemSemantic>(m, "MEM_SEMANTIC", py::module_local())
@@ -203,6 +205,14 @@ void init_triton_ir(py::module &&m) {
       .value("IEEE", InputPrecision::IEEE)
       .export_values();
 
+  py::enum_<F8F6F4Type>(m, "F8F6F4TY", py::module_local())
+      .value("E4M3", F8F6F4Type::E4M3)
+      .value("E5M2", F8F6F4Type::E5M2)
+      .value("E2M3", F8F6F4Type::E2M3)
+      .value("E3M2", F8F6F4Type::E3M2)
+      .value("E2M1", F8F6F4Type::E2M1)
+      .export_values();
+
   py::class_<MLIRContext>(m, "context", py::module_local())
       .def(py::init<>())
       .def("printOpOnDiagnostic",
@@ -223,9 +233,12 @@ void init_triton_ir(py::module &&m) {
     registry.insert<TritonDialect, ::mlir::triton::gpu::TritonGPUDialect,
                     math::MathDialect, arith::ArithDialect, index::IndexDialect,
                     scf::SCFDialect, ::mlir::gpu::GPUDialect,
-                    cf::ControlFlowDialect, LLVM::LLVMDialect>();
+                    cf::ControlFlowDialect, LLVM::LLVMDialect,
+                    mlir::ub::UBDialect>();
+    mlir::LLVM::registerInlinerInterface(registry);
     registerBuiltinDialectTranslation(registry);
     registerLLVMDialectTranslation(registry);
+    mlir::LLVM::registerInlinerInterface(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });
@@ -1247,7 +1260,7 @@ void init_triton_ir(py::module &&m) {
                                   evictionPolicy);
            })
       .def("create_descriptor_load",
-           [](TritonOpBuilder &self, Value &desc_ptr,
+           [](TritonOpBuilder &self, Value desc_ptr,
               std::vector<Value> &indices, Type type,
               CacheModifier cacheModifier,
               EvictionPolicy evictionPolicy) -> Value {
@@ -1255,10 +1268,26 @@ void init_triton_ir(py::module &&m) {
                  type, desc_ptr, indices, cacheModifier, evictionPolicy);
            })
       .def("create_descriptor_store",
-           [](TritonOpBuilder &self, Value &desc_ptr, Value value,
+           [](TritonOpBuilder &self, Value desc_ptr, Value value,
               std::vector<Value> &indices) -> void {
              self.create<ExperimentalDescriptorStoreOp>(desc_ptr, value,
                                                         indices);
+           })
+      .def("create_tensormap_create",
+           [](TritonOpBuilder &self, Value desc_ptr, Value global_address,
+              std::vector<Value> box_dim, std::vector<Value> global_dim,
+              std::vector<Value> global_stride,
+              std::vector<Value> element_stride, int32_t elem_type,
+              int32_t interleave_layout, int32_t swizzle_mode,
+              int32_t fill_mode) {
+             self.create<ExperimentalTensormapCreateOp>(
+                 desc_ptr, global_address, box_dim, global_dim, global_stride,
+                 element_stride, elem_type, interleave_layout, swizzle_mode,
+                 fill_mode);
+           })
+      .def("create_tensormap_fenceproxy_acquire",
+           [](TritonOpBuilder &self, Value desc_ptr) {
+             self.create<ExperimentalTensormapFenceproxyAcquireOp>(desc_ptr);
            })
       .def("create_reshape",
            [](TritonOpBuilder &self, Value &arg, std::vector<int64_t> &shape,
@@ -1377,19 +1406,13 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, int axis) -> Value {
              if (axis < 0 || axis > 3)
                throw pybind11::index_error("program_id must be in [0,3]");
-             return self.create<GetProgramIdOp>(
-                 self.getBuilder().getI32Type(),
-                 ProgramIDDimAttr::get(self.getBuilder().getContext(),
-                                       ProgramIDDim(axis)));
+             return self.create<GetProgramIdOp>(axis);
            })
       .def("create_get_num_programs",
            [](TritonOpBuilder &self, int axis) -> Value {
              if (axis < 0 || axis > 3)
                throw pybind11::index_error("program_id must be in [0,3]");
-             return self.create<GetNumProgramsOp>(
-                 self.getBuilder().getI32Type(),
-                 ProgramIDDimAttr::get(self.getBuilder().getContext(),
-                                       ProgramIDDim(axis)));
+             return self.create<GetNumProgramsOp>(axis);
            })
       .def("create_dot",
            [](TritonOpBuilder &self, mlir::Value &a, mlir::Value &b,
@@ -1397,6 +1420,15 @@ void init_triton_ir(py::module &&m) {
               int maxNumImpreciseAcc) -> mlir::Value {
              return self.create<DotOp>(c.getType(), a, b, c, inputPrecision,
                                        maxNumImpreciseAcc);
+           })
+      .def("create_dot_scaled",
+           [](TritonOpBuilder &self, mlir::Value &lhs, mlir::Value &lhs_scale,
+              F8F6F4Type lhs_format, mlir::Value &rhs,
+              std::optional<mlir::Value> &rhs_scale, F8F6F4Type rhs_format,
+              mlir::Value &c) -> mlir::Value {
+             return self.create<DotScaledOp>(
+                 c.getType(), lhs, rhs, c, lhs_scale,
+                 rhs_scale.value_or(Value()), lhs_format, rhs_format);
            })
       .def("create_floor",
            [](TritonOpBuilder &self, Value &val) -> Value {
@@ -1414,73 +1446,21 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::Exp2Op>(val);
            })
-      .def("create_expm1",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::ExpM1Op>(val);
-           })
       .def("create_cos",
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::CosOp>(val);
-           })
-      .def("create_cosh",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::CoshOp>(val);
            })
       .def("create_sin",
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::SinOp>(val);
            })
-      .def("create_sinh",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::SinhOp>(val);
-           })
-      .def("create_tan",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::TanOp>(val);
-           })
-      .def("create_tanh",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::TanhOp>(val);
-           })
-      .def("create_acos",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::AcosOp>(val);
-           })
-      .def("create_acosh",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::AcoshOp>(val);
-           })
-      .def("create_asin",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::AsinOp>(val);
-           })
-      .def("create_asinh",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::AsinhOp>(val);
-           })
-      .def("create_atan",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::AtanOp>(val);
-           })
-      .def("create_atanh",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::AtanhOp>(val);
-           })
       .def("create_log",
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::LogOp>(val);
            })
-      .def("create_log1p",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::Log1pOp>(val);
-           })
       .def("create_log2",
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::Log2Op>(val);
-           })
-      .def("create_log10",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::Log10Op>(val);
            })
       .def("create_erf",
            [](TritonOpBuilder &self, Value &val) -> Value {
@@ -1501,14 +1481,6 @@ void init_triton_ir(py::module &&m) {
       .def("create_iabs",
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::AbsIOp>(val);
-           })
-      .def("create_cbrt",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::CbrtOp>(val);
-           })
-      .def("create_trunc",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::TruncOp>(val);
            })
       .def("create_reduce",
            [](TritonOpBuilder &self, std::vector<Value> operands, int axis)
@@ -1566,26 +1538,18 @@ void init_triton_ir(py::module &&m) {
            })
       .def("create_assert",
            [](TritonOpBuilder &self, Value &condition,
-              const std::string &message, const std::string &fileName,
-              const std::string &funcName, unsigned lineNo) -> void {
+              const std::string &message) -> void {
              auto messageAttr = StringAttr::get(self.getBuilder().getContext(),
                                                 llvm::StringRef(message));
-             auto fileNameAttr = StringAttr::get(self.getBuilder().getContext(),
-                                                 llvm::StringRef(fileName));
-             auto funcNameAttr = StringAttr::get(self.getBuilder().getContext(),
-                                                 llvm::StringRef(funcName));
-             auto lineNoAttr = self.getBuilder().getI32IntegerAttr(lineNo);
-             self.create<AssertOp>(condition, messageAttr, fileNameAttr,
-                                   funcNameAttr, lineNoAttr);
+             self.create<AssertOp>(condition, messageAttr);
            })
       .def("create_assume",
            [](TritonOpBuilder &self, Value &condition) {
              self.create<LLVM::AssumeOp>(condition);
            })
-      // Undef
-      .def("create_undef",
+      .def("create_poison",
            [](TritonOpBuilder &self, Type &type) -> Value {
-             return self.create<LLVM::UndefOp>(type);
+             return self.create<ub::PoisonOp>(type);
            })
       .def("create_histogram",
            [](TritonOpBuilder &self, Value operand, int numBins) -> Value {
@@ -1699,8 +1663,6 @@ void init_triton_ir(py::module &&m) {
                           });
 
           ::llvm::DebugFlag = true;
-          // For release build setCurrentDebugTypes is a macro, so avoid
-          // namespace prefix
           using namespace llvm;
           setCurrentDebugTypes(debugTypes.data(), debugTypes.size());
         }

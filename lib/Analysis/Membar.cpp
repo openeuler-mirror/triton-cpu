@@ -6,6 +6,7 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include <deque>
 
 namespace mlir {
@@ -94,7 +95,7 @@ void MembarAnalysis::visitTerminator(Operation *op,
 
 void MembarAnalysis::insertBarrier(Operation *op, OpBuilder *builder) {
   OpBuilder::InsertionGuard g(*builder);
-  auto barrierOp = builder->create<gpu::BarrierOp>(op->getLoc());
+  ::insertBarrier(*builder, op);
 }
 
 void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
@@ -136,11 +137,15 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
           for (auto bufferId : allocation->getBufferIds(value)) {
             if (bufferId != Allocation::InvalidBufferId) {
               if (isa<MemoryEffects::Write>(effectInstance.getEffect()))
-                curBlockInfo.syncWriteIntervals.insert(
-                    allocation->getAllocatedInterval(bufferId));
+                curBlockInfo
+                    .syncWriteIntervals[allocation->getAllocatedInterval(
+                        bufferId)]
+                    .insert(op);
               else if (isa<MemoryEffects::Read>(effectInstance.getEffect()))
-                curBlockInfo.syncReadIntervals.insert(
-                    allocation->getAllocatedInterval(bufferId));
+                curBlockInfo
+                    .syncReadIntervals[allocation->getAllocatedInterval(
+                        bufferId)]
+                    .insert(op);
             }
           }
         }
@@ -161,15 +166,15 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
           "dependencies");
     }
     auto interval = allocation->getAllocatedInterval(scratchBufferId);
-    curBlockInfo.syncWriteIntervals.insert(interval);
-    if (blockInfo->isIntersected(curBlockInfo)) {
+    curBlockInfo.syncWriteIntervals[interval].insert(op);
+    if (blockInfo->isIntersected(curBlockInfo, filter)) {
       builder->setInsertionPoint(op);
       insertBarrier(op, builder);
     }
     // Ops with a scratch buffer internally syncs read/write on shared memory
     blockInfo->sync();
-    curBlockInfo.syncReadIntervals.insert(interval);
-  } else if (blockInfo->isIntersected(curBlockInfo)) {
+    curBlockInfo.syncReadIntervals[interval].insert(op);
+  } else if (blockInfo->isIntersected(curBlockInfo, filter)) {
     builder->setInsertionPoint(op);
     insertBarrier(op, builder);
     blockInfo->sync();

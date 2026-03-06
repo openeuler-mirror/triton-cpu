@@ -39,6 +39,7 @@ void init_triton_passes_ttir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_reorder_broadcast", createReorderBroadcastPass);
   ADD_PASS_WRAPPER_0("add_rewrite_tensor_pointer",
                      createRewriteTensorPointerPass);
+  ADD_PASS_WRAPPER_0("add_loop_unroll", createLoopUnrollPass);
   ADD_PASS_WRAPPER_4("add_convert_to_ttgpuir",
                      createConvertTritonToTritonGPUPass, const std::string &,
                      int, int, int);
@@ -65,9 +66,18 @@ void init_triton_passes_ttgpuir(py::module &&m) {
                      createAllocateSharedMemoryPass);
   ADD_PASS_WRAPPER_0("add_combine_tensor_select_and_if",
                      createTritonGPUCombineTensorSelectAndIf);
+  ADD_PASS_WRAPPER_0("add_optimize_accumulator_init",
+                     createTritonGPUOptimizeAccumulatorInit);
+  ADD_PASS_OPTION_WRAPPER_1("add_ws_task_partition",
+                            createTritonGPUWSTaskPartition, int);
+  ADD_PASS_OPTION_WRAPPER_1("add_ws_data_partition",
+                            createTritonGPUWSDataPartition, int);
+  ADD_PASS_OPTION_WRAPPER_1("add_ws_lowering", createTritonGPUWSLowering, int);
+  ADD_PASS_OPTION_WRAPPER_1("add_taskid_propagate",
+                            createTritonGPUTaskIdPropagate, int);
+  ADD_PASS_OPTION_WRAPPER_4("add_ws_code_partition",
+                            createTritonGPUWSCodePartition, int, int, int, int);
 }
-
-void init_triton_passes_ttcpuir(py::module &&m) {}
 
 void init_triton_passes_convert(py::module &&m) {
   using namespace mlir;
@@ -75,7 +85,6 @@ void init_triton_passes_convert(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_cf_to_llvmir", createConvertControlFlowToLLVMPass);
   ADD_PASS_WRAPPER_0("add_index_to_llvmir", createConvertIndexToLLVMPass);
   ADD_PASS_WRAPPER_0("add_arith_to_llvmir", createArithToLLVMConversionPass);
-  ADD_PASS_WRAPPER_0("add_math_to_llvmir", createConvertMathToLLVMPass);
 }
 
 void init_triton_passes_llvmir(py::module &&m) {
@@ -88,7 +97,6 @@ void init_triton_passes(py::module &&m) {
   init_triton_passes_common(m.def_submodule("common"));
   init_triton_passes_convert(m.def_submodule("convert"));
   init_triton_passes_ttir(m.def_submodule("ttir"));
-  init_triton_passes_ttcpuir(m.def_submodule("ttcpuir"));
   init_triton_passes_ttgpuir(m.def_submodule("ttgpuir"));
   init_triton_passes_llvmir(m.def_submodule("llvmir"));
 }

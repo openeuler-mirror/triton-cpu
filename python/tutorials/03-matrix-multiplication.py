@@ -154,8 +154,6 @@ import torch
 import triton
 import triton.language as tl
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
 
 def is_cuda():
     return triton.runtime.driver.active.get_current_target().backend == "cuda"
@@ -208,19 +206,19 @@ def get_hip_autotune_config():
     return [
         triton.Config(
             {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 1, 'waves_per_eu': 2},
-            num_warps=4, num_stages=0),
+            num_warps=4, num_stages=2),
         triton.Config(
             {'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 4, 'waves_per_eu': 2},
-            num_warps=8, num_stages=0),
+            num_warps=8, num_stages=2),
         triton.Config(
             {'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 1, 'waves_per_eu': 2},
-            num_warps=8, num_stages=0),
+            num_warps=8, num_stages=2),
         triton.Config(
             {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8, 'waves_per_eu': 3},
-            num_warps=4, num_stages=0),
+            num_warps=4, num_stages=2),
         triton.Config(
             {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 1, 'waves_per_eu': 8},
-            num_warps=4, num_stages=0),
+            num_warps=4, num_stages=2),
     ]
 
 
@@ -357,8 +355,8 @@ def matmul(a, b, activation=""):
 # We can test our custom matrix multiplication operation against a native torch implementation (i.e., cuBLAS).
 
 torch.manual_seed(0)
-a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
-b = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
+a = torch.randn((512, 512), device='cuda', dtype=torch.float16)
+b = torch.randn((512, 512), device='cuda', dtype=torch.float16)
 triton_output = matmul(a, b)
 torch_output = torch.matmul(a, b)
 print(f"triton_output_with_fp16_inputs={triton_output}")
@@ -375,8 +373,8 @@ else:
 TORCH_HAS_FP8 = hasattr(torch, "float8_e5m2")
 if TORCH_HAS_FP8 and is_cuda():
     torch.manual_seed(0)
-    a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
-    b = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
+    a = torch.randn((512, 512), device="cuda", dtype=torch.float16)
+    b = torch.randn((512, 512), device="cuda", dtype=torch.float16)
     a = a.to(torch.float8_e5m2)
     # pre-transpose b for efficiency.
     b = b.T
@@ -425,8 +423,8 @@ for fp8_inputs in [False, True]:
 
 @triton.testing.perf_report(configs)
 def benchmark(M, N, K, provider, fp8_inputs):
-    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-    b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+    a = torch.randn((M, K), device='cuda', dtype=torch.float16)
+    b = torch.randn((K, N), device='cuda', dtype=torch.float16)
     if TORCH_HAS_FP8 and fp8_inputs:
         a = a.to(torch.float8_e5m2)
         b = b.T

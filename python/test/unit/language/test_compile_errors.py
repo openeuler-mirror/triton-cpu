@@ -7,16 +7,22 @@ import triton
 import triton.language as tl
 from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
 import traceback
-from triton._internal_testing import is_interpreter, is_cuda, is_hip, is_hip_mi300, is_hip_mi350
 
 
-def format_exception(type, value, tb):
-    list_msg = traceback.format_exception(type, value, tb, chain=False)
-    return "\n".join(list_msg)
+def is_interpreter():
+    return os.environ.get('TRITON_INTERPRET', '0') == '1'
 
 
-def is_cpu():
-    return not is_interpreter() and triton.runtime.driver.active.get_current_target().backend == "cpu"
+def is_cuda():
+    return not is_interpreter() and triton.runtime.driver.active.get_current_target().backend == "cuda"
+
+
+def is_hip():
+    return not is_interpreter() and triton.runtime.driver.active.get_current_target().backend == "hip"
+
+
+def is_on_mi300():
+    return is_hip() and triton.runtime.driver.active.get_current_target().arch in ('gfx940', 'gfx941', 'gfx942')
 
 
 def test_err_undefined_variable():
@@ -144,7 +150,8 @@ def test_err_in_builtin():
     try:
         inner = e.value.__cause__
         outer = e.value
-        assert "/core.py" in '\n'.join(traceback.format_tb(inner.__traceback__)), "error should point inside core.py"
+        assert f"{os.sep}core.py" in '\n'.join(traceback.format_tb(
+            inner.__traceback__)), "error should point inside core.py"
 
         assert "at 2:4:" in str(outer), "error should point to expand_dims call"
         assert "<source unavailable>" not in str(outer)
@@ -323,7 +330,7 @@ def test_global_access_in_fn_default_arg():
         pass
 
     # No error.
-    triton.compile(triton.compiler.ASTSource(fn=kernel, signature={0: "i32"}, constants={}))
+    triton.compile(triton.compiler.ASTSource(fn=kernel, signature={'a': "i32"}, constants={}))
 
 
 def test_defaults_assign_no_err():
@@ -335,29 +342,48 @@ def test_defaults_assign_no_err():
     triton.compile(triton.compiler.ASTSource(fn=kernel, signature={'a': 'i32'}, constants={'B': ""}))
 
 
+def test_where_warning(fresh_triton_cache):
+
+    @triton.jit
+    def kernel():
+        a = tl.full((64, ), 0, tl.uint32)
+        b = tl.full((64, ), 1, tl.float32)
+        c = tl.full((64, ), 2, tl.float32)
+        tl.where(a, b, c)
+
+    with pytest.warns(UserWarning):
+        triton.compile(triton.compiler.ASTSource(fn=kernel, signature={}, constants={}))
+
+
 @pytest.mark.parametrize("dtype", [tl.float8e5, tl.float8e5b16, tl.float8e4nv, tl.float8e4b8, tl.float8e4b15])
 def test_fp8_support(dtype):
+    warning_dtypes = []
     supported_dtypes = [tl.float8e5]
     if is_cuda():
         cc = torch.cuda.get_device_capability(0)
-        if cc < (9, 0):
-            supported_dtypes.append(tl.float8e4b15)
+        supported_dtypes.append(tl.float8e4b15)
+        if cc >= (9, 0):
+            warning_dtypes.append(tl.float8e4b15)
         if cc >= (8, 9):
             supported_dtypes.append(tl.float8e4nv)
     elif is_hip():
-        if is_hip_mi300():
+        if is_on_mi300():
             supported_dtypes += [tl.float8e4b8, tl.float8e5b16]
     elif is_interpreter():
         supported_dtypes = [tl.float8e5, tl.float8e5b16, tl.float8e4nv, tl.float8e4b8, tl.float8e4b15]
-    elif is_cpu():
-        supported_dtypes = [tl.float8e5, tl.float8e5b16, tl.float8e4nv]
 
     @triton.jit
     def dtype_kernel(dtype: tl.constexpr):
         _ = tl.full((256, ), 0.0, dtype)
 
-    maybe_error = (contextlib.nullcontext() if dtype in supported_dtypes else pytest.raises(CompilationError, match=""))
-    with maybe_error as e:
+    if dtype in warning_dtypes:
+        ctx = pytest.warns(UserWarning, match=r"fp8e4b15 is deprecated in this architecture")
+    elif dtype in supported_dtypes:
+        ctx = contextlib.nullcontext()
+    else:
+        ctx = pytest.raises(CompilationError, match="")
+
+    with ctx as e:
         triton.compile(triton.compiler.ASTSource(fn=dtype_kernel, signature={}, constants={"dtype": dtype}))
 
     if dtype not in supported_dtypes:

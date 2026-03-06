@@ -67,6 +67,13 @@ def exp(arg0, _builder=None):
 
 
 @core.extern
+def fast_expf(arg0, _builder=None):
+    return core.extern_elementwise("", "", [arg0], {
+        (core.dtype("fp32"), ): ("__triton_hip_fast_expf", core.dtype("fp32")),
+    }, is_pure=True, _builder=_builder)
+
+
+@core.extern
 def fast_dividef(arg0, arg1, _builder=None):
     return core.extern_elementwise("", "", [arg0, arg1], {
         (core.dtype("fp32"), core.dtype("fp32")): ("__triton_hip_fast_fdividef", core.dtype("fp32")),
@@ -110,7 +117,7 @@ def isnan(arg0, _builder=None):
         ], {
             (core.dtype("fp32"), ): ("__ocml_isnan_f32", core.dtype("int32")),
             (core.dtype("fp64"), ): ("__ocml_isnan_f64", core.dtype("int32")),
-        }, is_pure=True, _builder=_builder)
+        }, is_pure=True, _builder=_builder).to(core.int1, _builder=_builder)
 
 
 @core.extern
@@ -139,7 +146,7 @@ def isinf(arg0, _builder=None):
         "", "", [arg0], {
             (core.dtype("fp32"), ): ("__ocml_isinf_f32", core.dtype("int32")),
             (core.dtype("fp64"), ): ("__ocml_isinf_f64", core.dtype("int32")),
-        }, is_pure=True, _builder=_builder)
+        }, is_pure=True, _builder=_builder).to(core.int1, _builder=_builder)
 
 
 @core.extern
