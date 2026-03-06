@@ -184,7 +184,11 @@ class CPUBackend(BaseBackend):
             _dump_ir_if_needed([src_path])
             triton_shared_opt_path = _get_triton_shared_opt_path()
             try:
-                subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "-o", dst_path])
+                # If mlir dump is enabled, pass option --mlir-print-ir-after-all to triton-shared
+                if os.environ.get("MLIR_ENABLE_DUMP", "0") == "1":
+                    subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "--mlir-print-ir-after-all", "-o", dst_path])
+                else:
+                    subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "-o", dst_path])
                 return Path(dst_path).read_text()
             except subprocess.CalledProcessError as e:
                 if ENABLE_FALLBACK:
