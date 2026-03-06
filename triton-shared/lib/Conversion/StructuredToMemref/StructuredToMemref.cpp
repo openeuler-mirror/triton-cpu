@@ -870,7 +870,7 @@ private:
 
     llvm::SmallVector<int64_t, 4> allocStridesInt;
     int64_t offset;
-    if (failed(getStridesAndOffset(allocType, allocStridesInt, offset))) {
+    if (failed(allocType.getStridesAndOffset(allocStridesInt, offset))) {
       // Handle error if needed
     }
 

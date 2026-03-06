@@ -25,7 +25,7 @@ using namespace dataflow;
 // Use Analysis
 // Note that logic below should evolve with triton-to-affine pass
 //===----------------------------------------------------------------------===//
-void
+LogicalResult
 triton::UseAnalysis::visitOperation(Operation *op, ArrayRef<UseInfo *> operands,
                                     ArrayRef<const UseInfo *> results) {
   // If an op only produces pointer, all its operands are used as meta data.
@@ -85,6 +85,7 @@ triton::UseAnalysis::visitOperation(Operation *op, ArrayRef<UseInfo *> operands,
           propagateResults(operand, results);
         }
       });
+      return success();
 }
 
 LogicalResult triton::runUseAnalysis(triton::FuncOp &funcOp) {

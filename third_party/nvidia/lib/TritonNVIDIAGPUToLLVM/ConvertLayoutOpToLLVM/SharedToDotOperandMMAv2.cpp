@@ -1,6 +1,7 @@
 #include "TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
 #include "Utility.h"
 #include "mlir/Support/LLVM.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 
 using namespace mlir;
 

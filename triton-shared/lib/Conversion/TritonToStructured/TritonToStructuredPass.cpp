@@ -82,7 +82,7 @@ public:
     RewritePatternSet patterns(&getContext());
 
     auto context = &getContext();
-    OneToNTypeConverter converter;
+    TypeConverter converter;
     converter.addConversion([](Type type) { return type; });
 
     // We are doing a 1->1 type conversion here, where a triton pointer type
@@ -181,7 +181,7 @@ public:
     auto moduleOp = getOperation();
 
     auto context = &getContext();
-    OneToNTypeConverter converter;
+    TypeConverter converter;
     converter.addConversion([](Type type) { return type; });
 
     // We are doing a 1->N type conversion here, where a pointer tuple type
