@@ -2,7 +2,6 @@
 # Import order is significant here.
 
 from . import math
-from . import sme_matrix
 from . import extra
 from .standard import (
     argmax,
@@ -29,6 +28,7 @@ from .core import (
     TRITON_MAX_TENSOR_NUMEL,
     _experimental_descriptor_load,
     _experimental_descriptor_store,
+    add,
     advance,
     arange,
     associative_scan,
@@ -54,6 +54,7 @@ from .core import (
     device_assert,
     device_print,
     dot,
+    dot_scaled,
     dtype,
     expand_dims,
     float16,
@@ -85,6 +86,7 @@ from .core import (
     permute,
     pi32_t,
     pointer_type,
+    nv_tma_desc_type,
     program_id,
     range,
     reduce,
@@ -118,7 +120,6 @@ from .random import (
     randn4x,
     uint_to_uniform_float,
 )
-from .sme_matrix import (smeadd, smematmul, smesub, smetranspose)
 
 __all__ = [
     "PropagateNan",
@@ -126,6 +127,7 @@ __all__ = [
     "_experimental_descriptor_load",
     "_experimental_descriptor_store",
     "abs",
+    "add",
     "advance",
     "arange",
     "argmax",
@@ -160,6 +162,7 @@ __all__ = [
     "device_print",
     "div_rn",
     "dot",
+    "dot_scaled",
     "dtype",
     "erf",
     "exp",
@@ -209,6 +212,7 @@ __all__ = [
     "philox_impl",
     "pi32_t",
     "pointer_type",
+    "nv_tma_desc_type",
     "program_id",
     "rand",
     "rand4x",
@@ -223,10 +227,6 @@ __all__ = [
     "rsqrt",
     "sigmoid",
     "sin",
-    "smeadd",
-    "smematmul",
-    "smesub",
-    "smetranspose",
     "softmax",
     "sort",
     "split",
@@ -265,6 +265,10 @@ def str_to_ty(name):
             const = True
         ty = str_to_ty(name)
         return pointer_type(element_ty=ty, const=const)
+
+    if name == "nvTmaDesc":
+        return nv_tma_desc_type()
+
     tys = {
         "fp8e4nv": float8e4nv,
         "fp8e4b8": float8e4b8,

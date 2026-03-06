@@ -575,13 +575,20 @@ public:
     return *this;
   }
 
-  // divideLeft and divideRight are the inverses of operator*.
-  //
-  // If c = a * b, then a = c.divideRight(b) and b = c.divideLeft(a).
-  //
-  // TODO(jlebar): Implement divideLeft.
-  // std::optional<LinearLayout> divideLeft(const LinearLayout &divisor);
-  std::optional<LinearLayout> divideRight(const LinearLayout &divisor);
+  // Returns true if this layout acts trivially (as the identity) on the given
+  // dimensions. This means that it's the identity on those dimensions, and it
+  // does not map other dimensions onto those or these onto other dimensions.
+  bool isTrivialOver(ArrayRef<StringAttr> dimNames) const;
+
+  // For an endomorphism on dimNames (linear map that maps dimNames to dimNames)
+  // checks whether it is the identity map on these dimensions (i.e
+  // LinearLayouts::isTrivialOver) and if so, returns the sublayout of the
+  // remaining dimensions.
+  // nb. The isTrivialOver condition is more restrictive than the usual
+  //     "leaves the subspace invariant" condition in maths.
+  //     We can always relax it if we know how to take advantage of a conversion
+  //     layout being block-diagonal in the future.
+  std::optional<LinearLayout> quotient(ArrayRef<StringAttr> dimNames) const;
 
   // Gets a layout with only these in/out dimensions.
   //
@@ -598,10 +605,10 @@ public:
   bool sublayoutIsZero(ArrayRef<StringAttr> inDimNames,
                        ArrayRef<StringAttr> outDimNames) const;
 
-  // Is the sublayout restricted to inDimNames + outDimNames and then flattened
-  // to 1D the identity layout (ignoring out-dim sizes)?
-  bool sublayoutIsIdentity(ArrayRef<StringAttr> inDimNames,
-                           ArrayRef<StringAttr> outDimNames) const;
+  // Is the sublayout defined from dimNames to dimNames the identity?
+  // In particular, is the input and  output size in these dimensions
+  // the same, and are the bases the identity?
+  bool squareSublayoutIsIdentity(ArrayRef<StringAttr> dimNames) const;
 
   // Computes and returns L(x, y, z).
   //

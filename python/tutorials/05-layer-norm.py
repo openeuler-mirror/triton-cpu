@@ -42,8 +42,6 @@ try:
 except ModuleNotFoundError:
     HAS_APEX = False
 
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
 
 @triton.jit
 def _layer_norm_fwd_fused(
@@ -290,12 +288,9 @@ class LayerNorm(torch.autograd.Function):
 
 
 layer_norm = LayerNorm.apply
-device = triton.runtime.driver.active.get_current_target().backend
-# Torch doesn't support operations in float16 on CPU so use float32 instead
-dtype = torch.float32 if device == 'cpu' else torch.float16
 
 
-def test_layer_norm(M, N, dtype, eps=1e-5, device=DEVICE):
+def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
     # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
@@ -331,9 +326,9 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device=DEVICE):
         styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
         ylabel='GB/s',
         plot_name='layer-norm-backward',
-        args={'M': 4096, 'dtype': dtype, 'mode': 'backward'},
+        args={'M': 4096, 'dtype': torch.float16, 'mode': 'backward'},
     ))
-def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device=DEVICE):
+def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda'):
     # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
@@ -369,8 +364,8 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device=DE
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 
-test_layer_norm(1151, 8192, dtype, device=device)
-bench_layer_norm.run(save_path='.', print_data=True, device=device)
+test_layer_norm(1151, 8192, torch.float16)
+bench_layer_norm.run(save_path='.', print_data=True)
 
 # %%
 # References

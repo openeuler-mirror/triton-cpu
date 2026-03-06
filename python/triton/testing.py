@@ -92,8 +92,7 @@ def do_bench_cudagraph(fn, rep=20, grad_to_none=None, quantiles=None, return_mod
         return _summarize_statistics(torch.tensor(ret), quantiles, return_mode)
 
 
-def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean",
-             measure_time_with_hooks=False):
+def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean"):
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
     the 20-th and 80-th performance percentile.
@@ -108,11 +107,10 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
     :type grad_to_none: torch.tensor, optional
     :param quantiles: Performance percentile to return in addition to the median.
     :type quantiles: list[float], optional
-    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all" Default is "mean".
-    :type return_mode: str
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all" Default is "mean".    :type return_mode: str
     """
-    import torch
     assert return_mode in ["min", "max", "mean", "median", "all"]
+    import torch
 
     di = runtime.driver.active.get_device_interface()
 
@@ -121,20 +119,16 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
 
     cache = runtime.driver.active.get_empty_cache_for_benchmark()
 
+    # Estimate the runtime of the function
     start_event = di.Event(enable_timing=True)
     end_event = di.Event(enable_timing=True)
     start_event.record()
     for _ in range(5):
-        runtime.driver.active.clear_cache(cache)
+        cache.zero_()
         fn()
     end_event.record()
     di.synchronize()
     estimate_ms = start_event.elapsed_time(end_event) / 5
-
-    # For CPU we can use entry and exit hooks to measure execution time
-    # more precisely.
-    if measure_time_with_hooks:
-        di.enable_hook_timing()
 
     # compute number of warmup and repeat
     n_warmup = max(1, int(warmup / estimate_ms))
@@ -153,14 +147,13 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
             for x in grad_to_none:
                 x.grad = None
         # we clear the L2 cache before each run
-        runtime.driver.active.clear_cache(cache)
+        cache.zero_()
         # record time of `fn`
         start_event[i].record()
         fn()
         end_event[i].record()
     # Record clocks
     di.synchronize()
-
     times = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
     return _summarize_statistics(times, quantiles, return_mode)
 

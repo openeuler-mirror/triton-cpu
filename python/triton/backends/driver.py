@@ -1,4 +1,4 @@
-from abc import ABCMeta, abstractmethod
+from abc import ABCMeta, abstractmethod, abstractclassmethod
 from typing import Callable, List, Protocol, Sequence
 
 
@@ -10,17 +10,12 @@ class Benchmarker(Protocol):
 
 class DriverBase(metaclass=ABCMeta):
 
-    @classmethod
-    @abstractmethod
+    @abstractclassmethod
     def is_active(self):
         pass
 
     @abstractmethod
     def get_current_target(self):
-        pass
-
-    @abstractmethod
-    def get_active_torch_device(self):
         pass
 
     @abstractmethod

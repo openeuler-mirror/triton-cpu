@@ -97,10 +97,12 @@ tt.func @sub() {
   %1 = arith.constant dense<1> : tensor<128xi32>
   // CHECK-NEXT: contiguity = [128], divisibility = [1], constancy = [1], constant_value = <none>
   %2 = arith.subi %0, %1 : tensor<128xi32>
+  // CHECK-NEXT: contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>
+  %3 = arith.subi %1, %0 : tensor<128xi32>
   // CHECK-NEXT: contiguity = [1], divisibility = [1], constancy = [128], constant_value = 129
-  %3 = arith.constant dense<129> : tensor<128xi32>
+  %4 = arith.constant dense<129> : tensor<128xi32>
   // CHECK-NEXT: contiguity = [1], divisibility = [128], constancy = [128], constant_value = 128
-  %4 = arith.subi %3, %1 : tensor<128xi32>
+  %5 = arith.subi %4, %1 : tensor<128xi32>
   tt.return
 }
 
@@ -862,4 +864,15 @@ tt.func public @chained_for(%8: tensor<128x64x!tt.ptr<bf16>> {tt.divisibility = 
     scf.yield %11 : tensor<128x64x!tt.ptr<bf16>>
   }
   tt.return
+}
+
+// -----
+
+// CHECK-LABEL: @int_min_does_not_underflow_in_analysis
+module {
+  tt.func @int_min_does_not_underflow_in_analysis() -> i64 {
+    // CHECK: divisibility = [4611686018427387904]
+    %int_min = arith.constant -9223372036854775808 : i64
+    tt.return %int_min : i64
+  }
 }

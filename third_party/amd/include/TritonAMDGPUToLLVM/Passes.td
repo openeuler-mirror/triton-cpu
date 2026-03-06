@@ -49,10 +49,34 @@ def ConvertTritonAMDGPUToLLVM : Pass<"convert-triton-amdgpu-to-llvm", "mlir::Mod
 
 def ConvertBuiltinFuncToLLVM : Pass<"convert-builtin-func-to-llvm", "mlir::ModuleOp"> {
     let summary = "Convert Builtin Func to LLVM";
-    let constructor = "mlir::triton::createConvertBuiltinFuncToLLVMPass()";
+    let constructor = "mlir::triton::createConvertBuiltinFuncToLLVMPass(/*ftz=*/true)";
 
     let dependentDialects = ["mlir::LLVM::LLVMDialect"];
 
+    let options = [
+        Option<"ftz", "ftz", "bool", /*default*/"true",
+               "flush denorms for math functions">,
+    ];
 }
+
+def InsertInstructionSchedHints : Pass<"insert-instruction-sched-hints", "mlir::ModuleOp"> {
+    let summary = "Insert instruction scheduling hints after the dot ops in the main loop";
+    let constructor = "mlir::triton::createInsertInstructionSchedHintsPass()";
+
+    let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+}
+
+def LowerInstructionSchedHints : Pass<"lower-insert-instruction-sched-hints", "mlir::ModuleOp"> {
+    let summary = "Lower instruction scheduling hints to LLVM intrinsics";
+    let constructor = "mlir::triton::createLowerInstructionSchedHintsPass(\"\")";
+
+    let dependentDialects = ["mlir::LLVM::LLVMDialect"];
+
+    let options = [
+        Option<"variant", "variant", "std::string", /*default*/"\"default\"",
+               "instruction scheduling variant">,
+    ];
+}
+
 
 #endif
