@@ -1899,7 +1899,6 @@ def test_join_with_mma(device):
     torch.testing.assert_close(z, z_ref)
 
 
-@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("debug", [False, True])
 def test_interleave(device, debug):
