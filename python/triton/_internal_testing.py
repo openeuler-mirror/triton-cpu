@@ -44,6 +44,8 @@ def get_arch():
     target = get_current_target()
     return "" if target is None else str(target.arch)
 
+def is_cpu():
+    return not is_interpreter() and triton.runtime.driver.active.get_current_target().backend == "cpu"
 
 def numpy_random(shape, dtype_str, rs: Optional[RandomState] = None, low=None, high=None):
     """

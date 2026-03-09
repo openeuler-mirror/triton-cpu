@@ -509,7 +509,7 @@ bool supportMMA(triton::DotOp op, int version) {
     }
     // We cannot use MMA_V3 if we need to accumulate in F32 within the MMA op.
     if (op.getMaxNumImpreciseAcc() < 32 &&
-        (llvm::isa<Float8E5M2Type, Float8E4M3FNType(aElemTy)) &&
+        (llvm::isa<Float8E5M2Type, Float8E4M3FNType>(aElemTy)) &&
         cast<RankedTensorType>(op.getType()).getElementType().isF32()) {
       return false;
     }
@@ -530,7 +530,7 @@ bool supportMMA(Value value, int version) {
   // FP8 is not natively supported on all mma versions but it can always be
   // promoted to fp16 therefore we can always support it.
   bool isFP8 = llvm::isa<Float8E5M2Type, Float8E4M3FNType, Float8E5M2FNUZType,
-                         Float8E4M3FNUZType(elemTy);
+                         Float8E4M3FNUZType>(elemTy);
   return isFP8 || elemTy.isF16() || elemTy.isBF16() ||
          (elemTy.isF32() && version >= 2) ||
          (elemTy.isInteger(8) && version >= 2);

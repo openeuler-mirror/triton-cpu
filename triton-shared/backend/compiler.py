@@ -1,5 +1,5 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, CPUFallbackException
-from triton._C.libtriton import ir, passes, cpu, llvm, triton_shared
+from triton._C.libtriton import ir, passes, llvm, triton_shared
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple, Optional
 from types import ModuleType
@@ -63,6 +63,7 @@ class CPUOptions:
     # Target specific backends can eanble it with supported types.
     allowed_dot_input_precisions: Tuple[str] = ("ieee", "tf32", "tf32x3")
     supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e5b16", "fp8e4nv")
+    deprecated_fp8_dtypes: Tuple[str] = ()
     allow_fp8e4nv: bool = True
     allow_fp8e4b15: bool = True
     enable_fp_fusion: bool = True
@@ -410,7 +411,7 @@ class CPUBackend(BaseBackend):
                     tiled2.results[0],
                     copy_back_op="none",
                     pad_to_multiple_of=[1, 1, 1],
-                    pack_paddings = Attribute.parse("[0, 1, 1, 0]"),
+                    nofold_flags = Attribute.parse("[0, 1, 1, 0]"),
                     padding_dimensions=Attribute.parse("[0, 1, 2]"),
                     padding_values=[StringAttr.get("0x0"), StringAttr.get("0x0"), StringAttr.get("0x0"), StringAttr.get("0x0")],
                 )

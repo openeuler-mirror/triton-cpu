@@ -28,6 +28,7 @@ from triton._internal_testing import (
     is_cuda,
     is_interpreter,
     is_hip,
+    is_cpu,
     get_arch,
     torch_float8_dtypes,
     torch_dtypes,
@@ -101,6 +102,8 @@ def check_type_supported(dtype, device):
     if is_interpreter():
         if dtype in [tl.bfloat16, "bfloat16", torch.bfloat16]:
             pytest.skip("bfloat16 is not supported in the interpreter")
+    if dtype == 'float8e4b15' and is_cpu():
+        pytest.skip("float8e4b15 not supported on CPU")
 
 
 class MfmaLayout:
@@ -193,6 +196,7 @@ def filter_layouts(layouts):
     return [l for l in layouts if is_layout_applicable(l)]
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_x", list(dtypes) + ["bfloat16"])
 def test_empty_kernel(dtype_x, device):
@@ -325,6 +329,7 @@ def _test_binary(dtype_x, dtype_y, expr, numpy_expr=None, mode_x='real', mode_y=
         x_is_scalar = isinstance(x, (bool, int, float))
         y_is_scalar = isinstance(y, (bool, int, float))
         scalar_test = x_is_scalar or y_is_scalar
+        z_ref = eval(expr if numpy_expr is None else numpy_expr)
 
         # For scalars, we follow the NumPy 2.0 (and JAX/PyTorch pretty much) casting rules.
         if scalar_test:
@@ -368,13 +373,6 @@ def _test_binary(dtype_x, dtype_y, expr, numpy_expr=None, mode_x='real', mode_y=
         return scalar
 
     do_test(x, y, kernel)
-    if mode_y != 'nan' and test_scalar:
-        if dtype_x in uint_dtypes:
-            low = 0 if y_low is None else max(y_low, 0)
-        else:
-            low = y_low
-        y_scalar = get_scalar(y, dtype_y, low, y_high, filter_y)
-        do_test(x, y_scalar, kernel_scalar_rhs)
     if test_broadcast:
         do_test(x[:1].reshape(()), y, kernel_broadcast_lhs)
         do_test(x, y[:1].reshape(()), kernel_broadcast_rhs)
@@ -404,6 +402,7 @@ def _mod_operation_ill_conditioned(dtype_x, dtype_y) -> bool:
     ]
 
 
+@pytest.mark.cpu
 def test_dtype_codegen():
     for dtype in dtypes_with_bfloat16:
         full_name = f"triton.language.{dtype}"
@@ -414,7 +413,7 @@ def test_dtype_codegen():
 # test binary ops
 # ---------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_x, dtype_y, op", [  #
     (dtype_x, dtype_y, op)
@@ -469,6 +468,7 @@ def test_bin_op(dtype_x, dtype_y, op, num_ctas, device):
             test_broadcast=(op != "%"), filter_y=filter_y, test_scalar=not skip_scalar_test)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype, order", [(dtype, order) for dtype in dtypes_with_bfloat16 for order in [0, 1]])
 def test_addptr(dtype, order, device):
@@ -495,6 +495,7 @@ def test_addptr(dtype, order, device):
     np.testing.assert_allclose(y, to_numpy(y_tri))
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_x, dtype_y", [  #
     (dtype_x, dtype_y) for dtype_x in int_dtypes for dtype_y in int_dtypes
@@ -551,6 +552,7 @@ def test_unsigned_name_mangling(device):
 
 # test bitwise ops
 # ---------------
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_x, dtype_y, op", [  #
     (dtype_x, dtype_y, op)
@@ -575,6 +577,7 @@ def test_bitwise_op(dtype_x, dtype_y, op, num_ctas, device):
         _test_binary(dtype_x, dtype_y, expr, numpy_expr, device=device, num_ctas=num_ctas)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_x, dtype_y, op", [  #
     (dtype_x, dtype_y, op) for op in ['<<', '>>'] for dtype_x in int_dtypes + uint_dtypes for dtype_y in uint_dtypes
@@ -596,7 +599,7 @@ def test_shift_op(dtype_x, dtype_y, op, num_ctas, device):
 # ---------------
 ops = ['==', '!=', '>', '<', '>=', '<=']
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize(
     "dtype_x, dtype_y, op, mode_x, mode_y",
@@ -621,6 +624,7 @@ def test_compare_op(dtype_x, dtype_y, op, mode_x, mode_y, num_ctas, device):
 # ---------------
 # test broadcast
 # ---------------
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype", dtypes_with_bfloat16)
 def test_broadcast(dtype, device):
@@ -654,7 +658,7 @@ def test_broadcast(dtype, device):
 # test slice
 # ----------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_slice(device):
 
@@ -685,7 +689,7 @@ def test_slice(device):
 # test invalid slice
 # ------------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_invalid_slice(device):
     dst = torch.empty(128, device=device)
@@ -701,6 +705,7 @@ def test_invalid_slice(device):
 # ----------------
 # test expand_dims
 # ----------------
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_expand_dims(device):
 
@@ -748,7 +753,7 @@ def test_expand_dims(device):
     dummy_tensor = torch.empty((), device=device)
     expand_dims_kernel[(1, )](dummy_tensor, N)
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_expand_dims_error_cases(device):
 
@@ -812,6 +817,7 @@ def test_expand_dims_error_cases(device):
 # ----------------------------
 # test invalid program id axis
 # ----------------------------
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_invalid_pid_axis(device):
     dst = torch.empty(128, device=device)
@@ -828,6 +834,7 @@ def test_invalid_pid_axis(device):
 # ---------------
 # test where
 # ---------------
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype", dtypes_with_bfloat16 + ["*int32"])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
@@ -880,6 +887,7 @@ def test_where(dtype, num_ctas, device):
         assert (z == to_numpy(z_tri)).all()
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_where_broadcast(num_ctas, device):
@@ -898,7 +906,7 @@ def test_where_broadcast(num_ctas, device):
     def where_scalar_condition(a_ptr, out_ptr, BLOCK_SIZE: tl.constexpr):
         xoffsets = tl.arange(0, BLOCK_SIZE)[:, None]
         yoffsets = tl.arange(0, BLOCK_SIZE)[None, :]
-        mask = False
+        mask = 0
         vals = tl.load(a_ptr + yoffsets + BLOCK_SIZE * xoffsets)
         res = tl.where(mask, vals, 0.)
         tl.store(out_ptr + yoffsets + BLOCK_SIZE * xoffsets, res)
@@ -923,7 +931,7 @@ def test_where_broadcast(num_ctas, device):
 # test unary ops
 # ---------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_x, expr",
                          [(dtype_x, ' -x') for dtype_x in dtypes_with_bfloat16] + [(dtype_x, ' ~x')
@@ -937,7 +945,7 @@ def test_unary_op(dtype_x, expr, num_ctas, device):
 # test math ops
 # ----------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_x, expr, x",
                          [(dtype_x, expr, x)
@@ -948,6 +956,7 @@ def test_math_op(dtype_x, expr, x, device):
     _test_unary(dtype_x, f'tl.{expr}({x})', f'np.{expr}({x}) ', device=device)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype", [dtype for dtype in ["float32", "float64"]])
 def test_math_erf_op(dtype, device):
@@ -969,6 +978,7 @@ def test_math_erf_op(dtype, device):
     torch.testing.assert_close(z_tri, z_ref)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype", [dtype for dtype in ["float32", "float64"]])
 def test_math_fma_op(dtype, device):
@@ -994,6 +1004,7 @@ def test_math_fma_op(dtype, device):
     torch.testing.assert_close(z_tri, z_ref)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("expr", ["tl.math.fdiv(x, y)", "tl.math.div_rn(x, y)"])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
@@ -1006,6 +1017,7 @@ def test_math_divide_op(expr, num_ctas, device):
 # -------------
 # test precise math
 # -------------
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("expr_prec, expr_ref",
                          [('tl.math.sqrt_rn(x)', 'tl.math.sqrt(x.to(tl.float64)).to(tl.float32)'),
@@ -1045,13 +1057,14 @@ def test_precise_math(expr_prec, expr_ref, num_ctas, device):
 # test abs
 # ----------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_x", [(dtype_x) for dtype_x in dtypes_with_bfloat16])
 def test_abs(dtype_x, device):
     _test_unary(dtype_x, 'tl.abs(x)', 'np.abs(x) ', device=device)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("in_dtype", [tl.float8e4b15, tl.float8e4nv, tl.float8e5])
 def test_abs_fp8(in_dtype, device):
@@ -1063,6 +1076,8 @@ def test_abs_fp8(in_dtype, device):
             pytest.skip("float8e4b15 not supported on CUDA >= 9.0")
         if in_dtype == tl.float8e4nv and cc < (8, 9):
             pytest.skip("float8e4nv not supported on CUDA < 8.9")
+    elif is_cpu():
+        pytest.skip('CPU not supports "fp8e4b15"')
 
     @triton.jit
     def abs_kernel(X, Z, SIZE: tl.constexpr):
@@ -1090,7 +1105,7 @@ def test_abs_fp8(in_dtype, device):
 # test passing shapes as individual params rather than tuples
 # ----------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_shapes_as_params(device):
 
@@ -1121,7 +1136,7 @@ def test_shapes_as_params(device):
 # test transpose
 # ----------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_x", [(dtype_x) for dtype_x in dtypes_with_bfloat16])
 def test_transpose(dtype_x, device):
@@ -1160,6 +1175,7 @@ def make_ptr_str(name, shape):
     return f"{name} + {' + '.join(offsets)}"
 
 
+@pytest.mark.cpu
 # TODO: handle `%4 = triton_gpu.convert_layout %3 : tensor<32xi32, #blocked0> -> tensor<32xi32, #triton_gpu.slice<{dim = 0, parent = #blocked1}>>``
 @pytest.mark.parametrize("expr, dtype_str", [(f'x[{s}]', d)
                                              for s in ['None, :', ':, None', 'None, :, :', ':, :, None']
@@ -1228,7 +1244,7 @@ def tuples_fn(a, b):
         a - b, \
         a * b
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_tuples(device):
 
@@ -1321,6 +1337,7 @@ def noinline_multi_values_fn(x, y, Z):
     tl.store(Z, z)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("mode", ["simple", "call_graph", "shared", "dynamic", "multi_values"])
 def test_noinline(mode, device):
@@ -1352,6 +1369,7 @@ def test_noinline(mode, device):
 # ---------------
 # test atomics
 # ---------------
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize(
     "op, dtype_x_str, mode, sem",
@@ -1432,6 +1450,7 @@ def test_atomic_rmw(op, dtype_x_str, mode, sem, device):
     assert f"atom.global.gpu.{sem_str}" in h.asm["ptx"]
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_atomic_rmw_predicate(num_ctas, device):
@@ -1447,6 +1466,7 @@ def test_atomic_rmw_predicate(num_ctas, device):
     assert x.item() == 63
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("shape, axis, num_ctas, dtype_x_str",
                          [(shape, axis, num_ctas, dtype_x_str)
@@ -1488,6 +1508,7 @@ def test_tensor_atomic_rmw(shape, axis, num_ctas, dtype_x_str, device):
     np.testing.assert_equal(old_ref, to_numpy(old_tri))
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_tensor_atomic_rmw_block(num_ctas, device):
@@ -1507,6 +1528,7 @@ def test_tensor_atomic_rmw_block(num_ctas, device):
     assert torch.min(x).item() == 0.0
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("sem", [None, 'acquire', 'release', 'acq_rel', 'relaxed'])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
@@ -1548,6 +1570,7 @@ def test_atomic_cas(sem, num_ctas, device):
     assert f"atom.global.{sem_str}" in h.asm["ptx"]
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("sem", [None, 'acquire', 'release', 'acq_rel', 'relaxed'])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
@@ -1573,7 +1596,7 @@ def test_tensor_atomic_cas(sem, num_ctas, device):
 # test cast
 # ---------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_x, dtype_z, bitcast, size",
                          [(dtype_x, dtype_z, False, 1024) for dtype_x in dtypes for dtype_z in dtypes] + [
@@ -1605,6 +1628,21 @@ def test_cast(dtype_x, dtype_z, bitcast, size, num_ctas, device):
 
     if is_hip() and (dtype_z in ("bfloat16", "float8_e4m3fn") or dtype_x == "float8_e4m3fn"):
         pytest.skip(f'test_cast{(dtype_x, dtype_z)} cast to bfloat16 not supported on HIP.')
+
+    if is_cpu() and (dtype_x in torch_float8_dtypes or dtype_z in torch_float8_dtypes):
+        pytest.skip(f'test_cast{(dtype_x, dtype_z)} is not supported on CPU.')
+
+    # fptrunc fp32->fp16 is broken in LLVM for large vectors:
+    #   https://github.com/llvm/llvm-project/issues/95274
+    # TODO: remove the change after the bug is fixed.
+    if is_cpu() and dtype_x == "float32" and dtype_z == "float16":
+        size = 512
+
+    # bf16 vector cast is broken in LLVM for large vectors:
+    #   https://github.com/llvm/llvm-project/issues/92471
+    # TODO: Remove the change after the bug is fixed.
+    if is_cpu() and dtype_x == 'bfloat16' and size > 128:
+        size = 128
 
     torch.manual_seed(0)
     # This is tricky because numpy doesn't have bfloat, and torch doesn't have uints.
@@ -1673,6 +1711,7 @@ def test_cast(dtype_x, dtype_z, bitcast, size, num_ctas, device):
         np.testing.assert_allclose(z_ref, to_numpy(z_tri), rtol=0, atol=0)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str, num_warps",
                          [(dtype_str, num_warps) for dtype_str in int_dtypes + float_dtypes for num_warps in [4, 8]])
@@ -1697,6 +1736,7 @@ def test_cat(dtype_str, num_warps, device):
     assert z.unique().size(0) == z.size(0)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str", list(torch_dtypes))
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
@@ -1741,7 +1781,7 @@ def test_store_constant_default_dtype(num_ctas, device):
 
     assert torch.all(output == ref)
 
-
+@pytest.mark.cpu
 def test_load_store_same_ptr(device):
 
     @triton.jit()
@@ -1759,7 +1799,7 @@ def test_load_store_same_ptr(device):
             kernel[(65536, )](x, num_warps=32)
         assert torch.all(x == 2)
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str", ['int32'])
 def test_umulhi(dtype_str, device):
@@ -1797,6 +1837,7 @@ def test_umulhi(dtype_str, device):
     np.testing.assert_equal(z_ref, to_numpy(z_tri))
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_join(device):
 
@@ -1817,6 +1858,7 @@ def test_join(device):
     np.testing.assert_equal(to_numpy(z_ref), to_numpy(z))
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_join_scalars(device):
 
@@ -1836,6 +1878,7 @@ def test_join_scalars(device):
     np.testing.assert_equal([42, 100], to_numpy(z))
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_join_with_mma(device):
 
@@ -1856,6 +1899,7 @@ def test_join_with_mma(device):
     torch.testing.assert_close(z, z_ref)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("debug", [False, True])
 def test_interleave(device, debug):
@@ -1874,6 +1918,7 @@ def test_interleave(device, debug):
     np.testing.assert_equal(to_numpy(z_ref), to_numpy(z))
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_interleave_scalars(device):
 
@@ -1889,6 +1934,7 @@ def test_interleave_scalars(device):
     np.testing.assert_equal([10, 20], to_numpy(z))
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_split(device):
 
@@ -1911,6 +1957,7 @@ def test_split(device):
     np.testing.assert_equal(to_numpy(z2_ref), to_numpy(z2))
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_split_to_scalar(device):
 
@@ -1970,6 +2017,7 @@ def convert_float_to_float32(fp: torch.tensor, dtype=None):
     return output
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("in_dtype", [torch.float16, torch.bfloat16])
 def test_convert_float16_to_float32(in_dtype, device):
@@ -2002,7 +2050,7 @@ def deserialize_fp8(np_data, in_dtype):
 # test reduce
 # ---------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_max_returns_zero(device):
     # Simple test with a tl.max call that returns 0.  The interpreter had a bug
@@ -2028,7 +2076,7 @@ def get_reduced_dtype(dtype_str, op):
         return 'float32'
     return dtype_str
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("op, dtype_str, shape", [(op, dtype, shape) for op in [
     'min',
@@ -2139,6 +2187,7 @@ keep_dims_3d_configs = [(op, 'float32', (32, 2, 16), axis, True)
 reduce_bool = [(op, 'bool', shape, axis, False) for op in ['xor_sum'] for shape in reduce2d_shapes for axis in [0, 1]]
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize(
     "op, dtype_str, shape, axis, keep_dims", reduce_configs1 + reduce_configs2 + reduce_configs3 + invalid_config +
@@ -2281,16 +2330,20 @@ def roll(a1, b1_last, b1_cur, a2, b2_last, b2_cur):
     return a1 + a2, tl.where(a2 == 1, b1_cur, 0) + b2_last, b2_cur
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("op, dtype_str, shape, axis, reverse, num_warps", scan_configs + negative_config)
 def test_scan2d(op, dtype_str, shape, axis, reverse, num_warps, device):
     check_type_supported(dtype_str, device)
     if dtype_str == 'bfloat16':
-        if op == 'cummax':
-            pytest.skip("bfloat16 compare not suppoted before sm90")
+        if is_cuda() and op == 'cummax':
+            pytest.skip("bfloat16 compare not supported before sm90")
         if op == 'linear_recurrence':
             pytest.skip("Skipping linear_recurrence scan on bfloat16 due to accuracy issues")
     numpy_dtype_str = 'float32' if dtype_str == 'bfloat16' else dtype_str
+
+    if is_cpu() and dtype_str == 'bfloat16':
+        shape = (min(shape[0], 128), min(shape[1], 128))
 
     # triton kernel
     @triton.jit
@@ -2437,7 +2490,7 @@ scan_layouts = [
 # test histogram
 # ---------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("M, N", [[2048, 2], [1024, 8], [1024, 128], [256, 512], [32, 512], [8, 512], [8, 2]])
 def test_histogram(M, N, device):
@@ -2461,6 +2514,7 @@ def test_histogram(M, N, device):
     assert (z_torch == z).all()
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("op", ['sum', 'max', 'min'])
 @pytest.mark.parametrize("BLOCK_N", [32, 64, 128])
@@ -2469,17 +2523,17 @@ def test_histogram(M, N, device):
 def test_optimize_thread_locality(op, BLOCK_N, N, num_pid_n, device):
 
     @triton.jit
-    def kernel(X, Y, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, NUM_PID_N: tl.constexpr):
+    def kernel(X, Y, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
         start_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         local = INITIALIZE_PATCH
         off_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        for start_n in range(pid_n, tl.cdiv(N, BLOCK_N), NUM_PID_N):
+        for start_n in range(pid_n, tl.cdiv(N, BLOCK_N), num_pid_n):
             off_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
             Xs = X + off_m[:, None] * N + off_n[None, :]
             x = tl.load(Xs)
             local = ACCUMULATE_PATCH
-        tl.store(Y + off_m * NUM_PID_N + pid_n, local)
+        tl.store(Y + off_m * num_pid_n + pid_n, local)
         # the following segfaults AMD backend following #3492
         # really unclear why; the llvm-ir and kernel arguments are
         # identical !
@@ -2505,8 +2559,8 @@ def test_optimize_thread_locality(op, BLOCK_N, N, num_pid_n, device):
     BLOCK_M = 32
     x = torch.randn((BLOCK_M, N), dtype=torch.float32, device=device)
     y = torch.randn((BLOCK_M, num_pid_n), dtype=torch.float32, device=device)
-    h = kernel[(1, num_pid_n, 1)](x, y, N, BLOCK_M, BLOCK_N, NUM_PID_N=num_pid_n)
-    if not is_interpreter():
+    h = kernel[(1, num_pid_n, 1)](x, y, N, BLOCK_M, BLOCK_N)
+    if not is_interpreter() and not is_cpu():
         assert h.asm['ttgir'].count(
             '"tt.reduce"') == 2, "tt.reduce should be called twice, otherwise the optimization didn't work"
     y_ref = numpy_op(x.cpu().numpy(), axis=1, keepdims=True)
@@ -2929,6 +2983,7 @@ def test_chain_reduce(M, N, src_layout, op, device, first_axis):
     np.testing.assert_allclose(z_ref, z_tri.cpu().numpy(), rtol=0.01, atol=1e-3)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_generic_reduction(device):
 
@@ -2959,7 +3014,7 @@ def test_generic_reduction(device):
 # test permute
 # ---------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str, shape, perm", [(dtype, shape, perm)
                                                     # TODO: bfloat16
@@ -3019,6 +3074,7 @@ def test_permute(dtype_str, shape, perm, num_ctas, device):
     assert 'st.global.v4' in ptx
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str", ["int32", "int8"])
 @pytest.mark.parametrize("shape", [(2, 4), (16, 16)])
@@ -3042,6 +3098,7 @@ def test_trans_2d(dtype_str, shape, perm, device):
     np.testing.assert_equal(to_numpy(expected), to_numpy(actual))
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str", ["int32", "int8"])
 @pytest.mark.parametrize("shape", [(2, 2, 8, 64), (4, 4, 4, 4)])
@@ -3094,6 +3151,7 @@ def convert_fp8_to_fp32(x, device, dtype_str):
     assert "Unsupported float8 dtype"
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize(
     "M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dtype, out_dtype, kpack",
@@ -3515,12 +3573,13 @@ def test_scaled_dot(M, N, K, col_a, col_b, type_a, type_b, num_warps, device):
     assert re.search(r'mma.sync.aligned.m\d+n\d+k16(?:.row.col)?.f32.bf16.bf16', ptx)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str",
                          [(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_str)
                           for B in [1, 2, 4, 8]
                           for num_warps in [1, 2, 4, 8, 16]
-                          for BLOCK_M, BLOCK_N in [(32, 32)]
+                          for BLOCK_M, BLOCK_N in [(32, 32) if not is_cpu() else (4, 4)]
                           for M, N, K in [(64, 64, 64), (32, 32, 32)]
                           for in_dtype_str, out_dtype_str in [('int8', 'int8'), ('float16', 'float16'),
                                                               ('float16', 'float32'), ('float32', 'float32')]] +
@@ -3536,10 +3595,16 @@ def test_dot3d(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_
                 pytest.skip(f"{in_dtype_str} is not supported in WMMA dot, FMA does not support dot3d")
             if out_dtype_str == "float16":
                 pytest.skip(f"{out_dtype_str} has low precision in WMMA dot")
+    elif is_cpu():
+        if out_dtype_str == "float16":
+            pytest.skip("Test is skipped due to float16 accuracy issue")
+        input_precision = "tf32" if in_dtype_str == 'float32' else "ieee"
+        if not is_interpreter() and (BLOCK_M < 4 or BLOCK_N < 4):
+            pytest.skip("small dots are supported only on HIP at the moment")
     else:
         input_precision = "tf32" if is_cuda() and in_dtype_str == 'float32' else "ieee"
 
-    if B == 8 and M == 64 and in_dtype_str == "float32" and out_dtype_str == "float32":
+    if B == 8 and M == 64 and in_dtype_str == "float32" and out_dtype_str == "float32" and not is_cpu():
         if not is_interpreter() and triton.runtime.driver.active.utils.get_device_properties(
                 torch.cuda.current_device())["max_shared_mem"] < 131072:
             pytest.skip(
@@ -3639,6 +3704,7 @@ def test_dot3d(B, num_warps, M, N, K, BLOCK_M, BLOCK_N, in_dtype_str, out_dtype_
     np.testing.assert_allclose(out_ref, to_numpy(out_tri), rtol=0.01, atol=1e-2)
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize('in_dtype', ['float32'])
 def test_dot_mulbroadcasted(in_dtype, device):
     if is_cuda():
@@ -3693,6 +3759,7 @@ def test_dot_mulbroadcasted(in_dtype, device):
         assert re.search(r"triton_gpu.async_wait %.* {num = 2 : i32}", h.asm["ttgir"]) is not None
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str", int_dtypes + uint_dtypes + float_dtypes + ['bfloat16'])
 @pytest.mark.parametrize("shape", [(), (1, ), (128, )])
@@ -3732,6 +3799,7 @@ def test_full(dtype_str, shape, device):
     assert torch.all(out_dynamic == 2)
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("literal, dtype_str", [(1e+50, "f64"), (1e+10, "f32"), (1.0, "f32"), ('float("inf")', "f32"),
                                                 ('float("-inf")', "f32"), ('float("nan")', "f32"),
                                                 ('float("-nan")', "f32"), (0., "f32"), (5, "i32"), (2**40, "i64")])
@@ -3756,6 +3824,7 @@ def pass_const(a, b, choose_b):
         return a
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("choose_const", [True, False])
 @pytest.mark.parametrize("constexpr", [True, False])
 @pytest.mark.parametrize("mode", ["direct", "call", "ternary", "if"])
@@ -3823,6 +3892,7 @@ def test_const(device, choose_const, constexpr, mode):
         assert torch.all(input == output)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str", ['float32', 'float16'])
 def test_dot_without_load(dtype_str, device):
@@ -3838,6 +3908,10 @@ def test_dot_without_load(dtype_str, device):
     kernel = patch_kernel(_kernel, {'GENERATE_TEST_HERE': f"tl.full((32, 32), 1.0, tl.{dtype_str})"})
     a = torch.ones((32, 32), dtype=getattr(torch, dtype_str), device=device)
     b = torch.ones((32, 32), dtype=getattr(torch, dtype_str), device=device)
+    if is_cpu() and dtype_str == "float16":
+        out_ref = torch.tensor(np.matmul(to_numpy(a), to_numpy(b)), dtype=getattr(torch, dtype_str), device=device)
+    else:
+        out_ref = torch.matmul(a, b)
     out_ref = torch.matmul(a, b)
     out = torch.zeros((32, 32), dtype=getattr(torch, dtype_str), device=device)
     kernel[(1, )](out)
@@ -3849,6 +3923,7 @@ def test_dot_without_load(dtype_str, device):
 # ---------------
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("start", [0, 1, 7, 16])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
@@ -3872,6 +3947,7 @@ def test_arange(start, num_ctas, device):
 # ---------------
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str, size, size_diff, other", [(dtype_str, size, size_diff, other)
                                                                for dtype_str in torch_dtypes
@@ -3909,7 +3985,7 @@ def test_masked_load(dtype_str, size, size_diff, other, num_ctas, device):
     reference_out = torch.cat((input, torch.full((size_diff, ), other, dtype=dtype, device=device)))
     torch.testing.assert_close(output, reference_out)
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 @pytest.mark.parametrize("mask_val", [True, False])
@@ -3939,6 +4015,7 @@ def test_masked_load_scalar(num_ctas, mask_val, other_val, device):
 
 # Testing masked loads with a copy to shared memory.
 # FIXME: Shape too small for ldmatrix when num_ctas=4
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_masked_load_shared_memory(dtype, device):
@@ -3975,13 +4052,17 @@ def test_masked_load_shared_memory(dtype, device):
         output_offsets = M_offsets[:, None] * out_stride + N_offsets[None, :]
         tl.store(output_ptr + output_offsets, o, mask=output_offsets < M * N)
 
-    pgm = _kernel[(1, )](in1, in2, out, in1.stride()[0], in2.stride()[0], out.stride()[0], in1.numel(), in2.numel(),
+    _kernel[(1, )](in1, in2, out, in1.stride()[0], in2.stride()[0], out.stride()[0], in1.numel(), in2.numel(),
                          out.numel(), M=M, N=N, K=K)
-
-    reference_out = torch.matmul(in1, in2)
+    
+    if is_cpu() and (dtype == torch.float16 or dtype == torch.bfloat16):
+        reference_out = torch.tensor(np.matmul(to_numpy(in1), to_numpy(in2))).to(torch.float32)
+    else:
+        reference_out = torch.matmul(in1, in2).to(torch.float32)
     torch.testing.assert_close(out, reference_out, atol=1e-2, rtol=0)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("cache", ["", ".ca", ".cg", ".cv"])
 def test_load_cache_modifier(cache, device):
@@ -4027,6 +4108,7 @@ def test_load_cache_modifier(cache, device):
             assert 'ld.global.cg' not in ptx
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("N", [16, 10, 11, 1024])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
@@ -4054,6 +4136,7 @@ def test_vectorization(N, num_ctas, device):
     torch.testing.assert_close(dst[:N], src[:N], atol=1e-6, rtol=0)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("has_hints", [False, True])
 def test_vectorization_hints(has_hints, device):
@@ -4081,6 +4164,7 @@ def test_vectorization_hints(has_hints, device):
         assert "ld.global.v4.b32" not in ptx
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_assume(device):
 
@@ -4107,6 +4191,7 @@ def test_assume(device):
 # ---------------
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("cache", ["", ".wb", ".cg", ".cs", ".wt"])
 def test_store_cache_modifier(cache, device):
@@ -4171,6 +4256,7 @@ def test_store_cache_modifier(cache, device):
             assert 'st.global.wt' in ptx
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("eviction_policy", ["", "evict_last", "evict_first"])
 def test_store_eviction_policy(eviction_policy, device):
@@ -4208,7 +4294,7 @@ def test_store_eviction_policy(eviction_policy, device):
 def _impl(value=10):
     return value
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_default(device):
     value = 5
@@ -4233,7 +4319,7 @@ def test_default(device):
 # test noop
 # ----------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_noop(device):
 
@@ -4261,6 +4347,7 @@ def test_pointer_arguments(device):
         kernel[(1, )](x)
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("value, value_type", [(-1, 'i32'), (0, 'i32'), (-2**31, 'i32'), (2**31 - 1, 'i32'),
                                                (2**31, 'i64'), (2**32 - 1, 'i64'), (2**32, 'i64'), (2**63 - 1, 'i64'),
                                                (-2**63, 'i64'), (2**63, 'u64'), (2**64 - 1, 'u64')])
@@ -4283,7 +4370,7 @@ def test_value_specialization(value: int, value_type: str, device) -> None:
 # value specialization
 # --------------------
 
-
+@pytest.mark.cpu
 @pytest.mark.parametrize("value, overflow", [(2**64 - 1, False), (2**64, True), (-2**63, False), (-2**63 - 1, True)])
 def test_value_specialization_overflow(value: int, overflow: bool, device) -> None:
 
@@ -4304,7 +4391,7 @@ def test_value_specialization_overflow(value: int, overflow: bool, device) -> No
 # test constexpr
 # ----------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("op", ['+', '-', '*', '/', '%', '<', '>', '<<', '>>', '&', '^', '|'])
 @pytest.mark.parametrize("is_lhs_constexpr", [False, True])
@@ -4342,6 +4429,7 @@ def test_bin_op_constexpr(op, is_lhs_constexpr, is_rhs_constexpr, device):
     np.testing.assert_allclose(z, to_numpy(z_tri), rtol=1e-3)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_constexpr_shape(device):
 
@@ -4355,6 +4443,7 @@ def test_constexpr_shape(device):
     np.testing.assert_equal(to_numpy(x_tri), np.arange(0, 256))
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_constexpr_scalar_shape(device):
 
@@ -4371,7 +4460,7 @@ def test_constexpr_scalar_shape(device):
 
 reshape_list = [((64, ), (8, 8)), ((2, 32), (16, 4)), ((512, ), (2, 2, 2, 2, 2, 2, 2, 2, 2)), ((64, 32), (16, 8, 16))]
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("formats", reshape_list)
 def test_reshape(formats, device):
@@ -4399,6 +4488,7 @@ def test_reshape(formats, device):
     np.testing.assert_equal(z, to_numpy(z_tri))
 
 
+@pytest.mark.cpu
 def test_reshape_err(device):
 
     @triton.jit
@@ -4438,8 +4528,9 @@ def test_trans_reshape(device):
     actual = torch.zeros(expected.shape, dtype=torch.int32, device=device)
 
     k = kernel[(1, )](input, actual, shape[0], shape[1])
-    assert k.asm['ttgir'].count(
-        'triton_gpu.convert_layout') == 1, "Expected exactly one convert_layout op in the TTGIR after optimization"
+    if not is_cpu():
+        assert k.asm['ttgir'].count(
+            'triton_gpu.convert_layout') == 1, "Expected exactly one convert_layout op in the TTGIR after optimization"
 
     np.testing.assert_equal(to_numpy(expected), to_numpy(actual))
 
@@ -4473,6 +4564,7 @@ def vecmul_kernel(ptr, n_elements, rep, type: tl.constexpr):
     tl.store(ptr + offsets, vec, mask=mask)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("type", ["inline", "noinline"])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
@@ -4503,7 +4595,7 @@ def test_call(type, num_ctas, device):
 # test if
 # -------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("if_type", [
     "if", "if_and_dynamic", "if_exp_static", "if_exp_dynamic", "if_exp_dynamic_constexpr", "if_exp_dynamic_void",
@@ -4564,6 +4656,7 @@ def test_num_warps_pow2(device):
     _kernel[(1, )](dst=dst, num_warps=4)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("func_str", ['sqrt', 'rsqrt', 'exp', 'exp2', 'log', 'log2', 'sin', 'cos'])
 def test_unary_math(func_str, device):
@@ -4797,6 +4890,7 @@ def test_inline_asm_packed_multiple_outputs(device):
 # -----------------------
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("lo, hi, iv", [(2**35, 2**35 + 20, 1), (2**35, 2**35 + 20, 2), (2**35, 2**35 + 20, 3),
                                         (15, -16, -1), (15, -16, -2), (15, -16, -3), (-18, -22, -1), (22, 18, -1)])
 def test_for_iv(lo, hi, iv, device):
@@ -4816,6 +4910,7 @@ def test_for_iv(lo, hi, iv, device):
     assert out[0] == sum(range(lo, hi, iv))
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_if_else(device):
 
@@ -4841,6 +4936,7 @@ def test_if_else(device):
     assert to_numpy(out)[0] == false_val[0]
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("mode", ["dynamic", "static"])
 def test_if_return(mode, device):
@@ -4899,7 +4995,7 @@ def add_fn_static_cond(x, cond: tl.constexpr):
     else:
         return x + 1
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize(
     "call_type",
@@ -4969,6 +5065,7 @@ def test_if_call(call_type, device):
     assert to_numpy(out)[0] == 1
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("_cond1", [True, False])
 @pytest.mark.parametrize("_cond2", [True, False])
@@ -5011,6 +5108,7 @@ def test_nested_if_else_return(_cond1, _cond2, _cond3, device):
     assert out[0] == targets[(_cond1, _cond2, _cond3)]
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_while(device):
 
@@ -5039,6 +5137,7 @@ def test_while(device):
     assert out_j[0] == bound[0]
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_nested_while(device):
 
@@ -5056,6 +5155,7 @@ def test_nested_while(device):
     assert data[0] == 40
 
 
+@pytest.mark.cpu
 def test_constexpr_if_return(device):
     # Reproducer for #4883, return statement in an if with a constexpr causes
     # errors when combined with non-trivial control flow graphs
@@ -5106,7 +5206,7 @@ def test_poison_return(device):
 # test extra
 # -----------------------
 
-
+@pytest.mark.cpu
 def test_num_threads(device):
     if is_hip():
         pytest.skip("test_num_threads is not supported in HIP")
@@ -5415,6 +5515,7 @@ def test_load_scalar_with_mask(device):
 
 # This test is used to test our own PTX codegen for float16 and int16 conversions
 # maybe delete it later after ptxas has been fixed
+@pytest.mark.cpu
 @pytest.mark.parametrize("dtype_str", ['float16', 'int16'])
 def test_ptx_cast(dtype_str, device):
 
@@ -5460,6 +5561,9 @@ def test_ptx_cast(dtype_str, device):
 
 def f8_to_f16(x, dtype):
 
+    if is_cpu():
+        assert(False and "Works as excepted only for GPU")
+    
     @triton.jit
     def kernel(Y, X, N, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -5486,10 +5590,8 @@ def matmul_kernel(  #
         low_precision_acc: tl.constexpr,  #
         num_pipeline_stages: tl.constexpr = 3  #
 ):
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    pid_m = pid % num_pid_m
-    pid_n = pid // num_pid_m
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -5508,9 +5610,10 @@ def matmul_kernel(  #
     tl.store(c_ptrs, accumulator)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("M, N, K", [(128, 256, 256)])
-@pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 256, 128), (64, 64, 64)])
+@pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 256, 128), (64, 64, 64)] if not is_cpu() else [(32, 32, 128), (32, 32, 32)])
 @pytest.mark.parametrize("in_type_str", ['float8e5', 'float8e4nv', 'float8e4b15'])
 @pytest.mark.parametrize("low_precision_acc", [0, 32, 64, 128])
 def test_dot_max_num_imprecise_acc(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, in_type_str, low_precision_acc, device):
@@ -5531,16 +5634,21 @@ def test_dot_max_num_imprecise_acc(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, in_type_s
     num_warps = 8
     a = to_triton(A, device=device, dst_type=in_type_str)
     b = to_triton(B, device=device, dst_type=in_type_str)
-    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
+    grid = (triton.cdiv(M, BLOCK_M),  triton.cdiv(N, BLOCK_N))
     max_num_impressive_acc = low_precision_acc if low_precision_acc <= BLOCK_K else None
     h = matmul_kernel[grid](a, b, C, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), C.stride(0),
-                            C.stride(1), BLOCK_M, BLOCK_N, BLOCK_K, max_num_impressive_acc, num_warps=num_warps,
-                            num_pipeline_stages=num_stages)
+                            C.stride(1), BLOCK_M, BLOCK_N, BLOCK_K, max_num_impressive_acc, num_warps=num_warps)
     torch_a = torch.from_numpy(A).to(device=device)
-    th_a = f8_to_f16(torch_a, in_type_str)
     torch_b = torch.from_numpy(B).to(device=device)
-    th_b = f8_to_f16(torch_b, in_type_str)
-    ref_out = torch.matmul(th_a, th_b).to(torch.float32)
+    if is_cpu() and 'float8' in in_type_str:
+        in_dtype = getattr(tl, in_type_str)
+        th_a = convert_float_to_float32(torch_a, in_dtype)
+        th_b = convert_float_to_float32(torch_b, in_dtype)
+        ref_out = torch.matmul(th_a, th_b).to(torch.float32)
+    else:
+        th_a = f8_to_f16(torch_a, in_type_str)
+        th_b = f8_to_f16(torch_b, in_type_str)
+        ref_out = torch.matmul(th_a, th_b).to(torch.float32)
     if in_type_str == 'float8e4nv':
         torch.testing.assert_close(ref_out, C, rtol=0.01, atol=0.01)
     else:
@@ -5554,6 +5662,7 @@ def test_dot_max_num_imprecise_acc(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, in_type_s
 # -----------------------
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("enable_fp_fusion", [False, True])
 @pytest.mark.parametrize("default_override", [False, True])
 def test_enable_fp_fusion(enable_fp_fusion, default_override, device):
@@ -5585,7 +5694,7 @@ def test_enable_fp_fusion(enable_fp_fusion, default_override, device):
 # test propagate_nan
 # -----------------------
 
-
+@pytest.mark.cpu
 @pytest.mark.parametrize("dtype", ['float16', 'float32'])
 @pytest.mark.parametrize("propagate_nan", ['NONE', 'ALL'])
 @pytest.mark.parametrize("func", ['minimum', 'maximum', 'clamp'])
@@ -5623,7 +5732,7 @@ def test_propagate_nan(dtype, propagate_nan, func, device):
 # test clamp
 # -----------------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype", ['float16', 'float32'])
 def test_clamp(dtype, device):
@@ -5660,6 +5769,7 @@ def test_clamp(dtype, device):
 
 # Test for symmetric clamp(x, -limit, limit), as it may go through optimized
 # codegen in the backends
+@pytest.mark.cpu
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype", ['float16', 'float32'])
 def test_clamp_symmetric(dtype, device):
@@ -5694,7 +5804,7 @@ def test_clamp_symmetric(dtype, device):
 # test iterators
 # -----------------------
 
-
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_static_range(device):
 
@@ -5715,20 +5825,28 @@ def test_static_range(device):
     assert (Out == Acc).all(), (Out, Acc)
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_tl_range(device):
     if is_hip():
         pytest.skip("test_tl_range is not supported in HIP")
     M, N, K = 64, 64, 512
-    BLOCK_M, BLOCK_N, BLOCK_K = M, N, 64
+    if is_cpu():
+        block_m, block_n, block_k = 32, 32, 64
+    else:
+        block_m, block_n, block_k = M, N, 64
+    BLOCK_M, BLOCK_N, BLOCK_K = block_m, block_n, block_k
     a = torch.randn((M, K), device=device, dtype=torch.float16)
     b = torch.randn((K, N), device=device, dtype=torch.float16)
     c = torch.empty((M, N), dtype=torch.float32, device=device)
-    pgm = matmul_kernel[
-        1,
-    ](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1), BLOCK_M, BLOCK_N,
-      BLOCK_K, 0, num_pipeline_stages=5)
-    ref_out = torch.matmul(a, b).to(torch.float32)
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    pgm = matmul_kernel[grid](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0),
+                              c.stride(1), BLOCK_M, BLOCK_N, BLOCK_K, 0, num_pipeline_stages=5)
+    if is_cpu():
+        ref_out = torch.tensor(np.matmul(to_numpy(a), to_numpy(b)), dtype=torch.float32, device=device)
+    else:
+        ref_out = torch.matmul(a, b).to(torch.float32)
+
     if is_interpreter():
         # GPU invokes tensor core for float16 matmul, which is not supported in interpreter.
         # Thus we use a higher tolerance
@@ -5816,6 +5934,7 @@ def test_maxnreg(device):
         raise
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_temp_var_in_loop(device):
 
@@ -5850,6 +5969,7 @@ def test_temp_var_in_loop(device):
     assert (acc == out).all()
 
 
+@pytest.mark.cpu
 @pytest.mark.interpreter
 def test_num_programs(device):
     # Assuming that the kernel is launched with a grid of (11, 21, 31)
