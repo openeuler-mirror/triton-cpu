@@ -9,6 +9,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include "nvidia/lib/TritonNVIDIAGPUToLLVM/Utility.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -78,9 +79,9 @@ Type getTypeFromConstraint(char constraint, PatternRewriter &rewriter) {
   else if (constraint == 'l')
     ty = IntegerType::get(rewriter.getContext(), 64);
   else if (constraint == 'f')
-    ty = FloatType::getF32(rewriter.getContext());
+    ty = Float32Type::get(rewriter.getContext());
   else if (constraint == 'd')
-    ty = FloatType::getF64(rewriter.getContext());
+    ty = Float64Type::get(rewriter.getContext());
   else {
     assert(false && "Unsupported constraint");
   }

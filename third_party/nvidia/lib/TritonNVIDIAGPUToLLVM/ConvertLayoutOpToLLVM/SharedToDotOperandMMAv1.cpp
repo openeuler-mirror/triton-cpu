@@ -1,4 +1,5 @@
 #include "Utility.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 
 using CoordTy = SmallVector<Value>;
 using ValueTable = std::map<std::pair<int, int>, std::pair<Value, Value>>;

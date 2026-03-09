@@ -75,8 +75,8 @@ bool WarpGroupDotOp::needsPartialAccumulator() {
   const auto &d = getD();
   auto aTensorTy = cast<TensorOrMemDesc>(a.getType());
   auto aElTy = cast<TensorOrMemDesc>(a.getType()).getElementType();
-  bool isFP8 = aElTy.isFloat8E5M2() || aElTy.isFloat8E4M3FN() ||
-               aElTy.isFloat8E5M2FNUZ() || aElTy.isFloat8E4M3FNUZ();
+  bool isFP8 = llvm::isa<Float8E5M2Type, Float8E4M3FNType, Float8E5M2FNUZType,
+                         Float8E4M3FNUZType>(aElTy);
   bool accFP32 = cast<TensorOrMemDesc>(d.getType()).getElementType().isF32();
   uint32_t maxNumImpreciseAcc = getMaxNumImpreciseAcc();
   return isFP8 && accFP32 && maxNumImpreciseAcc <= aTensorTy.getShape()[1];

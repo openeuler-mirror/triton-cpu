@@ -492,10 +492,10 @@ TEST_F(InferLayoutTest, FuzzReshape) {
         llvm::to_vector(llvm::reverse(llvm::seq<unsigned>(rank))));
 
     auto srcTy = RankedTensorType::get(
-        srcShape, FloatType::getF32(&ctx),
+        srcShape, Float32Type::get(&ctx),
         BlockedEncodingAttr::get(&ctx, sizePerThread, threadsPerWarp,
                                  warpsPerCTA, order, ctaLayout));
-    auto dstTy = RankedTensorType::get(dstShape, FloatType::getF32(&ctx));
+    auto dstTy = RankedTensorType::get(dstShape, Float32Type::get(&ctx));
 
     bool couldReshape = false;
     testReshape(srcTy, dstTy, /*expectedDstEnc=*/std::nullopt,
@@ -526,7 +526,7 @@ public:
     ctx.getOrLoadDialect<TritonGPUDialect>();
     ctaLayout =
         triton::gpu::CTALayoutAttr::get(&ctx, ctaPerCGA, ctaSplit, ctaOrder);
-    f16Ty = FloatType::getF16(&ctx);
+    f16Ty = Float16Type::get(&ctx);
   }
 
   triton::gpu::AMDMfmaEncodingAttr createMFMA(int mDim, int nDim,
