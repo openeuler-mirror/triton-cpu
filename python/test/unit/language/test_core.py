@@ -2526,6 +2526,7 @@ def test_optimize_thread_locality(op, BLOCK_N, N, num_pid_n, device):
     def kernel(X, Y, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
         start_m = tl.program_id(0)
         pid_n = tl.program_id(1)
+        num_pid_n = tl.num_programs(1)
         local = INITIALIZE_PATCH
         off_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
         for start_n in range(pid_n, tl.cdiv(N, BLOCK_N), num_pid_n):

@@ -168,7 +168,6 @@ class CPUBackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_licm(pm)
         passes.common.add_symbol_dce(pm)
-        cpu.passes.ttcpuir.add_convert_unsupported_ops(pm, False, True, True)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
         passes.common.add_canonicalizer(pm)
