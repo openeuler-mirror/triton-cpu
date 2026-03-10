@@ -55,6 +55,10 @@ class CPUOptions:
     num_threads: int = 1
     num_ctas: int = 0
     num_stages: int = 1
+    num_buffers_warp_spec: int = 0
+    num_consumer_groups: int = 0
+    reg_dec_producer: int = 0
+    reg_inc_consumer: int = 0
     enable_warp_specialization: bool = False
     extern_libs = None
     cluster_dims: tuple = (1, 1, 1)

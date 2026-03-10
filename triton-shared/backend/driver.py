@@ -5,6 +5,7 @@ import time
 import triton
 
 import os, subprocess, tempfile, platform
+import importlib
 import importlib.util
 import sys
 
@@ -14,6 +15,13 @@ from triton.runtime.cache import get_cache_manager
 from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
 import shutil
+
+# for locating libsleef
+try:
+    _triton_C_dir = importlib.resources.files(triton).joinpath("_C")
+except AttributeError:
+    # resources.files() doesn't exist for Python < 3.9
+    _triton_C_dir = importlib.resources.path(triton, "_C").__enter__()
 
 # -------------------- Launcher ----------------------------
 def _ty_to_cpp(ty):
@@ -310,7 +318,9 @@ def compile_module(launcher_src, kernel_placeholder_name):
                   subprocess.check_call([
                     "g++","-g", "-std=c++17", launcher_src_path, obj_path,
                     f"-I{py_include_dir}", f"-I{include_dir}", f"-L{py_lib_dir}",
-                    "-shared", f"-l{py_lib}", "-fPIC", "-fopenmp", "-o", so_path
+                    "-shared", f"-l{py_lib}", "-fPIC", "-fopenmp",
+                    f"-L{_triton_C_dir}", "-lsleef", f"-Wl,-rpath,{_triton_C_dir}",
+                    "-o", so_path
                   ])
 
               with open(so_path, "rb") as f:
