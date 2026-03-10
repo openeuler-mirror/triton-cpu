@@ -49,3 +49,13 @@ if (TRITON_SHARED_BUILD_CPU_BACKEND)
         ${Python3_LIBRARIES}
     )
 endif()
+
+# Build and link sleef
+set(SLEEF_BUILD_SHARED_LIBS ON CACHE BOOL "Build sleef shared lib" FORCE)
+set(SLEEF_BUILD_DFT OFF CACHE BOOL "Don't build sleef DFT lib" FORCE)
+set(SLEEF_BUILD_GNUABI_LIBS OFF CACHE BOOL "Don't build sleef gnuabi libs" FORCE)
+set(SLEEF_BUILD_TESTS OFF CACHE BOOL "Don't build sleef tests" FORCE)
+set(SLEEF_BUILD_SCALAR_LIB OFF CACHE BOOL "libsleefscalar will not be built." FORCE)
+add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/sleef" sleef)
+# Override sleef's output directory with our own
+set_target_properties(sleef PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
