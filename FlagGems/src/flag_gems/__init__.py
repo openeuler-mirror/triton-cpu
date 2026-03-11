@@ -1,3 +1,4 @@
+import contextlib
 import logging
 
 import torch
@@ -12,6 +13,7 @@ from flag_gems.logging_utils import setup_flaggems_logging
 from flag_gems.modules import *  # noqa: F403
 from flag_gems.ops import *  # noqa: F403
 from flag_gems.patches import *  # noqa: F403
+from flag_gems.runtime import torch_device_fn
 from flag_gems.runtime.register import Register
 
 __version__ = "4.2.0"
@@ -21,6 +23,18 @@ aten_lib = torch.library.Library("aten", "IMPL")
 registrar = Register
 current_work_registrar = None
 runtime.replace_customized_ops(globals())
+
+if hasattr(torch, "cpu"):
+    def _cpu_current_device():
+        return 0
+
+    @contextlib.contextmanager
+    def _cpu_device(*args, **kwargs):
+        yield
+
+    if torch_device_fn == torch.cpu:
+        torch_device_fn.current_device = _cpu_current_device
+        torch_device_fn.device = _cpu_device
 
 
 def torch_ge(v):
