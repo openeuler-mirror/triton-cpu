@@ -823,10 +823,13 @@ class WrapperGenerator:
             with code.indent():
                 self.gen_return(code)
             max_tile_size = self.config.max_tile_size
-            capability = torch_device_fn.get_device_capability(
-                torch_device_fn.current_device()
-            )
-            if self.name.find("fill_scalar") != -1 and capability[0] >= 9:
+            is_cpu = torch_device_fn.__name__ == 'torch.cpu'
+            # device capability is the thing on GPU targets
+            if not is_cpu:
+                capability = torch_device_fn.get_device_capability(
+                    torch_device_fn.current_device()
+                )
+            if self.name.find("fill_scalar") != -1 and not is_cpu and capability[0] >= 9:
                 code.writeline("tile_sizes = tuple([64])")
             else:
                 code.writeline(
@@ -837,7 +840,7 @@ class WrapperGenerator:
                 "num_tiles = math.prod(triton.cdiv(size, tile_size) for size, tile_size in zip(shape, tile_sizes))"
             )
 
-            if self.name.find("fill_scalar") != -1 and capability[0] >= 9:
+            if self.name.find("fill_scalar") != -1 and not is_cpu and capability[0] >= 9:
                 code.writeline("num_ctas = num_tiles")
             else:
                 max_grid_size0 = self.config.max_grid_size[0]
