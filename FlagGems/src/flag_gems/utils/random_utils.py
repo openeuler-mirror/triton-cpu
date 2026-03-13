@@ -36,13 +36,22 @@ except AttributeError:
 # It returns the current state of the default Philox RNG in seed and offset and
 # updates the next offset by adding `increment`.
 def philox_backend_seed_offset(increment, generator=None):
+    is_cpu = torch_device_fn.__name__ == 'torch.cpu'
     if generator is None:
         device = torch_device_fn.current_device()
-        generator = torch_device_fn.default_generators[device]
+        # cpu only has one default generator in torch
+        if is_cpu:
+            generator = torch.default_generator
+        else:
+            generator = torch_device_fn.default_generators[device]
     state_copy = generator.get_state()
+    state_view = state_copy.view(torch.int64)
     # TODO[kunlunxin]: we will upgrade torch version in 2025.04
+    # cpu state_copy has many tensors, use the first two for seed and offset.
     if flag_gems.vendor_name in ("kunlunxin", "aipu"):
-        c0, c1 = state_copy.view(torch.int64)[-2], state_copy.view(torch.int64)[-1]
+        c0, c1 = state_view[-2], state_view[-1]
+    elif is_cpu:
+        c0, c1 = state_view[0], state_view[1]
     else:
         c0, c1 = state_copy.view(torch.int64)
 
@@ -50,7 +59,10 @@ def philox_backend_seed_offset(increment, generator=None):
     increment = (increment + 3) // 4 * 4
     c1 += increment
     # get_state returns a new tensor, so it needs set_state to update the actual generator state.
-    generator.set_state(state_copy)
+    # ignore the state update on cpu, otherwise get error like Invalid mt19937 state.
+    # what's more seems the set_state does nothing, state_copy is not changed at all.
+    if not is_cpu:
+        generator.set_state(state_copy)
     return seed, offset
 
 
