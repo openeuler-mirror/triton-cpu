@@ -81,6 +81,7 @@ void mlir::triton::populateTritonArithToLinalgConversionPatterns(
   patterns.add<DenseConstantConverter>(patterns.getContext());
   patterns.add<CumSumConverter>(patterns.getContext());
   patterns.add<ReshapeConverter>(patterns.getContext());
+  patterns.add<BarrierConverter>(patterns.getContext());
 
   populateExternElementwiseOpToMLIROps(patterns);
 

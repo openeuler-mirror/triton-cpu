@@ -20,8 +20,11 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 
 #include "llvm/ADT/SmallVectorExtras.h"
@@ -2365,6 +2368,25 @@ public:
     rewriter.replaceOpWithNewOp<tensor::ReshapeOp>(op, outputType, input,
                                                    shape);
 
+    return success();
+  }
+};
+
+class BarrierConverter : public OpConversionPattern<gpu::BarrierOp> {
+  using OpConversionPattern<gpu::BarrierOp>::OpConversionPattern;
+
+public:
+  LogicalResult
+  matchAndRewrite(gpu::BarrierOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (dyn_cast<RegionBranchOpInterface>(op->getParentOp())) {
+      // If possible, gpu.barrier is replaced with llvm.fence Op.
+      rewriter.replaceOpWithNewOp<LLVM::FenceOp>(op,
+          mlir::LLVM::AtomicOrdering::seq_cst, "crossthread");
+      return success();
+    }
+    // All other cases remove gpu.barrier
+    rewriter.eraseOp(op);
     return success();
   }
 };
