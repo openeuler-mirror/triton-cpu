@@ -133,7 +133,10 @@ def pytest_runtest_protocol(item, nextitem):
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_logreport(report):
     if report.when == "call":
-        test_results[report.nodeid]["result"] = report.outcome
+        try:
+            test_results[report.nodeid]["result"] = report.outcome
+        except Exception:
+            yield
 
 
 def pytest_terminal_summary(terminalreporter):
