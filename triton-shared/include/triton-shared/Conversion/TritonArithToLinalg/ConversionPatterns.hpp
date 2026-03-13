@@ -2391,6 +2391,58 @@ public:
   }
 };
 
+class HistogramConverter : public OpConversionPattern<triton::HistogramOp> {
+  using OpConversionPattern<triton::HistogramOp>::OpConversionPattern;
+public:
+  LogicalResult
+  matchAndRewrite(HistogramOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto input = op.getSrc();
+    auto ResultType = dyn_cast<RankedTensorType>(op.getResult().getType());
+    SmallVector<AffineMap> affineMaps(1,
+        rewriter.getMultiDimIdentityMap(ResultType.getRank()));
+    auto Zero = rewriter.create<arith::ConstantOp>(op->getLoc(),
+        rewriter.getIntegerAttr(rewriter.getIntegerType(32), 0));
+
+    auto alloc = rewriter.create<memref::AllocOp>(loc,
+        MemRefType::get(ResultType.getShape(), ResultType.getElementType()));
+
+    auto Zeros = rewriter.create<linalg::FillOp>(loc, ValueRange{Zero},
+                                                 ValueRange{alloc});
+
+    auto genericOp = rewriter.create<linalg::GenericOp>(loc, TypeRange{},
+        ValueRange{input}, ValueRange{}, affineMaps,
+        SmallVector<utils::IteratorType>(ResultType.getRank(),
+                                         utils::IteratorType::parallel),
+        [&](OpBuilder &nestedBuilder, Location nestedLoc,
+            ValueRange regionArgs) {
+          // triton supports histogram calculation only from 0 and width of 1.
+          // Each input data is considered as index for output array.
+          // Increment the output array will get the result.
+          auto loadValue = regionArgs[0];
+          auto One = nestedBuilder.create<arith::ConstantOp>(nestedLoc,
+              rewriter.getIntegerAttr(nestedBuilder.getIntegerType(32), 1));
+          Value histogramArrayIndex = nestedBuilder.create<arith::IndexCastOp>(
+              nestedLoc, rewriter.getIndexType(), loadValue);
+          auto kindAttr = arith::AtomicRMWKindAttr::get(
+              nestedBuilder.getContext(), arith::AtomicRMWKind::addi);
+
+            SmallVector<Value, 1> memIndices{histogramArrayIndex};
+            auto atomic = nestedBuilder.create<memref::AtomicRMWOp>(nestedLoc,
+                kindAttr, One, alloc, memIndices);
+
+            nestedBuilder.create<linalg::YieldOp>(nestedLoc);
+        });
+
+    SmallVector<Value> resultTensors {rewriter.create<bufferization::ToTensorOp>(
+        loc, alloc, true, true)};
+    rewriter.replaceOp(op, ValueRange{resultTensors});
+    return success();
+  }
+};
+
 class ExternElementwiseBinaryOpConverter
     : public OpConversionPattern<triton::ExternElementwiseOp> {
   using OpConversionPattern<triton::ExternElementwiseOp>::OpConversionPattern;
