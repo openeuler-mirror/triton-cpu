@@ -20,8 +20,11 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 
 #include "llvm/ADT/SmallVectorExtras.h"
@@ -1207,9 +1210,12 @@ private:
   bool requiresF32Conversion(const Type elemType, Operation *redOp) const {
     // Only if it is a binaryOp and types mismatch
     if (isa<arith::AddFOp>(redOp) || isa<arith::SubFOp>(redOp) ||
-        isa<arith::MulFOp>(redOp) || isa<arith::DivFOp>(redOp)) {
+        isa<arith::MulFOp>(redOp) || isa<arith::DivFOp>(redOp) ||
+        isa<triton::ReduceReturnOp>(redOp)) {
       auto lhsType = elemType;
-      auto rhsType = redOp->getOperand(1).getType();
+      auto rhsType = (isa<triton::ReduceReturnOp>(redOp)) ?
+                        redOp->getOperand(0).getType():
+                        redOp->getOperand(1).getType();
       return (lhsType != rhsType) && (isa<FloatType>(rhsType)) &&
              rhsType.getIntOrFloatBitWidth() == 32;
     }
@@ -1257,6 +1263,8 @@ private:
                                                unsigned accArgIdx) {
     Value accArg = block.getArgument(accArgIdx);
     for (Operation &opInner : block.getOperations()) {
+      if(isa<triton::ReduceReturnOp>(&opInner))
+          return &opInner;
       if (&opInner == block.getTerminator())
         break;
       for (Value operand : opInner.getOperands())
@@ -1309,6 +1317,8 @@ private:
             .Case([&](arith::OrIOp) {
               return rewriter.getIntegerAttr(constantType, 0);
             })
+            .Case<triton::ReduceReturnOp>(
+                [&](auto) { return rewriter.getIntegerAttr(constantType, 0); })
             .Default([&](Operation *op) { return nullptr; });
 
     if (!attr) {
@@ -2358,6 +2368,25 @@ public:
     rewriter.replaceOpWithNewOp<tensor::ReshapeOp>(op, outputType, input,
                                                    shape);
 
+    return success();
+  }
+};
+
+class BarrierConverter : public OpConversionPattern<gpu::BarrierOp> {
+  using OpConversionPattern<gpu::BarrierOp>::OpConversionPattern;
+
+public:
+  LogicalResult
+  matchAndRewrite(gpu::BarrierOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (dyn_cast<RegionBranchOpInterface>(op->getParentOp())) {
+      // If possible, gpu.barrier is replaced with llvm.fence Op.
+      rewriter.replaceOpWithNewOp<LLVM::FenceOp>(op,
+          mlir::LLVM::AtomicOrdering::seq_cst, "crossthread");
+      return success();
+    }
+    // All other cases remove gpu.barrier
+    rewriter.eraseOp(op);
     return success();
   }
 };

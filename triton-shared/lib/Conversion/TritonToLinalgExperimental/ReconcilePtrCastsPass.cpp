@@ -367,6 +367,134 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
   }
 };
 
+struct AtomicCASOpConversion : public OpConversionPattern<AtomicCASOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(AtomicCASOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto replaceVal = op.getVal();
+    auto compareVal = op.getCmp();
+    Value tritonPtr = op.getPtr();
+
+    // Recover memref from Triton pointer
+    Value memref = tritonPtr;
+    if (auto fromMemref = tritonPtr.getDefiningOp<tptr::FromMemrefOp>())
+      memref = fromMemref.getOperand();
+    else if (auto tensorType =
+                 dyn_cast<RankedTensorType>(tritonPtr.getType())) {
+      // shapes and rank
+      SmallVector<int64_t> shape(tensorType.getShape().begin(),
+                                 tensorType.getShape().end());
+      unsigned rank = tensorType.getRank();
+
+      // pointer element type (e.g. !tt.ptr<f32> or !ptr.ptr<#...>)
+      Type lanePtrElemTy = tensorType.getElementType();
+      Type pointeeTy = nullptr;
+      if (auto ttPtr = mlir::dyn_cast<triton::PointerType>(lanePtrElemTy)) {
+        pointeeTy = ttPtr.getPointeeType();
+      } else if (auto genericPtr =
+                     mlir::dyn_cast<ptr::PtrType>(lanePtrElemTy)) {
+        pointeeTy = genericPtr.getElementType();
+      } else {
+        return rewriter.notifyMatchFailure(op,
+                                           "unsupported pointer element type");
+      }
+
+      // the result tensor type should match 'val'
+      auto resultTensorTy = replaceVal.getType().dyn_cast<RankedTensorType>();
+      if (!resultTensorTy)
+        return rewriter.notifyMatchFailure(
+            op, "expected ranked tensor as value/result");
+
+      // ==Prepare loop bounds as Values (ValueRange expected by
+      // buildLoopNest) ===
+      SmallVector<Value> lbs, ubs, steps;
+      lbs.reserve(rank);
+      ubs.reserve(rank);
+      steps.reserve(rank);
+      for (unsigned i = 0; i < rank; ++i) {
+        lbs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+        // shape[i] may be dynamic (-1) — for static shapes we use constant
+        // index; if dynamic, you'd need to materialize the dynamic bound. Here
+        // we assume static.
+        if (shape[i] == ShapedType::kDynamic) {
+          return rewriter.notifyMatchFailure(
+              op, "dynamic shapes not supported in lowering yet");
+        }
+        ubs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, shape[i]));
+        steps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+      }
+
+      // Unwrap pointer tensor if necessary
+      Value ttPtr = tritonPtr;
+      if (auto cast =
+                  tritonPtr.getDefiningOp<UnrealizedConversionCastOp>())
+          ttPtr = cast.getOperand(0);
+
+      scf::LoopNest nest = scf::buildLoopNest(
+          rewriter, loc, lbs, ubs, steps,
+          [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange ivs)  {
+
+            // 1. Extract pointer element for this lane
+            Value lanePtr =
+                nestedBuilder.create<tensor::ExtractOp>(nestedLoc, ttPtr, ivs);
+
+            // 2. Convert lane pointer to memref<1xtype>
+            auto elemTy = replaceVal.getType().cast<RankedTensorType>().getElementType();
+            Value laneMemref = nestedBuilder.create<tptr::ToMemrefOp>(
+                nestedLoc, MemRefType::get({1}, elemTy), lanePtr);
+
+            // 3. Extract the replace value element for this lane
+            Value laneReplaceVal =
+                nestedBuilder.create<tensor::ExtractOp>(nestedLoc, replaceVal, ivs);
+
+            // 4. Extract the compare value for this lane
+            Value laneCmpVal =
+                nestedBuilder.create<tensor::ExtractOp>(nestedLoc, compareVal, ivs);
+
+            Value zeroIdx =
+                nestedBuilder.create<arith::ConstantIndexOp>(nestedLoc, 0);
+
+            // 5. Create the GenericAtomicRMWOp for cmpxhg atomic operation
+            SmallVector<Value, 1> memIndices{zeroIdx};
+            auto genericOp = nestedBuilder.create<memref::GenericAtomicRMWOp>(
+                   nestedLoc, laneMemref, memIndices);
+            Value currentValue = genericOp.getCurrentValue();
+
+            OpBuilder bodyBuilder =
+              OpBuilder::atBlockEnd(genericOp.getBody(), rewriter.getListener());
+            auto isEqual = bodyBuilder.create<arith::CmpIOp>(nestedLoc,
+                arith::CmpIPredicate::eq, currentValue, laneCmpVal);
+
+            auto result = bodyBuilder.create<arith::SelectOp>(nestedLoc, isEqual,
+                laneReplaceVal, currentValue);
+
+            bodyBuilder.create<memref::AtomicYieldOp>(nestedLoc, result);
+          });
+      rewriter.eraseOp(op);
+      return success();
+    }
+    Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    SmallVector<Value, 1> memIndices{zeroIdx};
+    auto genericOp = rewriter.create<memref::GenericAtomicRMWOp>(
+                   loc, memref, memIndices);
+    Value currentValue = genericOp.getCurrentValue();
+
+    OpBuilder bodyBuilder =
+        OpBuilder::atBlockEnd(genericOp.getBody(), rewriter.getListener());
+    auto isEqual = bodyBuilder.create<arith::CmpIOp>(loc,
+         arith::CmpIPredicate::eq, currentValue, compareVal);
+
+    auto result = bodyBuilder.create<arith::SelectOp>(loc, isEqual,
+        replaceVal, currentValue);
+    bodyBuilder.create<memref::AtomicYieldOp>(loc, result);
+    rewriter.replaceOp(op, genericOp);
+    return success();
+  }
+};
+
 class ReconcilePtrCastsPass
     : public ReconcilePtrCastsBase<ReconcilePtrCastsPass> {
 
@@ -397,6 +525,7 @@ public:
     {
       RewritePatternSet conversionPatterns(&getContext());
       conversionPatterns.add<AtomicrmwConverter>(&getContext());
+      conversionPatterns.add<AtomicCASOpConversion>(&getContext());
 
       ConversionTarget target(getContext());
       target.addIllegalOp<triton::AtomicRMWOp>();
@@ -405,6 +534,7 @@ public:
       target.addLegalDialect<scf::SCFDialect>();
       target.addLegalDialect<tensor::TensorDialect>();
       target.addLegalDialect<tptr::TPtrDialect>();
+      target.addLegalDialect<LLVM::LLVMDialect>();
       target.addLegalDialect<BuiltinDialect>();
 
       if (failed(applyPartialConversion(moduleOp, target,
