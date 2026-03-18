@@ -184,8 +184,8 @@ def dot_kernel_fp32(
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offset < n_elements
 
-    inp = tl.load(inp_ptr + inp_stride * offset, mask=mask)
-    other = tl.load(other_ptr + other_stride * offset, mask=mask)
+    inp = tl.load(inp_ptr + inp_stride * offset, mask=mask, other=0.0)
+    other = tl.load(other_ptr + other_stride * offset, mask=mask, other=0.0)
 
     out = tl.sum(inp * other)
     tl.atomic_add(out_ptr, out)

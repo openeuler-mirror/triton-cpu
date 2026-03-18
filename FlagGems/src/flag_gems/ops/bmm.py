@@ -98,8 +98,14 @@ def bmm_kernel(
             else:
                 mask_b = mask_k[:, None] & mask_n[None, :]
 
-        a = tl.load(a_ptrs, mask_a)
-        b = tl.load(b_ptrs, mask_b)
+        if mask_a is None:
+            a = tl.load(a_ptrs, mask_a)
+        else:
+            a = tl.load(a_ptrs, mask_a, other=0)
+        if mask_b is None:
+            b = tl.load(b_ptrs, mask_b)
+        else:
+            b = tl.load(b_ptrs, mask_b, other=0)
 
         offs_k += TILE_K
         a_ptrs += TILE_K
