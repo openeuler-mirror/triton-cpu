@@ -110,8 +110,15 @@ def baddbmm_kernel(
                 mask_b = mask_k[:, None]
             else:
                 mask_b = mask_k[:, None] & mask_n[None, :]
-        a = tl.load(a_ptrs, mask=mask_a)
-        b = tl.load(b_ptrs, mask=mask_b)
+        if mask_a is None:
+            a = tl.load(a_ptrs, mask=mask_a)
+        else:
+            a = tl.load(a_ptrs, mask=mask_a, other=0)
+        if mask_b is None:
+            b = tl.load(b_ptrs, mask=mask_b)
+        else:
+            b = tl.load(b_ptrs, mask=mask_b, other=0)
+
         accumulator += tl.dot(a, b, allow_tf32=False)
         offs_k += TILE_K
         a_ptrs += TILE_K
@@ -128,7 +135,10 @@ def baddbmm_kernel(
         if not DIVISIBLE_N:
             mask_c &= offs_n[None, :] < N
 
-    bi = tl.load(bias_ptrs, mask=mask_c)
+    if mask_c is None:
+        bi = tl.load(bias_ptrs, mask=mask_c)
+    else:
+        bi = tl.load(bias_ptrs, mask=mask_c, other=0)
     out = accumulator * alpha + bi * beta
     o = out.to(bi.dtype)
     tl.store(o_ptrs, o, mask=mask_c)
