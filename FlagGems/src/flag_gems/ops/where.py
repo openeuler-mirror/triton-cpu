@@ -41,9 +41,11 @@ def where_self_out(condition, self, other, out=None):
     devices = map(lambda x: x.device, (c, a, b))
     devices = list(filter(lambda k: k.type != "cpu", devices))
 
-    assert len(devices), "CPU only. There seems a mistake to dispatch to here."
-
-    device = devices[0]
+    # assert len(devices), "CPU only. There seems a mistake to dispatch to here."
+    if len(devices) > 0:
+        device = devices[0]
+    else:
+        device = torch.device('cpu')
     if c.device != device and c.ndim == 0:
         c = c.to(device)
     if a.device != device and a.ndim == 0:
@@ -52,7 +54,7 @@ def where_self_out(condition, self, other, out=None):
         b = b.to(device)
 
     assert (
-        len(set(devices)) == 1
+        len(set(devices)) <= 1
     ), f"Expected all tensors to be on the same device, but found at least two devices, {devices}"
     assert (
         c.dtype == torch.bool
