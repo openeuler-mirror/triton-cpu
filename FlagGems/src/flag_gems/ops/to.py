@@ -67,6 +67,8 @@ def to_copy(
     memory_format=None,
 ):
     # We only implement the dense strided kernel today; all other layouts fall back to PyTorch.
+    if not isinstance(x, tensor.Tensor):
+        x = torch.tensor(x, dtype=dtype, device=device)
     if (layout is not None and layout != torch.strided) or x.layout != torch.strided:
         raise NotImplementedError(
             "FlagGems to_copy currently supports strided tensors only."
