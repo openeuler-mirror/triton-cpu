@@ -522,9 +522,12 @@ def mha_varlan_fwd(
 
         # We assess which phase the requests are likely to be in and set the config accordingly.
         total_rows = total_q * num_heads
-        num_sms = torch_device_fn.get_device_properties(
-            flag_gems.device
-        ).multi_processor_count
+        if str(torch_device_fn.__name__).endswith('cpu'):
+            num_sms = torch.get_num_threads()
+        else:
+            num_sms = torch_device_fn.get_device_properties(
+                flag_gems.device
+            ).multi_processor_count
         avg_rows_per_sm = total_rows / num_sms
         avg_rows_per_batch = total_q / batch_size
         avg_rows_per_cta = min(avg_rows_per_batch, avg_rows_per_sm)
