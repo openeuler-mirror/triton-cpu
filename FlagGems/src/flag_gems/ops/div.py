@@ -90,7 +90,8 @@ def trunc_divide(A, B):
         return trunc_div_func_scalar_tensor(A, B)
     else:
         # Both scalar
-        return torch.tensor(A / B)
+        _A = torch.as_tensor(A)
+        return torch.tensor(int(A / B), dtype = _A.dtype)
 
 
 def trunc_divide_(A, B):
