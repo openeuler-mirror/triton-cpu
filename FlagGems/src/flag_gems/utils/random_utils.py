@@ -68,12 +68,16 @@ def philox_backend_seed_offset(increment, generator=None):
 
 def set_philox_state(seed, offset, device=None):
     assert offset % 4 == 0
-    device = device or torch_device_fn.current_device()
-    gen = torch_device_fn.default_generators[device]
-    state_copy = gen.get_state()
-    state_copy.view(torch.int64)[0] = seed
-    state_copy.view(torch.int64)[1] = offset
-    gen.set_state(state_copy)
+    if str(torch_device_fn.__name__).endswith('cpu'):
+        gen = torch.default_generator
+        gen.manual_seed(seed)
+    else:
+        device = device or torch_device_fn.current_device()
+        gen = torch_device_fn.default_generators[device]
+        state_copy = gen.get_state()
+        state_copy.view(torch.int64)[0] = seed
+        state_copy.view(torch.int64)[1] = offset
+        gen.set_state(state_copy)
     return
 
 
