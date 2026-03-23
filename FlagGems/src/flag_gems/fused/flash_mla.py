@@ -182,6 +182,7 @@ def flash_mla(
     sm_scale = 1 / math.sqrt(d)
 
     o = torch.empty([b * s_q, h_q, dv], dtype=q.dtype, device=device)
+    # FIXME: Add fixed major number for CPU condition
     if device == 'cpu':
         major = 8
     else:
