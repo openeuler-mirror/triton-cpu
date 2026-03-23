@@ -39,6 +39,8 @@ def make_input(
     set_philox_state(1234567890, 0, device)
     q_shape = (batch, num_head, q_seq_len, head_size)
     kv_shape = (batch, num_head_k, kv_seq_len, head_size)
+    if torch_device_fn == torch.cpu:
+        device = 'cpu'
     q = torch.empty(q_shape, dtype=dtype, device=device).uniform_(-0.05, 0.05)
     k = torch.empty(kv_shape, dtype=dtype, device=device).uniform_(-0.05, 0.05)
     v = torch.empty(kv_shape, dtype=dtype, device=device).uniform_(-0.05, 0.05)
