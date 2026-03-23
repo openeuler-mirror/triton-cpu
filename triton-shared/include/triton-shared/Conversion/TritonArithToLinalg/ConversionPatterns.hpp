@@ -2452,10 +2452,31 @@ public:
   matchAndRewrite(triton::ExternElementwiseOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
+    // sleef function name is like: Sleef_xxx(numel), need to get rid of the
+    // placeholder
+    StringRef sym = op.getSymbol().split('(').first;
     if (!op.getPure() || op.getSrcs().size() != 2)
       return failure();
+
+    // Calls to sleef math library
+    if (sym.starts_with("Sleef_")) {
+      auto moduleOp = op->getParentOfType<ModuleOp>();
+      auto operands = adaptor.getOperands();
+      auto funcType =
+          rewriter.getFunctionType(operands.getTypes(), op.getType());
+      auto funcOp = moduleOp.lookupSymbol<func::FuncOp>(sym);
+
+      if (!funcOp) {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(moduleOp.getBody());
+        funcOp = rewriter.create<func::FuncOp>(loc, sym, funcType);
+        funcOp.setPrivate();
+      }
+      rewriter.replaceOpWithNewOp<func::CallOp>(op, funcOp, operands);
+      return success();
+    }
 #define POPULATE_BINARY_OP(FUNC_NAME, DST_OP)                                  \
-  if (!op.getSymbol().compare(FUNC_NAME)) {                                    \
+  if (!sym.compare(FUNC_NAME)) {                                               \
     rewriter.replaceOpWithNewOp<DST_OP>(op, op.getSrcs()[0], op.getSrcs()[1]); \
     return success();                                                          \
   }
@@ -2479,10 +2500,30 @@ public:
   matchAndRewrite(triton::ExternElementwiseOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
+    // sleef function name is like: Sleef_rintf(numel), need to get rid of the
+    // placeholder
+    StringRef sym = op.getSymbol().split('(').first;
     if (!op.getPure() || op.getSrcs().size() != 1)
       return failure();
+
+    // Calls to sleef math library
+    if (sym.starts_with("Sleef_")) {
+      auto moduleOp = op->getParentOfType<ModuleOp>();
+      auto funcType =
+          rewriter.getFunctionType(op.getSrcs()[0].getType(), op.getType());
+      auto funcOp = moduleOp.lookupSymbol<func::FuncOp>(sym);
+      if (!funcOp) {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(moduleOp.getBody());
+        funcOp = rewriter.create<func::FuncOp>(loc, sym, funcType);
+        funcOp.setPrivate();
+      }
+      rewriter.replaceOpWithNewOp<func::CallOp>(op, funcOp,
+                                                adaptor.getOperands());
+      return success();
+    }
 #define POPULATE_UNARY_OP(FUNC_NAME, DST_OP)                                   \
-  if (!op.getSymbol().compare(FUNC_NAME)) {                                    \
+  if (!sym.compare(FUNC_NAME)) {                                               \
     rewriter.replaceOpWithNewOp<DST_OP>(op, op.getSrcs()[0]);                  \
     return success();                                                          \
   }
