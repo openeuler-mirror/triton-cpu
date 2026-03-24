@@ -189,6 +189,8 @@ def streamk_scenario(a, b, M, N, K):
     # TODO: this my change sometime according to the realbenchmark result
     # Currently, the best configuration for streamk has only been tested on A100(capability[0] == 8).
     # The optimal settings for other devices need to be determined through real testing.
+    if torch_device_fn == torch.cpu:
+        return False
     capability = torch_device_fn.get_device_capability(get_device_info())
     return (
         capability[0] == 8
