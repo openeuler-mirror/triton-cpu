@@ -1,7 +1,7 @@
 import functools
 import logging
 import math
-
+import os
 import torch
 import triton
 import triton.language as tl
@@ -521,6 +521,7 @@ GRID_Y_LIMIT = 65535
 def normed_cumsum(inp, dim=-1):
     logger.debug("GEMS NORMED_CUMSUM")
     assert inp.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    is_cpu = torch_device_fn.__name__ == 'torch.cpu'
     dim = dim % inp.ndim
     N = inp.numel()
     K = inp.size(dim)
@@ -534,7 +535,14 @@ def normed_cumsum(inp, dim=-1):
     out = torch.empty_like(inp)
     with torch_device_fn.device(inp.device.index):
         # Pass one, scan a (batch, n_tiles * TILE) sized block within each cta
-        num_sms = get_device_properties(device).multi_processor_count
+        if is_cpu:
+            try:
+                num_sms = len(os.sched_getaffinity(0))
+            except:
+                num_sms = os.cpu_count()
+        else:
+            num_sms = get_device_properties(device).multi_processor_count
+
         TILE = 2048
         # Each row is split into n_chunks of chunks where each chunk is compised of
         # n_tiles of tiles. Different chunks are assigned to different ctas.
