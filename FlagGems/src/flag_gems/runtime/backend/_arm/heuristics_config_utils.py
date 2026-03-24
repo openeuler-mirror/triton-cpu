@@ -245,7 +245,7 @@ def mean_heur_tile_k(args):
             tile_k *= 2
         else:
             break
-        return tile_k
+    return tile_k
 
 
 def mean_heur_tile_n_non_inner(args):
