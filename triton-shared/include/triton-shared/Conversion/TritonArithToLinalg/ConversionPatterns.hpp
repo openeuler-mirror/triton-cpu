@@ -2455,9 +2455,7 @@ public:
     if (!op.getPure() || op.getSrcs().size() != 2)
       return failure();
 
-    // sleef function name is like: Sleef_xxx(numel), need to get rid of the
-    // placeholder
-    StringRef sym = op.getSymbol().split('(').first;
+    StringRef sym = op.getSymbol();
 
     // Calls to sleef math library
     if (sym.starts_with("Sleef_")) {
@@ -2504,9 +2502,7 @@ public:
     if (!op.getPure() || op.getSrcs().size() != 1)
       return failure();
 
-    // sleef function name is like: Sleef_rintf(numel), need to get rid of the
-    // placeholder
-    StringRef sym = op.getSymbol().split('(').first;
+    StringRef sym = op.getSymbol();
 
     // Calls to sleef math library
     if (sym.starts_with("Sleef_")) {
