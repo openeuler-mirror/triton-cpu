@@ -1474,6 +1474,14 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::RsqrtOp>(val);
            })
+      .def("create_tanh",
+           [](TritonOpBuilder &self, Value &val) -> Value {
+             return self.create<math::TanhOp>(val);
+           })
+      .def("create_trunc",
+           [](TritonOpBuilder &self, Value &val) -> Value {
+             return self.create<math::TruncOp>(val);
+           })
       .def("create_fabs",
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::AbsFOp>(val);
