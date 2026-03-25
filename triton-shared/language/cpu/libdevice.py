@@ -133,8 +133,8 @@ def trunc(arg0, _builder=None):
 def ceil(arg0, _builder=None):
     return core.extern_elementwise(
         "", "", [arg0], {
-            (core.dtype("fp32"), ): ("Sleef_ceilf%(numel)", core.dtype("fp32")),
-            (core.dtype("fp64"), ): ("Sleef_ceild%(numel)", core.dtype("fp64")),
+            (core.dtype("fp32"), ): ("Sleef_ceilf", core.dtype("fp32")),
+            (core.dtype("fp64"), ): ("Sleef_ceild1", core.dtype("fp64")),
         }, is_pure=True, _builder=_builder)
 
 
@@ -142,8 +142,8 @@ def ceil(arg0, _builder=None):
 def pow(arg0, arg1, _builder=None):
     return core.extern_elementwise(
         "", "", [arg0, arg1], {
-            (core.dtype("fp32"), core.dtype("fp32")): ("Sleef_powf%(numel)_u10", core.dtype("fp32")),
-            (core.dtype("fp64"), core.dtype("fp64")): ("Sleef_powd%(numel)_u10", core.dtype("fp64")),
+            (core.dtype("fp32"), core.dtype("fp32")): ("Sleef_powf_u10", core.dtype("fp32")),
+            (core.dtype("fp64"), core.dtype("fp64")): ("Sleef_powd1_u10", core.dtype("fp64")),
         }, is_pure=True, _builder=_builder)
 
 
@@ -151,8 +151,8 @@ def pow(arg0, arg1, _builder=None):
 def fmod(arg0, arg1, _builder=None):
     return core.extern_elementwise(
         "", "", [arg0, arg1], {
-            (core.dtype("fp32"), core.dtype("fp32")): ("Sleef_fmodf%(numel)", core.dtype("fp32")),
-            (core.dtype("fp64"), core.dtype("fp64")): ("Sleef_fmodd%(numel)", core.dtype("fp64")),
+            (core.dtype("fp32"), core.dtype("fp32")): ("Sleef_fmodf", core.dtype("fp32")),
+            (core.dtype("fp64"), core.dtype("fp64")): ("Sleef_fmodd1", core.dtype("fp64")),
         }, is_pure=True, _builder=_builder)
 
 
@@ -171,8 +171,8 @@ def div_rz(arg0, arg1, _builder=None):
 def rint(arg0, _builder=None):
     return core.extern_elementwise(
         "", "", [arg0], {
-            (core.dtype("fp32"), ): ("Sleef_rintf(numel)", core.dtype("fp32")),
-            (core.dtype("fp64"), ): ("Sleef_rint(numel)", core.dtype("fp64")),
+            (core.dtype("fp32"), ): ("Sleef_rintf", core.dtype("fp32")),
+            (core.dtype("fp64"), ): ("Sleef_rint", core.dtype("fp64")),
         }, is_pure=True, _builder=_builder)
 
 
@@ -180,8 +180,8 @@ def rint(arg0, _builder=None):
 def atan2(arg0, arg1, _builder=None):
     return core.extern_elementwise(
         "", "", [arg0, arg1], {
-            (core.dtype("fp32"), core.dtype("fp32")): ("Sleef_atan2f%(numel)_u10", core.dtype("fp32")),
-            (core.dtype("fp64"), core.dtype("fp64")): ("Sleef_atan2%(numel)_u10", core.dtype("fp64")),
+            (core.dtype("fp32"), core.dtype("fp32")): ("Sleef_atan2f_u10", core.dtype("fp32")),
+            (core.dtype("fp64"), core.dtype("fp64")): ("Sleef_atan2_u10", core.dtype("fp64")),
         }, is_pure=True, _builder=_builder)
 
 
