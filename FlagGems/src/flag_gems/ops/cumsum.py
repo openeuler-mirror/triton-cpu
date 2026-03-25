@@ -16,8 +16,15 @@ logger = logging.getLogger(__name__)
 
 
 @functools.lru_cache
-def get_num_sms(idx: int) -> int:
-    return get_device_properties(idx).multi_processor_count
+def get_num_sms(idx) -> int:
+    props = get_device_properties(idx)
+    if isinstance(props, dict):
+        # CPU backend: use logical CPU count as SM equivalent
+        try:
+            return len(os.sched_getaffinity(0))
+        except Exception:
+            return os.cpu_count() or 1
+    return props.multi_processor_count
 
 
 @tl.constexpr
@@ -231,6 +238,18 @@ def cumsum_wrapper(inp, dim=1, dtype=None, out=None):
     if inp.dtype == torch.float16 or inp.dtype == torch.bfloat16:
         compute_dtype = torch.float32
 
+    is_cpu = torch_device_fn.__name__ == 'torch.cpu'
+    if is_cpu:
+        # The Triton-CPU (triton-shared) backend executes CTAs sequentially,
+        # making the multi-CTA scan_then_fan extremely slow for large N.
+        # FlagGems only overrides aten::cumsum and aten::cumsum.out, NOT the
+        # in-place aten::cumsum_, so calling Tensor.cumsum_() falls through to
+        # the native ATen kernel without recursion.
+        tmp = inp.to(compute_dtype, copy=True)
+        tmp.cumsum_(dim)
+        out.copy_(tmp)
+        return out
+
     if K == 1:  # row scan
         reduce_then_scan_row(inp, out, M, N, compute_dtype)
     else:  # col scan
@@ -246,6 +265,18 @@ def reduce_then_scan_row(x, out, M, N, compute_dtype):
         reduce_then_scan_root_scan_kernel_row[(M, 1, 1)](
             x, out, N, TILE_SIZE, num_warps=num_warps
         )
+        return out
+
+    is_cpu = torch_device_fn.__name__ == 'torch.cpu'
+    if is_cpu:
+        # The multi-CTA GPU 3-kernel approach uses int64 pointer offsets which
+        # the triton-shared (CPU) backend does not support. Fall back to
+        # scan_then_fan which uses i32 offsets and is CPU-compatible.
+        # Also cast the input: bool/sub-word dtypes produce a tt.bitcast in the
+        # TTIR (ptr<i1> -> ptr<i8>) that triton-shared PtrAnalysis cannot handle.
+        if x.dtype != compute_dtype:
+            x = x.to(compute_dtype)
+        scan_then_fan(x, out, M, N, 1, compute_dtype)
         return out
 
     TILE_SIZE = min(4096, triton.next_power_of_2(N))

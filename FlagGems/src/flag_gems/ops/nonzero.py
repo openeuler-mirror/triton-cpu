@@ -26,11 +26,11 @@ def nonzero_kernel(
 ):
     pid = tle.program_id(0)
 
-    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offset = (pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(tl.int32)
     mask = offset < n_elements
 
     inp_vals = tl.load(inp + offset, mask=mask).to(tl.int1)
-    out_offset = tl.load(prefix_sum + offset, mask=mask) - 1
+    out_offset = tl.load(prefix_sum + offset, mask=mask).to(tl.int32) - 1
 
     nonzero_mask = mask and inp_vals  # noqa
 
@@ -62,9 +62,14 @@ def nonzero(inp, *, as_tuple=False):
     num_nonzeros = n_elements
     out = torch.empty(num_nonzeros, inp_ndim, dtype=torch.int64, device=inp.device)
 
+    # Cast bool to uint8: bool is stored as uint8 in memory (0/1), so view() is
+    # free. This avoids a tt.bitcast(ptr<i1> -> ptr<i8>) in the TTIR that the
+    # triton-shared (CPU) PtrAnalysis cannot lower.
+    inp_kernel = inp_bool.view(torch.uint8) if inp_bool.dtype == torch.bool else inp_bool
+
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
     with torch_device_fn.device(inp.device):
-        nonzero_kernel[grid](inp_bool, prefix_sum, out, n_elements, shape, inp_ndim)
+        nonzero_kernel[grid](inp_kernel, prefix_sum, out, n_elements, shape, inp_ndim)
 
     num_nonzeros = prefix_sum[n_elements - 1].item()
     out = out[0:num_nonzeros]
