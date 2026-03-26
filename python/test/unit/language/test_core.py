@@ -3908,10 +3908,6 @@ def test_dot_without_load(dtype_str, device):
     kernel = patch_kernel(_kernel, {'GENERATE_TEST_HERE': f"tl.full((32, 32), 1.0, tl.{dtype_str})"})
     a = torch.ones((32, 32), dtype=getattr(torch, dtype_str), device=device)
     b = torch.ones((32, 32), dtype=getattr(torch, dtype_str), device=device)
-    if is_cpu() and dtype_str == "float16":
-        out_ref = torch.tensor(np.matmul(to_numpy(a), to_numpy(b)), dtype=getattr(torch, dtype_str), device=device)
-    else:
-        out_ref = torch.matmul(a, b)
     out_ref = torch.matmul(a, b)
     out = torch.zeros((32, 32), dtype=getattr(torch, dtype_str), device=device)
     kernel[(1, )](out)
@@ -4052,13 +4048,10 @@ def test_masked_load_shared_memory(dtype, device):
         output_offsets = M_offsets[:, None] * out_stride + N_offsets[None, :]
         tl.store(output_ptr + output_offsets, o, mask=output_offsets < M * N)
 
-    _kernel[(1, )](in1, in2, out, in1.stride()[0], in2.stride()[0], out.stride()[0], in1.numel(), in2.numel(),
+    pgm = _kernel[(1, )](in1, in2, out, in1.stride()[0], in2.stride()[0], out.stride()[0], in1.numel(), in2.numel(),
                          out.numel(), M=M, N=N, K=K)
-    
-    if is_cpu() and (dtype == torch.float16 or dtype == torch.bfloat16):
-        reference_out = torch.tensor(np.matmul(to_numpy(in1), to_numpy(in2))).to(torch.float32)
-    else:
-        reference_out = torch.matmul(in1, in2).to(torch.float32)
+
+    reference_out = torch.matmul(in1, in2)
     torch.testing.assert_close(out, reference_out, atol=1e-2, rtol=0)
 
 
@@ -5842,11 +5835,8 @@ def test_tl_range(device):
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     pgm = matmul_kernel[grid](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0),
                               c.stride(1), BLOCK_M, BLOCK_N, BLOCK_K, 0, num_pipeline_stages=5)
-    if is_cpu():
-        ref_out = torch.tensor(np.matmul(to_numpy(a), to_numpy(b)), dtype=torch.float32, device=device)
-    else:
-        ref_out = torch.matmul(a, b).to(torch.float32)
 
+    ref_out = torch.matmul(a, b).to(torch.float32)
     if is_interpreter():
         # GPU invokes tensor core for float16 matmul, which is not supported in interpreter.
         # Thus we use a higher tolerance
