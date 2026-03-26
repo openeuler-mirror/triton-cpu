@@ -2483,6 +2483,17 @@ public:
 
     StringRef sym = op.getSymbol();
 
+#define POPULATE_BINARY_OP(FUNC_NAME, DST_OP)                                  \
+  if (!sym.compare(FUNC_NAME)) {                                               \
+    rewriter.replaceOpWithNewOp<DST_OP>(op, op.getSrcs()[0], op.getSrcs()[1]); \
+    return success();                                                          \
+  }
+
+    POPULATE_BINARY_OP("Sleef_atan2f_u10", math::Atan2Op);
+    POPULATE_BINARY_OP("Sleef_atan2_u10", math::Atan2Op);
+    POPULATE_BINARY_OP("Sleef_powf_u10", math::PowFOp);
+    POPULATE_BINARY_OP("Sleef_powd1_u10", math::PowFOp);
+
     // Calls to sleef math library
     if (sym.starts_with("Sleef_")) {
       auto moduleOp = op->getParentOfType<ModuleOp>();
@@ -2500,11 +2511,6 @@ public:
       rewriter.replaceOpWithNewOp<func::CallOp>(op, funcOp, operands);
       return success();
     }
-#define POPULATE_BINARY_OP(FUNC_NAME, DST_OP)                                  \
-  if (!sym.compare(FUNC_NAME)) {                                               \
-    rewriter.replaceOpWithNewOp<DST_OP>(op, op.getSrcs()[0], op.getSrcs()[1]); \
-    return success();                                                          \
-  }
 
     POPULATE_BINARY_OP("__nv_atan2f", math::Atan2Op);
     POPULATE_BINARY_OP("__nv_atan2", math::Atan2Op);
@@ -2530,6 +2536,15 @@ public:
 
     StringRef sym = op.getSymbol();
 
+#define POPULATE_UNARY_OP(FUNC_NAME, DST_OP)                                   \
+  if (!sym.compare(FUNC_NAME)) {                                               \
+    rewriter.replaceOpWithNewOp<DST_OP>(op, op.getSrcs()[0]);                  \
+    return success();                                                          \
+  }
+
+    POPULATE_UNARY_OP("Sleef_ceilf", math::CeilOp);
+    POPULATE_UNARY_OP("Sleef_ceild1", math::CeilOp);
+
     // Calls to sleef math library
     if (sym.starts_with("Sleef_")) {
       auto moduleOp = op->getParentOfType<ModuleOp>();
@@ -2546,11 +2561,6 @@ public:
                                                 adaptor.getOperands());
       return success();
     }
-#define POPULATE_UNARY_OP(FUNC_NAME, DST_OP)                                   \
-  if (!sym.compare(FUNC_NAME)) {                                               \
-    rewriter.replaceOpWithNewOp<DST_OP>(op, op.getSrcs()[0]);                  \
-    return success();                                                          \
-  }
 
     POPULATE_UNARY_OP("__nv_fabsf", math::AbsFOp);
     POPULATE_UNARY_OP("__nv_fabs", math::AbsFOp);
