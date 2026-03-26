@@ -1063,6 +1063,31 @@ struct JoinConverter : public OpConversionPattern<triton::JoinOp> {
     Value result = rewriter.create<tensor::EmptyOp>(
         loc, resultType.getShape(), resultType.getElementType());
 
+    auto materializeSliceOperand = [&](Value input) -> Value {
+      if (auto inputType = dyn_cast<RankedTensorType>(input.getType())) {
+        auto inputRank = inputType.getRank();
+        SmallVector<int64_t> sliceShape(inputType.getShape());
+        sliceShape.push_back(1);
+
+        SmallVector<ReassociationIndices> reassoc;
+        if (inputRank == 0) {
+          reassoc.push_back({0});
+        } else {
+          for (int64_t i = 0; i < inputRank - 1; ++i)
+            reassoc.push_back({i});
+          reassoc.push_back({inputRank - 1, inputRank});
+        }
+
+        auto sliceType =
+            RankedTensorType::get(sliceShape, inputType.getElementType());
+        return rewriter.create<tensor::ExpandShapeOp>(loc, sliceType, input,
+                                                      reassoc);
+      }
+
+      auto sliceType = RankedTensorType::get({1}, input.getType());
+      return rewriter.create<tensor::FromElementsOp>(loc, sliceType, input);
+    };
+
     auto shape = resultType.getShape();
 
     SmallVector<OpFoldResult> offsets(shape.size(), rewriter.getIndexAttr(0));
@@ -1078,7 +1103,8 @@ struct JoinConverter : public OpConversionPattern<triton::JoinOp> {
 
       offsets.push_back(rewriter.getIndexAttr(i));
       sizes.push_back(rewriter.getIndexAttr(1));
-      result = rewriter.create<tensor::InsertSliceOp>(loc, inputs[i], result,
+      Value slice = materializeSliceOperand(inputs[i]);
+      result = rewriter.create<tensor::InsertSliceOp>(loc, slice, result,
                                                       offsets, sizes, strides);
     }
 
