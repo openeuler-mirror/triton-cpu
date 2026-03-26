@@ -54,8 +54,10 @@ module {
 // CHECK:     } -> tensor<128x!tt.ptr<i32>>
 // CHECK:     [[LOADED_ARG1:%.+]] = tt.load [[ADDPTR_ARG1]] : tensor<128x!tt.ptr<i32>>
 // CHECK:     [[EMPTY_JOIN:%.+]] = tensor.empty() : tensor<128x2xi32>
-// CHECK:     [[INSERTED_SLICE0:%.+]] = tensor.insert_slice [[LOADED_ARG0]] into [[EMPTY_JOIN]]{{\[}}0, 0{{\]}} [128, 1] [1, 1] : tensor<128xi32> into tensor<128x2xi32>
-// CHECK:     [[INSERTED_SLICE1:%.+]] = tensor.insert_slice [[LOADED_ARG1]] into [[INSERTED_SLICE0]]{{\[}}0, 1{{\]}} [128, 1] [1, 1] : tensor<128xi32> into tensor<128x2xi32>
+// CHECK:     [[JOIN_SLICE0:%.+]] = tensor.expand_shape [[LOADED_ARG0]] {{.*}} output_shape [128, 1] : tensor<128xi32> into tensor<128x1xi32>
+// CHECK:     [[INSERTED_SLICE0:%.+]] = tensor.insert_slice [[JOIN_SLICE0]] into [[EMPTY_JOIN]]{{\[}}0, 0{{\]}} [128, 1] [1, 1] : tensor<128x1xi32> into tensor<128x2xi32>
+// CHECK:     [[JOIN_SLICE1:%.+]] = tensor.expand_shape [[LOADED_ARG1]] {{.*}} output_shape [128, 1] : tensor<128xi32> into tensor<128x1xi32>
+// CHECK:     [[INSERTED_SLICE1:%.+]] = tensor.insert_slice [[JOIN_SLICE1]] into [[INSERTED_SLICE0]]{{\[}}0, 1{{\]}} [128, 1] [1, 1] : tensor<128x1xi32> into tensor<128x2xi32>
 // CHECK:     [[EXPANDED_RANGE:%.+]] = tensor.expand_shape
 // CHECK:     [[MULI_RESULT:%.+]] = linalg.generic {{.*}} ins([[EXPANDED_RANGE]], [[FILLED_C2]] : tensor<128x1xi32>, tensor<128x1xi32>) outs([[EXPANDED_RANGE:%.+]] : tensor<128x1xi32>) {
 // CHECK:       ^bb0([[IN_I32_0:%.+]]: i32, [[IN_I32_1:%.+]]: i32, %out: i32):
