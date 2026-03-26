@@ -214,6 +214,8 @@ def _is_special_float(arg0, uint_dtype, kind: tl.constexpr):
         return exp_is_all_ones & (shifted_mantissa != zero)
     elif kind == "inf":
         return exp_is_all_ones & (shifted_mantissa == zero)
+    elif kind == "finite":
+        return exp_is_all_ones == False
     else:
         raise ValueError(f"Unexpected kind {kind}")
 
@@ -235,6 +237,23 @@ def isinf(arg0, _builder=None, _generator=None):
     uint_dtype = tl.core.get_int_dtype(bitwidth, signed=False)
     return _generator.call_JitFunction(_is_special_float, (arg0, uint_dtype, "inf"), kwargs={})
 
+
+@builtin
+def isfinited(arg0, _builder=None, _generator=None):
+    if not arg0.dtype.is_floating():
+        raise ValueError("isfinited expects a floating point type")
+    bitwidth = arg0.dtype.primitive_bitwidth
+    uint_dtype = tl.core.get_int_dtype(bitwidth, signed=False)
+    return _generator.call_JitFunction(_is_special_float, (arg0, uint_dtype, "finite"), kwargs={})
+
+
+@builtin
+def finitef(arg0, _builder=None, _generator=None):
+    if not arg0.dtype.is_floating():
+        raise ValueError("finitef expects a floating point type")
+    bitwidth = arg0.dtype.primitive_bitwidth
+    uint_dtype = tl.core.get_int_dtype(bitwidth, signed=False)
+    return _generator.call_JitFunction(_is_special_float, (arg0, uint_dtype, "finite"), kwargs={})
 
 @jit
 def _signbit(arg0, uint_dtype: tl.constexpr):
