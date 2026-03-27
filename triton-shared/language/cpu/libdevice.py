@@ -158,11 +158,17 @@ def fmod(arg0, arg1, _builder=None):
 
 @core.extern
 def div_rn(arg0, arg1, _builder=None):
+    arg0 = core.to_tensor(arg0, _builder=_builder)
+    arg1 = core.to_tensor(arg1, _builder=_builder)
+    arg0, arg1 = core.binary_op_type_legalization(arg0, arg1, _builder)
     return core.tensor(_builder.create_precise_divf(arg0.handle, arg1.handle), arg0.type)
 
 
 @core.extern
 def div_rz(arg0, arg1, _builder=None):
+    arg0 = core.to_tensor(arg0, _builder=_builder)
+    arg1 = core.to_tensor(arg1, _builder=_builder)
+    arg0, arg1 = core.binary_op_type_legalization(arg0, arg1, _builder)
     rn = core.tensor(_builder.create_precise_divf(arg0.handle, arg1.handle), arg0.type)
     return core.tensor(_builder.create_trunc(rn.handle), rn.type)
 
