@@ -158,15 +158,15 @@ def conv2d_forward_kernel(
             output_c_offset < out_per_group_c
         )[None, :]
 
-        input_block = tl.load(curr_input_pointer, mask=input_mask)
-        weight_block = tl.load(curr_weight_pointer, mask=weight_mask)
+        input_block = tl.load(curr_input_pointer, mask=input_mask, other=0)
+        weight_block = tl.load(curr_weight_pointer, mask=weight_mask, other=0)
 
         accum += tl.dot(input_block, weight_block, allow_tf32=False)
     bias_pointer += (pid_group[None] * out_per_group_c)[None, :] + output_c_offset[
         None, :
     ]
     mask_bias = (output_c_offset < out_per_group_c)[None, :]
-    bias = tl.load(bias_pointer, mask_bias).to(tl.float32)
+    bias = tl.load(bias_pointer, mask_bias, other=0).to(tl.float32)
     accum += bias
     output_pointer += (
         (output_n_stride * in_n_point_value)[:, None]
@@ -271,7 +271,7 @@ def conv2d_backward_kernel_weight(
         :, None
     ]
 
-    input_pointer += (ci_point_value * input_c_stride[None])[:, None] + (
+    input_pointer += (ci_point_value * input_c_stride)[:, None] + (
         pid_groups[None] * input_c_stride * input_c
     )[None, :]
 
@@ -295,7 +295,7 @@ def conv2d_backward_kernel_weight(
                     output_c_offset < out_c
                 )[None, :]
 
-                curr_out_grad = tl.load(curr_out_grad_pointer, mask=out_grad_mask)
+                curr_out_grad = tl.load(curr_out_grad_pointer, mask=out_grad_mask, other=0)
 
                 input_height_offset = (
                     weight_height_point_value * dilation_height
@@ -324,7 +324,7 @@ def conv2d_backward_kernel_weight(
                     & (input_width_offset < input_width)[:, None]
                 )
 
-                curr_input = tl.load(curr_input_pointer, mask=input_mask)
+                curr_input = tl.load(curr_input_pointer, mask=input_mask, other=0)
                 accum += tl.dot(curr_input, curr_out_grad, allow_tf32=False)
 
     weight_mask = (
