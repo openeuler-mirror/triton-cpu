@@ -90,6 +90,7 @@ def triton_lighting_indexer_k_tiled(
             )
             tl.store(out_ptr, out_blk.to(tl.float16), out_msk)
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def triton_lighting_indexer_k_tiled_interface(
     q, kv, weights, cu_seqlen_ks, cu_seqlen_ke
@@ -97,7 +98,7 @@ def triton_lighting_indexer_k_tiled_interface(
     Q, H, D = q.shape[0], q.shape[1], q.shape[2]
     K = kv.shape[0]
     CU = cu_seqlen_ks.shape[0]
-    logits = torch.full([Q, K], float("-inf"), device="cuda", dtype=torch.float32)
+    logits = torch.full([Q, K], float("-inf"), device=device, dtype=torch.float32)
     BQ = 1
     BK = 64
     TK = 2048
