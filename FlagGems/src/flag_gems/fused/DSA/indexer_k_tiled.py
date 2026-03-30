@@ -46,7 +46,7 @@ def triton_lighting_indexer_k_tiled(
         cu_ed_seqlens + offs_cu, mask_cu, -1000000000
     )  # [BQ]
     eos_vec = tl.minimum(eos_vec, bos_vec + (i_k + 1) * TK)
-    bos, eos = max(bos_vec.min(0), 0), min(eos_vec.max(0), K)
+    bos, eos = tl.maximum(tl.min(bos_vec, axis=0), 0), tl.minimum(tl.max(eos_vec, axis=0), K)
     CK = eos - bos
     if CK > 0:
         q_base = q_index
@@ -78,7 +78,7 @@ def triton_lighting_indexer_k_tiled(
             k_blk = tl.load(k_ptr, k_msk, 0.0).to(tl.float16)
             acc = tl.dot(q_blk, k_blk, out_dtype=tl.float16)  # [BQ*H, BK]
             acc = tl.maximum(acc, 0.0) * w_blk[:, None]
-            out_blk = acc.trans().reshape(BK, BQ, H).sum(-1).trans()  # [BQ, BK]
+            out_blk = tl.trans(tl.sum(tl.trans(acc).reshape(BK, BQ, H), axis=-1))  # [BQ, BK]
             out_ptr = (
                 o_base + offs_boq[:, None] * stride_lm + offs_bk[None, :] * stride_ln
             )
