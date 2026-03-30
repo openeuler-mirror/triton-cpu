@@ -168,7 +168,7 @@ def test_lighting_indexer_forward(
     your_output = triton_lighting_indexer_k_tiled_interface(q, kv, weights, ks, ke)
 
     # Accuracy comparison
-    assert_close_inf(your_output, ref_output, 1e-2)
+    assert_close_inf(your_output, ref_output, 1e-2, ks=ks, ke=ke)
 
 
 if __name__ == "__main__":
