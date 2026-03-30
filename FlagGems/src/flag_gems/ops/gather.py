@@ -63,8 +63,11 @@ def generate_gather_kernel(
         code.newline()
         code.writeline("cur_offset = offset")
         for i in range(rank - 1, -1, -1):
-            code.writeline(f"index_idx{i} = cur_offset % index_shape{i}")
-            code.writeline(f"cur_offset = cur_offset // index_shape{i}")
+            if i > 0:
+                code.writeline(f"index_idx{i} = cur_offset % index_shape{i}")
+                code.writeline(f"cur_offset = cur_offset // index_shape{i}")
+            else:
+                code.writeline(f"index_idx{i} = cur_offset")
         code.newline()
         comp = [f"index_idx{i} * index_stride{i}" for i in range(rank)]
         code.writeline(f"index_offset = {' + '.join(comp)}")
