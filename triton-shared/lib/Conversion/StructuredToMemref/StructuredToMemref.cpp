@@ -110,8 +110,12 @@ llvm::SmallVector<OpFoldResult> getMixedStridesForMemref(OpType op,
                                                          OpBuilder &b) {
   llvm::SmallVector<OpFoldResult> strides;
   auto accumulate = 1;
+
+  auto opSizes = op.getSizes();
+  auto opMixedStrides = op.getMixedStrides();
+
   for (auto [size, stride] :
-       llvm::reverse(llvm::zip(op.getSizes(), op.getMixedStrides()))) {
+       llvm::reverse(llvm::zip(opSizes, opMixedStrides))) {
     auto strideIntAttr = getIntAttr(stride);
     if (size == 1 && strideIntAttr && strideIntAttr.value() == 0) {
       strides.push_back(b.getIndexAttr(accumulate));
