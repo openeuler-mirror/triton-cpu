@@ -288,7 +288,6 @@ def compile(src, target=None, options=None):
                 driver.set_active_to_cpu()
                 return compile(old_src, GPUTarget("cpu", "cpu", 1), old_options)
             raise RuntimeError(f"CPU backend fallback failed: {e}") 
-        next_module = compile_ir(module, metadata)
         ir_filename = f"{file_name}.{ext}"
         if (fn_override_manager is not None and (full_name := fn_override_manager.get_file(ir_filename)) is not None):
             print(f"\nOverriding kernel with file {full_name}")
