@@ -606,11 +606,49 @@ struct TypeOffsetConverter : OpConversionPattern<tptr::TypeOffsetOp> {
   }
 };
 
+// IntToPtrOp -> llvm.inttoptr conversion
+struct IntToPtrConverter : OpConversionPattern<tptr::IntToPtrOp> {
+  using OpConversionPattern<tptr::IntToPtrOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(tptr::IntToPtrOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    LDBG("matchAndRewrite: inttoptr " << op);
+
+    auto ctx = rewriter.getContext();
+    Type targetType = LLVM::LLVMPointerType::get(ctx);
+
+    rewriter.replaceOpWithNewOp<LLVM::IntToPtrOp>(op, targetType,
+                                                  adaptor.getOperands()[0]);
+
+    LDBG("matchAndRewrite: inttoptr done");
+    return success();
+  }
+};
+
+// PtrToIntOp -> llvm.ptrtoint
+struct PtrToIntConverter : OpConversionPattern<tptr::PtrToIntOp> {
+  using OpConversionPattern<tptr::PtrToIntOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(tptr::PtrToIntOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    LDBG("matchAndRewrite: ptrtoint " << op);
+
+    Type targetType = rewriter.getI64Type();
+
+    rewriter.replaceOpWithNewOp<LLVM::PtrToIntOp>(op, targetType,
+                                                  adaptor.getOperands()[0]);
+    LDBG("matchAndRewrite: ptrtoint done");
+    return success();
+  }
+};
+
 void populateTPtrToLLVMConversionPatterns(RewritePatternSet &patterns,
                                           TypeConverter &typeConverter) {
   patterns.add<TypeOffsetConverter, PtrAddConverter, FromMemrefConverter,
                ConvertBranchOp, ConvertControlFlowOp, ToMemrefConverter,
-               UnrealizedCastConverter>(
+               UnrealizedCastConverter, IntToPtrConverter, PtrToIntConverter>(
       typeConverter, patterns.getContext());
 }
 
