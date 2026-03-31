@@ -1361,7 +1361,7 @@ def test_accuracy_rwkv_mmsparsity(dtype):
 
     k = torch.randn(n, dtype=dtype, device=flag_gems.device)
     k = torch.relu(k)
-    if flag_gems.vendor_name == "kunlunxin":
+    if flag_gems.vendor_name in ("kunlunxin", "arm"):
         torch.manual_seed(42)
         # kunlunxin sparsity test require 90% sparsity
         sparsity_levels = [0.9]
