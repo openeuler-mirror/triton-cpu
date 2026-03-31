@@ -30,7 +30,7 @@ def isclose_func(
 ):
     cast_x = x if x.dtype.is_fp64() else x.to(tl.float32)
     cast_y = y if x.dtype.is_fp64() else y.to(tl.float32)
-    if x.dtype.is_bf16():
+    if x.dtype.is_bf16() | x.dtype.is_fp16():
         close = cast_x == cast_y
     else:
         close = x == y
