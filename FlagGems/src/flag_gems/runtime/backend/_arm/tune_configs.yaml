@@ -52,7 +52,7 @@ argmin:
 log_softmax:
 - META:
     BLOCK_M: 8
-    BLOCK_N: 1024
+    BLOCK_N: 128
   num_warps: 4
 mm:
 - META:
