@@ -512,10 +512,15 @@ class CPUBackend(BaseBackend):
                     oneshot.result,
                     ["func.func"]
                 )
-                transform.ApplyRegisteredPassOp(
+                dealloc = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
                     funcs.result,
                     "buffer-deallocation"
+                )
+                transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    dealloc.result,
+                    "convert-bufferization-to-memref"
                 )
 
                 transform.YieldOp([oneshot])
