@@ -27,6 +27,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR//MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -47,6 +48,7 @@ using namespace mlir;
 
 static const std::string WRAP_SIDE_BY_SIDE = "wrap_side_by_side";
 static const std::string WRAP_STACKED = "wrap_stacked";
+static const std::string ORIGINAL_ORDER_ATTR = "tts.original_order";
 
 static memref::SubViewOp getSubview(int rank, ArrayRef<OpFoldResult> dims,
                                     Value source, Location loc, OpBuilder &b) {
@@ -105,17 +107,13 @@ static MemRefType getResultMemrefType(tts::MakeGatherScatterTensorPtrOp op,
 // If there are dimensions with size 1 and stride 0, replace 0 stride with
 // the product of sizes of all lower dimensions. This avoids creating memref
 // with zero stride.
-template <class OpType>
-llvm::SmallVector<OpFoldResult> getMixedStridesForMemref(OpType op,
-                                                         OpBuilder &b) {
+static llvm::SmallVector<OpFoldResult>
+getMixedStridesForMemref(ArrayRef<int64_t> sizes,
+                         ArrayRef<OpFoldResult> mixedStrides, OpBuilder &b) {
   llvm::SmallVector<OpFoldResult> strides;
   auto accumulate = 1;
 
-  auto opSizes = op.getSizes();
-  auto opMixedStrides = op.getMixedStrides();
-
-  for (auto [size, stride] :
-       llvm::reverse(llvm::zip(opSizes, opMixedStrides))) {
+  for (auto [size, stride] : llvm::reverse(llvm::zip(sizes, mixedStrides))) {
     auto strideIntAttr = getIntAttr(stride);
     if (size == 1 && strideIntAttr && strideIntAttr.value() == 0) {
       strides.push_back(b.getIndexAttr(accumulate));
@@ -129,6 +127,52 @@ llvm::SmallVector<OpFoldResult> getMixedStridesForMemref(OpType op,
   }
   std::reverse(strides.begin(), strides.end());
   return strides;
+}
+
+template <class OpType>
+llvm::SmallVector<OpFoldResult> getMixedStridesForMemref(OpType op,
+                                                         OpBuilder &b) {
+  return getMixedStridesForMemref(op.getSizes(), op.getMixedStrides(), b);
+}
+
+template <typename T>
+static SmallVector<T> applyPermutation(ArrayRef<T> values,
+                                       ArrayRef<int32_t> permutation) {
+  assert(values.size() == permutation.size());
+  SmallVector<T> result;
+  result.reserve(values.size());
+  for (int32_t axis : permutation)
+    result.push_back(values[axis]);
+  return result;
+}
+
+static SmallVector<int32_t> getTransposePermutation(ArrayRef<int32_t> order) {
+  return SmallVector<int32_t>(order.rbegin(), order.rend());
+}
+
+static SmallVector<int32_t> getRecoverPermutation(ArrayRef<int32_t> order) {
+  SmallVector<int32_t> permutation(order.size());
+  for (auto [index, axis] : llvm::enumerate(order))
+    permutation[axis] = order.size() - index - 1;
+  return permutation;
+}
+
+static DenseI32ArrayAttr getOriginalOrderAttr(Value ptr) {
+  if (Operation *definingOp = ptr.getDefiningOp())
+    return definingOp->getAttrOfType<DenseI32ArrayAttr>(ORIGINAL_ORDER_ATTR);
+  return {};
+}
+
+static Value transposeTensor(Value source, ArrayRef<int64_t> dstShape,
+                             ArrayRef<int32_t> permutation, Location loc,
+                             ConversionPatternRewriter &rewriter) {
+  auto sourceType = cast<RankedTensorType>(source.getType());
+  auto empty = rewriter.create<tensor::EmptyOp>(loc, dstShape,
+                                                sourceType.getElementType());
+  SmallVector<int64_t> permutation64(permutation.begin(), permutation.end());
+  auto transpose =
+      rewriter.create<linalg::TransposeOp>(loc, source, empty, permutation64);
+  return transpose.getResults()[0];
 }
 
 static OpFoldResult accumulateTargetOffset(Location loc,
@@ -514,8 +558,28 @@ private:
   LogicalResult rewritePtr(ArrayRef<int64_t> resultShape, bool isBlockPtr,
                            tts::MakeTensorPtrOp op, OpAdaptor adaptor,
                            ConversionPatternRewriter &rewriter) const {
+    auto transposePermutation = getTransposePermutation(op.getOrder());
+    bool needsTranspose = !llvm::is_sorted(op.getOrder(), std::greater<>());
 
-    auto mixedStrides = getMixedStridesForMemref(op, rewriter);
+    SmallVector<int64_t> memrefShape(resultShape.begin(), resultShape.end());
+    SmallVector<int64_t> memrefSizes(op.getSizes().begin(),
+                                     op.getSizes().end());
+    SmallVector<OpFoldResult> memrefStrides =
+        llvm::to_vector(op.getMixedStrides());
+    SmallVector<Value> dynamicSizes;
+
+    if (needsTranspose) {
+      memrefShape =
+          applyPermutation<int64_t>(resultShape, transposePermutation);
+      memrefSizes =
+          applyPermutation<int64_t>(op.getSizes(), transposePermutation);
+      memrefStrides = applyPermutation<OpFoldResult>(op.getMixedStrides(),
+                                                     transposePermutation);
+    }
+
+    auto mixedStrides =
+        getMixedStridesForMemref(memrefSizes, memrefStrides, rewriter);
+    auto mixedSizes = mlir::getMixedValues(memrefSizes, dynamicSizes, rewriter);
     SmallVector<int64_t> staticStrides;
     SmallVector<Value> dynamicStrides;
     dispatchIndexOpFoldResults(mixedStrides, dynamicStrides, staticStrides);
@@ -525,11 +589,14 @@ private:
     auto staticTargetOffset = getIntAttr(targetOffset);
     auto resultType = getResultMemrefType(
         op, staticTargetOffset.value_or(ShapedType::kDynamic), staticStrides,
-        resultShape);
+        memrefShape);
 
     auto castOp = rewriter.create<memref::ReinterpretCastOp>(
-        op.getLoc(), resultType, adaptor.getBase(), targetOffset,
-        op.getMixedSizes(), mixedStrides);
+        op.getLoc(), resultType, adaptor.getBase(), targetOffset, mixedSizes,
+        mixedStrides);
+
+    if (needsTranspose)
+      castOp->setAttr(ORIGINAL_ORDER_ATTR, op.getOrderAttr());
 
     rewriter.replaceOp(op, castOp);
 
@@ -563,7 +630,7 @@ public:
   LogicalResult
   matchAndRewrite(tts::MakeTensorPtrOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (!llvm::is_sorted(op.getOrder(), std::greater<>())) {
+    if (!llvm::is_sorted(op.getOrder(), std::greater<>()) && op.isSplitPtr()) {
       emitError(op.getLoc()) << "non-decreasing dimension order on tensor "
                                 "pointers are not yet supported";
       return failure();
@@ -749,9 +816,16 @@ private:
 
     auto tensorType = cast<RankedTensorType>(op.getType());
     auto elemType = tensorType.getElementType();
+    auto originalOrderAttr = getOriginalOrderAttr(ptr);
+    SmallVector<int64_t> storageShape(tensorType.getShape().begin(),
+                                      tensorType.getShape().end());
+    if (originalOrderAttr) {
+      storageShape = applyPermutation<int64_t>(
+          tensorType.getShape(), getTransposePermutation(originalOrderAttr));
+    }
 
     auto alloc = rewriter.create<memref::AllocOp>(
-        loc, MemRefType::get(tensorType.getShape(), elemType));
+        loc, MemRefType::get(storageShape, elemType));
 
     // No mask
     assert(!other && "other value used in non-masked load");
@@ -777,8 +851,15 @@ private:
       rewriter.create<memref::CopyOp>(loc, ptr, alloc);
     }
 
+    auto storageTensorType = RankedTensorType::get(storageShape, elemType);
     Value tensor = rewriter.create<bufferization::ToTensorOp>(
-        loc, tensorType, alloc, true /* restrict */, true /* writable */);
+        loc, storageTensorType, alloc, true /* restrict */,
+        true /* writable */);
+    if (originalOrderAttr) {
+      tensor = transposeTensor(tensor, tensorType.getShape(),
+                               getRecoverPermutation(originalOrderAttr), loc,
+                               rewriter);
+    }
     rewriter.replaceOp(op, tensor);
 
     return success();
@@ -793,16 +874,30 @@ private:
 
     auto tensorType = cast<RankedTensorType>(op.getType());
     auto elemType = tensorType.getElementType();
+    auto originalOrderAttr = getOriginalOrderAttr(ptr);
+    SmallVector<int64_t> storageShape(tensorType.getShape().begin(),
+                                      tensorType.getShape().end());
+    SmallVector<OpFoldResult> mixedDims = op.getMixedMaskDims();
+    SmallVector<int64_t> staticMaskDims(op.getStaticMaskDims().begin(),
+                                        op.getStaticMaskDims().end());
+    if (originalOrderAttr) {
+      auto transposePermutation = getTransposePermutation(originalOrderAttr);
+      storageShape = applyPermutation<int64_t>(tensorType.getShape(),
+                                               transposePermutation);
+      mixedDims =
+          applyPermutation<OpFoldResult>(mixedDims, transposePermutation);
+      staticMaskDims = applyPermutation<int64_t>(op.getStaticMaskDims(),
+                                                 transposePermutation);
+    }
 
     auto alloc = rewriter.create<memref::AllocOp>(
-        loc, MemRefType::get(tensorType.getShape(), elemType));
-
-    SmallVector<OpFoldResult> mixedDims = op.getMixedMaskDims();
+        loc, MemRefType::get(storageShape, elemType));
 
     // Fill load destination with other value
     if (Value other = op.getOther()) {
-      fillWithValue(loc, alloc, other, tensorType.getShape(),
-                    op.getMixedMaskDims(), op.getStaticMaskDims(), rewriter);
+      auto fillDims = mixedDims;
+      fillWithValue(loc, alloc, other, storageShape, std::move(fillDims),
+                    staticMaskDims, rewriter);
     }
 
     auto ptrDefiningOp = ptr.getDefiningOp();
@@ -838,8 +933,15 @@ private:
       rewriter.create<memref::CopyOp>(loc, srcSubview, dstSubview);
     }
 
+    auto storageTensorType = RankedTensorType::get(storageShape, elemType);
     Value tensor = rewriter.create<bufferization::ToTensorOp>(
-        loc, tensorType, alloc, true /* restrict */, true /* writable */);
+        loc, storageTensorType, alloc, true /* restrict */,
+        true /* writable */);
+    if (originalOrderAttr) {
+      tensor = transposeTensor(tensor, tensorType.getShape(),
+                               getRecoverPermutation(originalOrderAttr), loc,
+                               rewriter);
+    }
     rewriter.replaceOp(op, tensor);
 
     return success();
@@ -1146,12 +1248,26 @@ public:
     }
 
     auto ptr = adaptor.getPtr();
-    auto storeValue = op.getValue();
+    Value storeValue = op.getValue();
     auto rank = cast<RankedTensorType>(storeValue.getType()).getRank();
+    auto originalOrderAttr = getOriginalOrderAttr(ptr);
+    SmallVector<OpFoldResult> mixedDims;
+    if (op.hasMask())
+      mixedDims = op.getMixedMaskDims();
+
+    if (originalOrderAttr) {
+      auto transposePermutation = getTransposePermutation(originalOrderAttr);
+      auto storeTensorType = cast<RankedTensorType>(storeValue.getType());
+      auto storageShape = applyPermutation<int64_t>(storeTensorType.getShape(),
+                                                    transposePermutation);
+      storeValue = transposeTensor(storeValue, storageShape,
+                                   transposePermutation, loc, rewriter);
+      if (op.hasMask())
+        mixedDims =
+            applyPermutation<OpFoldResult>(mixedDims, transposePermutation);
+    }
 
     if (op.hasMask()) {
-      auto mixedDims = op.getMixedMaskDims();
-
       auto srcSlice =
           getExtractSlice(rank, mixedDims, storeValue, loc, rewriter);
       auto dstSubview = getSubview(rank, mixedDims, ptr, loc, rewriter);
