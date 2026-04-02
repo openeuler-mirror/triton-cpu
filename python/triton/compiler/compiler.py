@@ -6,7 +6,7 @@ from ..backends import backends
 from ..backends.compiler import GPUTarget, AttrsDescriptor, CPUFallbackException
 from .. import __version__
 from ..runtime.autotuner import OutOfResources
-from ..runtime.cache import get_cache_manager, get_dump_manager, get_override_manager
+from ..runtime.cache import get_cache_manager, get_dump_manager, get_override_manager, _base64
 from ..runtime.driver import driver
 from ..tools.disasm import get_sass
 # TODO: this shouldn't be here
@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import functools
 import os
+import time
 
 # - ^\s*tt\.func\s+ : match the start of the string, any leading whitespace, the keyword func,
 #    and any following whitespace
@@ -279,6 +280,10 @@ def compile(src, target=None, options=None):
         filter_traceback(e)
         raise
     use_ir_loc = os.environ.get("USE_IR_LOC", None)
+    if os.getenv("TRITON_PRINT_COMPILE_TIME", "0") == "1":
+        print(f"{' ' + file_name + ' ':-^{80}}")
+        print(f"Folder Name: {_base64(hash)}")
+        start_time = time.perf_counter()
     for ext, compile_ir in list(stages.items())[first_stage:]:
         try:    
             next_module = compile_ir(module, metadata)
@@ -301,6 +306,10 @@ def compile(src, target=None, options=None):
             next_module.create_location_snapshot(ir_full_name)
             print(f"Creating new locations for {ir_full_name}")
         module = next_module
+    if os.getenv("TRITON_PRINT_COMPILE_TIME", "0") == "1":
+        end_time = time.perf_counter()
+        duration = end_time - start_time
+        print(f"{' Total: ' + f'{duration:.3f}' + ' seconds. ':-^{80}}")
     # write-back metadata
     metadata_group[metadata_filename] = fn_cache_manager.put(json.dumps(metadata, default=vars), metadata_filename,
                                                              binary=False)
