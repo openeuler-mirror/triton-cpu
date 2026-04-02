@@ -154,17 +154,33 @@ def embedding_backward(
     )
 
     if scale_grad_by_freq:
-        indice_freq = torch.zeros(
-            (num_weights,),
-            requires_grad=False,
-            device=grad_outputs.device,
-            dtype=torch.int32,
-        )
-        INDICE_BLOCK_SIZE = 256
-        indice_grid = (triton.cdiv(M, INDICE_BLOCK_SIZE),)
+        if grad_outputs.device.type == "cpu":
+            # tl.atomic_add with a data-dependent (scatter) index vector is not
+            # supported by the triton-shared CPU backend and causes a segfault.
+            # The PtrAnalysis pass must convert every tt.addptr into a
+            # tts.make_tptr with statically-known, affine strides.  A scatter
+            # address like `indices_freq + index_element` - where each lane
+            # holds a different data-dependent offset - has no regular stride
+            # and cannot be represented as tts.make_tptr, so the pass fails and
+            # the kernel produces invalid IR that segfaults at launch.
+            # torch.bincount is semantically equivalent and runs natively on CPU.
+            indice_freq = torch.bincount(
+                indices.flatten().to(torch.int64), minlength=num_weights
+            ).to(torch.int32)
+        else:
+            indice_freq = torch.zeros(
+                (num_weights,),
+                requires_grad=False,
+                device=grad_outputs.device,
+                dtype=torch.int32,
+            )
+            INDICE_BLOCK_SIZE = 256
+            indice_grid = (triton.cdiv(M, INDICE_BLOCK_SIZE),)
 
-        with torch_device_fn.device(grad_outputs.device):
-            indice_freq_kernel[indice_grid](indice_freq, indices, M, INDICE_BLOCK_SIZE)
+            with torch_device_fn.device(grad_outputs.device):
+                indice_freq_kernel[indice_grid](
+                    indice_freq, indices, M, INDICE_BLOCK_SIZE
+                )
     else:
         indice_freq = None
 
