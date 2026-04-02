@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import functools
 import textwrap
+import time
 from pathlib import Path
 from mlir.ir import *
 from mlir.dialects import transform
@@ -45,6 +46,19 @@ def _dump_ir_if_needed(files):
         shutil.copy(f, os.path.join(path, os.path.basename(f)))
 
 
+def timer(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if os.getenv("TRITON_PRINT_COMPILE_TIME", "0") == "1":
+            start_time = time.perf_counter()
+            result = func(*args, **kwargs)
+            end_time = time.perf_counter()
+            duration = end_time - start_time
+            print(f"{func.__name__}: {duration:.3f} seconds.")
+        else:
+            result = func(*args, **kwargs)
+        return result
+    return wrapper
 
 
 @dataclass(frozen=True)
@@ -162,6 +176,7 @@ class CPUBackend(BaseBackend):
         return
 
     @staticmethod
+    @timer
     def make_ttir(mod, metadata, options):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
@@ -178,6 +193,7 @@ class CPUBackend(BaseBackend):
         pm.run(mod)
         return mod
 
+    @timer
     def _ttir_to_ttsharedir(self, mod):
         # Get Triton-MLIR as string
         ttir_code = str(mod)
@@ -1301,6 +1317,7 @@ class CPUBackend(BaseBackend):
 
        
 
+    @timer
     def _optimize_ttsharedir(self, src: str):
         if(FORCE_SME or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features)):
             return self._sme_transform(src)
@@ -1369,6 +1386,7 @@ class CPUBackend(BaseBackend):
             f.write(output)
 
 
+    @timer
     def _ttsharedir_to_llir(self, ttsharedir: str):
         with tempfile.TemporaryDirectory() as tmpdir:
             ttshared_path = os.path.join(tmpdir, "ttshared.mlir")
@@ -1463,11 +1481,13 @@ class CPUBackend(BaseBackend):
             return Path(llir_path).read_text()
 
 
+    @timer
     def _optimize_llir(self, llir: str):
         # We don't apply any optimizations now, but we can add passes if needed.
         return llir
 
 
+    @timer
     def _llir_to_bin(self, llir: str, metadata):
         pattern = r"define void @(\w+)\(.+"
         matches = re.findall(pattern, llir)
