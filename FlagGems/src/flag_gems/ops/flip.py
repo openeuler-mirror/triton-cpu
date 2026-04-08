@@ -1,22 +1,15 @@
 import logging
-from dataclasses import replace
 
 import torch
 import triton
 
 from flag_gems.utils import pointwise_dynamic
-from flag_gems.utils.codegen_config_utils import get_codegen_config
 from flag_gems.utils.tensor_wrapper import StridedBuffer
 
 logger = logging.getLogger(__name__)
 
 
-config_ = replace(get_codegen_config(), prefer_block_pointer=False)
-
-
-@pointwise_dynamic(
-    is_tensor=[True], promotion_methods=[(0, "DEFAULT")], config=config_
-)
+@pointwise_dynamic(is_tensor=[True], promotion_methods=[(0, "DEFAULT")])
 @triton.jit
 def copy_func(x):
     return x
