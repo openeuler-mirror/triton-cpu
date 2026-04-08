@@ -125,6 +125,72 @@ bool isNotSingleDim(Value v) {
              false) == nullptr;
 }
 
+static OpFoldResult divOFRs(const OpFoldResult lhs, const OpFoldResult rhs,
+                            Location loc, OpBuilder &builder) {
+  auto lhsAttr = getIntAttr(lhs);
+  auto rhsAttr = getIntAttr(rhs);
+  assert(!hasConstZero(rhs) && "block pointer stride must be non-zero");
+  if (lhsAttr && rhsAttr) {
+    assert(*lhsAttr % *rhsAttr == 0 &&
+           "scaled block pointer offset must be divisible by stride");
+    return builder.getIndexAttr(*lhsAttr / *rhsAttr);
+  }
+
+  auto lhsValue = ofrToIndexValue(lhs, loc, builder);
+  auto rhsValue = ofrToIndexValue(rhs, loc, builder);
+  return builder.create<arith::DivSIOp>(loc, lhsValue, rhsValue).getResult();
+}
+
+static SmallVector<OpFoldResult>
+getBoundaryMaskDims(Value ptr, ArrayRef<int32_t> boundaryCheck, Location loc,
+                    OpBuilder &builder) {
+  SmallVector<OpFoldResult> dims;
+  if (boundaryCheck.empty())
+    return dims;
+
+  auto makeTensorPtr = ptr.getDefiningOp<tts::MakeTensorPtrOp>();
+  if (!makeTensorPtr || !makeTensorPtr.isBlockPtr())
+    return dims;
+
+  dims = makeTensorPtr.getMixedSizes();
+  auto offsets = makeTensorPtr.getMixedOffsets();
+  auto strides = makeTensorPtr.getMixedStrides();
+  auto shape = makeTensorPtr.getMixedShape();
+  auto zero = builder.getIndexAttr(0);
+  for (auto dim : boundaryCheck) {
+    assert(dim >= 0 && static_cast<size_t>(dim) < dims.size() &&
+           "boundary check dimension out of range");
+    // Block pointer offsets are stored in physical units (logical offset times
+    // stride). Convert back to a logical tile coordinate before applying the
+    // boundary check against the logical shape.
+    OpFoldResult logicalOffset =
+        divOFRs(offsets[dim], strides[dim], loc, builder);
+    OpFoldResult remaining = subOFRs(shape[dim], logicalOffset, loc, builder);
+    remaining = maxOFRs(zero, remaining, loc, builder);
+    dims[dim] = minOFRs(dims[dim], remaining, loc, builder);
+  }
+
+  return dims;
+}
+
+static SmallVector<OpFoldResult> mergeMaskDims(ArrayRef<OpFoldResult> lhs,
+                                               ArrayRef<OpFoldResult> rhs,
+                                               Location loc,
+                                               OpBuilder &builder) {
+  if (lhs.empty())
+    return SmallVector<OpFoldResult>(rhs.begin(), rhs.end());
+  if (rhs.empty())
+    return SmallVector<OpFoldResult>(lhs.begin(), lhs.end());
+
+  assert(lhs.size() == rhs.size() && "mask dimensions must have same rank");
+
+  SmallVector<OpFoldResult> merged;
+  merged.reserve(lhs.size());
+  for (auto [lhsDim, rhsDim] : llvm::zip(lhs, rhs))
+    merged.push_back(minOFRs(lhsDim, rhsDim, loc, builder));
+  return merged;
+}
+
 LogicalResult PtrState::rebuildAsUnsupportedOp(Value operand) {
   if (isNotSingleDim(operand))
     return failure();
@@ -1590,7 +1656,7 @@ LogicalResult PtrAnalysis::rewriteLoadOp(triton::LoadOp op,
     return failure();
   }
 
-  ArrayRef<OpFoldResult> dims;
+  SmallVector<OpFoldResult> dims;
   mlir::triton::MaskState mstate(useUnsafeMask);
   Value scalarOther;
 
@@ -1602,8 +1668,12 @@ LogicalResult PtrAnalysis::rewriteLoadOp(triton::LoadOp op,
       op->emitRemark("MaskAnalysis failed");
       return failure();
     }
-    dims = mstate.dims;
+    dims.assign(mstate.dims.begin(), mstate.dims.end());
   }
+
+  dims = mergeMaskDims(
+      dims, getBoundaryMaskDims(ptr, op.getBoundaryCheck(), loc, builder), loc,
+      builder);
 
   if (other) {
     assert(mask && "other value used while no masks are specified");
@@ -1739,7 +1809,7 @@ LogicalResult PtrAnalysis::rewriteStoreOp(triton::StoreOp op,
     return failure();
   }
 
-  ArrayRef<OpFoldResult> dims;
+  SmallVector<OpFoldResult> dims;
   mlir::triton::MaskState mstate(useUnsafeMask);
 
   OpBuilder builder(op);
@@ -1751,8 +1821,12 @@ LogicalResult PtrAnalysis::rewriteStoreOp(triton::StoreOp op,
       op->emitRemark("MaskAnalysis failed");
       return failure();
     }
-    dims = mstate.dims;
+    dims.assign(mstate.dims.begin(), mstate.dims.end());
   }
+
+  dims = mergeMaskDims(
+      dims, getBoundaryMaskDims(ptr, op.getBoundaryCheck(), loc, builder), loc,
+      builder);
 
   auto storeOp = builder.create<tts::StoreOp>(loc, ptr, val, dims);
 
