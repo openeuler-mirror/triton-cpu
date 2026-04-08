@@ -2489,12 +2489,24 @@ public:
     return success();                                                          \
   }
 
-    POPULATE_BINARY_OP("Sleef_atan2f_u10", math::Atan2Op);
-    POPULATE_BINARY_OP("Sleef_atan2_u10", math::Atan2Op);
+    // Map known Sleef calls to native MLIR math ops so they flow through
+    // MathToLibm lowering (C libm) instead of direct Sleef function calls.
     POPULATE_BINARY_OP("Sleef_powf_u10", math::PowFOp);
     POPULATE_BINARY_OP("Sleef_powd1_u10", math::PowFOp);
+    POPULATE_BINARY_OP("Sleef_atan2f_u10", math::Atan2Op);
+    POPULATE_BINARY_OP("Sleef_atan2_u10", math::Atan2Op);
+    POPULATE_BINARY_OP("Sleef_fmodf", arith::RemFOp);
+    POPULATE_BINARY_OP("Sleef_fmodd1", arith::RemFOp);
 
-    // Calls to sleef math library
+    // NVIDIA libdevice mappings
+    POPULATE_BINARY_OP("__nv_atan2f", math::Atan2Op);
+    POPULATE_BINARY_OP("__nv_atan2", math::Atan2Op);
+    POPULATE_BINARY_OP("__nv_powf", math::PowFOp);
+    POPULATE_BINARY_OP("__nv_pow", math::PowFOp);
+
+#undef POPULATE_BINARY_OP
+
+    // Fallback: pass remaining Sleef calls through as direct function calls
     if (sym.starts_with("Sleef_")) {
       auto moduleOp = op->getParentOfType<ModuleOp>();
       auto operands = adaptor.getOperands();
@@ -2512,12 +2524,6 @@ public:
       return success();
     }
 
-    POPULATE_BINARY_OP("__nv_atan2f", math::Atan2Op);
-    POPULATE_BINARY_OP("__nv_atan2", math::Atan2Op);
-    POPULATE_BINARY_OP("__nv_powf", math::PowFOp);
-    POPULATE_BINARY_OP("__nv_pow", math::PowFOp);
-
-#undef POPULATE_BINARY_OP
     return failure();
   }
 };
@@ -2542,26 +2548,12 @@ public:
     return success();                                                          \
   }
 
+    // Map known Sleef calls to native MLIR math ops so they flow through
+    // MathToLibm lowering (C libm) instead of direct Sleef function calls.
     POPULATE_UNARY_OP("Sleef_ceilf", math::CeilOp);
     POPULATE_UNARY_OP("Sleef_ceild1", math::CeilOp);
 
-    // Calls to sleef math library
-    if (sym.starts_with("Sleef_")) {
-      auto moduleOp = op->getParentOfType<ModuleOp>();
-      auto funcType =
-          rewriter.getFunctionType(op.getSrcs()[0].getType(), op.getType());
-      auto funcOp = moduleOp.lookupSymbol<func::FuncOp>(sym);
-      if (!funcOp) {
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPointToStart(moduleOp.getBody());
-        funcOp = rewriter.create<func::FuncOp>(loc, sym, funcType);
-        funcOp.setPrivate();
-      }
-      rewriter.replaceOpWithNewOp<func::CallOp>(op, funcOp,
-                                                adaptor.getOperands());
-      return success();
-    }
-
+    // NVIDIA libdevice mappings
     POPULATE_UNARY_OP("__nv_fabsf", math::AbsFOp);
     POPULATE_UNARY_OP("__nv_fabs", math::AbsFOp);
     POPULATE_UNARY_OP("__nv_sinf", math::SinOp);
@@ -2612,6 +2604,25 @@ public:
     POPULATE_UNARY_OP("__nv_trunc", math::TruncOp);
 
 #undef POPULATE_UNARY_OP
+
+    // Fallback: pass remaining Sleef calls through as direct function calls
+    // (e.g. Sleef_rintf, Sleef_rint which lack clean math dialect equivalents)
+    if (sym.starts_with("Sleef_")) {
+      auto moduleOp = op->getParentOfType<ModuleOp>();
+      auto funcType =
+          rewriter.getFunctionType(op.getSrcs()[0].getType(), op.getType());
+      auto funcOp = moduleOp.lookupSymbol<func::FuncOp>(sym);
+      if (!funcOp) {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(moduleOp.getBody());
+        funcOp = rewriter.create<func::FuncOp>(loc, sym, funcType);
+        funcOp.setPrivate();
+      }
+      rewriter.replaceOpWithNewOp<func::CallOp>(op, funcOp,
+                                                adaptor.getOperands());
+      return success();
+    }
+
     return failure();
   }
 };
