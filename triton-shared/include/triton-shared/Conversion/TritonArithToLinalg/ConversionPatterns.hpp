@@ -1620,7 +1620,9 @@ class ArgMinMaxBaseConverter : public OpConversionPattern<triton::ReduceOp> {
                                     Value &tileBreakValue) const {
     // Match the following (section 1. of the above)
     //
-    //   %11 = arith.cmpf oeq, %arg9, %arg11 : f32
+    //   %11 = arith.cmpf oeq, %arg9, %arg11 : f32   (float case)
+    //   OR
+    //   %11 = arith.cmpi eq, %arg9, %arg11 : i64    (integer case)
     //   %12 = arith.cmpi slt, %arg10, %arg12 : i32
     //   %13 = arith.andi %11, %12 : i1
     //
@@ -1628,16 +1630,27 @@ class ArgMinMaxBaseConverter : public OpConversionPattern<triton::ReduceOp> {
     //
     //   tie = value1 == value2 and index1 < index2
 
-    // matching: %11 = arith.cmpf oeq, %arg9, %arg11 : f32
+    // matching: %11 = arith.cmpf oeq OR arith.cmpi eq
     LLVM_DEBUG(llvm::dbgs() << "Matching: " << *it << "\n");
-    auto eqCmpOp = dyn_cast<arith::CmpFOp>(*it++);
-    if (eqCmpOp) {
-      if (eqCmpOp.getPredicate() != arith::CmpFPredicate::OEQ) {
+    Value eqResult;
+    if (auto eqCmpFOp = dyn_cast<arith::CmpFOp>(*it)) {
+      if (eqCmpFOp.getPredicate() != arith::CmpFPredicate::OEQ) {
         return failure();
       }
-      if (currValue != eqCmpOp.getLhs() || reduceValue != eqCmpOp.getRhs()) {
+      if (currValue != eqCmpFOp.getLhs() || reduceValue != eqCmpFOp.getRhs()) {
         return failure();
       }
+      eqResult = eqCmpFOp;
+      ++it;
+    } else if (auto eqCmpIOp = dyn_cast<arith::CmpIOp>(*it)) {
+      if (eqCmpIOp.getPredicate() != arith::CmpIPredicate::eq) {
+        return failure();
+      }
+      if (currValue != eqCmpIOp.getLhs() || reduceValue != eqCmpIOp.getRhs()) {
+        return failure();
+      }
+      eqResult = eqCmpIOp;
+      ++it;
     } else {
       return failure();
     }
@@ -1660,7 +1673,7 @@ class ArgMinMaxBaseConverter : public OpConversionPattern<triton::ReduceOp> {
     LLVM_DEBUG(llvm::dbgs() << "Matching: " << *it << "\n");
     auto andOp = dyn_cast<arith::AndIOp>(*it++);
     if (andOp) {
-      if (andOp.getLhs() != eqCmpOp || andOp.getRhs() != sltCmpOp) {
+      if (andOp.getLhs() != eqResult || andOp.getRhs() != sltCmpOp) {
         return failure();
       }
     } else {
@@ -1789,9 +1802,16 @@ public:
     // the result value to either -inf or +inf depending on
     // whether we're dealing with argmax or argmin
     auto valueType = elemTypes[0];
-    auto valuesAccBaseVal = rewriter.create<arith::ConstantOp>(
-        loc, valueType,
-        rewriter.getFloatAttr(valueType, T::getBaseReductionValue()));
+    TypedAttr baseAttr;
+    if (valueType.isInteger()) {
+      baseAttr = rewriter.getIntegerAttr(
+          valueType,
+          T::getIntBaseReductionValue(valueType.getIntOrFloatBitWidth()));
+    } else {
+      baseAttr = rewriter.getFloatAttr(valueType, T::getBaseReductionValue());
+    }
+    auto valuesAccBaseVal =
+        rewriter.create<arith::ConstantOp>(loc, valueType, baseAttr);
 
     // Set the initial value of the rank-0 tensor containing the index of the
     // min or max value to -1
@@ -1853,25 +1873,38 @@ struct ArgMaxConverter : public ArgMinMaxBaseConverter<ArgMaxConverter> {
                                              Value reduceIndex,
                                              mlir::Block::iterator &it,
                                              Value &comparisonResult) {
-    // %14 = arith.cmpf ogt, %arg9, %arg11 : f32
+    // %14 = arith.cmpf ogt, %arg9, %arg11 : f32   (float case)
+    // OR
+    // %14 = arith.cmpi sgt, %arg9, %arg11 : i64   (integer case)
     // This corresponds to section 2. of the sample snippet in
     // ArgMinMaxBaseConverter
-    auto cmpOp = dyn_cast<arith::CmpFOp>(*it++);
-    if (cmpOp) {
-      if (cmpOp.getPredicate() != arith::CmpFPredicate::OGT ||
-          currValue != cmpOp.getLhs() || reduceValue != cmpOp.getRhs()) {
+    if (auto fCmpOp = dyn_cast<arith::CmpFOp>(*it)) {
+      if (fCmpOp.getPredicate() != arith::CmpFPredicate::OGT ||
+          currValue != fCmpOp.getLhs() || reduceValue != fCmpOp.getRhs()) {
         return failure();
       }
-    } else {
-      return failure();
+      comparisonResult = fCmpOp;
+      ++it;
+      return success();
     }
-
-    comparisonResult = cmpOp;
-    return success();
+    if (auto iCmpOp = dyn_cast<arith::CmpIOp>(*it)) {
+      if (iCmpOp.getPredicate() != arith::CmpIPredicate::sgt ||
+          currValue != iCmpOp.getLhs() || reduceValue != iCmpOp.getRhs()) {
+        return failure();
+      }
+      comparisonResult = iCmpOp;
+      ++it;
+      return success();
+    }
+    return failure();
   }
 
   static float getBaseReductionValue() {
     return -std::numeric_limits<float>::infinity();
+  }
+
+  static int64_t getIntBaseReductionValue(unsigned bitWidth) {
+    return llvm::minIntN(bitWidth);
   }
 
   ArgMaxConverter(MLIRContext *context) : ArgMinMaxBaseConverter(context) {}
@@ -1883,26 +1916,39 @@ struct ArgMinConverter : public ArgMinMaxBaseConverter<ArgMinConverter> {
                                              Value reduceIndex,
                                              mlir::Block::iterator &it,
                                              Value &comparisonResult) {
-    // %14 = arith.cmpf olt, %arg9, %arg11 : f32
+    // %14 = arith.cmpf olt, %arg9, %arg11 : f32   (float case)
+    // OR
+    // %14 = arith.cmpi slt, %arg9, %arg11 : i64   (integer case)
     // This corresponds to section 2. of the sample snippet in
     // ArgMinMaxBaseConverter
     LLVM_DEBUG(llvm::dbgs() << "Matching: " << *it << "\n");
-    auto cmpOp = dyn_cast<arith::CmpFOp>(*it++);
-    if (cmpOp) {
-      if (cmpOp.getPredicate() != arith::CmpFPredicate::OLT ||
-          currValue != cmpOp.getLhs() || reduceValue != cmpOp.getRhs()) {
+    if (auto fCmpOp = dyn_cast<arith::CmpFOp>(*it)) {
+      if (fCmpOp.getPredicate() != arith::CmpFPredicate::OLT ||
+          currValue != fCmpOp.getLhs() || reduceValue != fCmpOp.getRhs()) {
         return failure();
       }
-    } else {
-      return failure();
+      comparisonResult = fCmpOp;
+      ++it;
+      return success();
     }
-
-    comparisonResult = cmpOp;
-    return success();
+    if (auto iCmpOp = dyn_cast<arith::CmpIOp>(*it)) {
+      if (iCmpOp.getPredicate() != arith::CmpIPredicate::slt ||
+          currValue != iCmpOp.getLhs() || reduceValue != iCmpOp.getRhs()) {
+        return failure();
+      }
+      comparisonResult = iCmpOp;
+      ++it;
+      return success();
+    }
+    return failure();
   }
 
   static float getBaseReductionValue() {
     return std::numeric_limits<float>::infinity();
+  }
+
+  static int64_t getIntBaseReductionValue(unsigned bitWidth) {
+    return llvm::maxIntN(bitWidth);
   }
 
   ArgMinConverter(MLIRContext *context) : ArgMinMaxBaseConverter(context) {}
