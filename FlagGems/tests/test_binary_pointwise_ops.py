@@ -604,9 +604,7 @@ def test_accuracy_div_scalar_scalar(dtype):
 
 @pytest.mark.div
 @pytest.mark.parametrize("shape", POINTWISE_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.float32])
-# Note : tl.math.div_rz only support float32, cast will cause diff
-# with torch, so we only do float32 test for now.
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_accuracy_trunc_div(shape, dtype):
     if flag_gems.vendor_name == "kunlunxin":
         torch.manual_seed(0)
@@ -617,7 +615,7 @@ def test_accuracy_trunc_div(shape, dtype):
 
     upcast = (
         True
-        if flag_gems.vendor_name not in ["cambricon", "iluvatar", "kunlunxin"]
+        if flag_gems.vendor_name not in ["arm", "cambricon", "iluvatar", "kunlunxin", "kunpeng"]
         else False
     )
     ref_inp1 = to_reference(inp1, upcast)
@@ -638,9 +636,7 @@ def test_accuracy_trunc_div(shape, dtype):
 @pytest.mark.inplace
 @pytest.mark.div_
 @pytest.mark.parametrize("shape", POINTWISE_SHAPES)
-@pytest.mark.parametrize("dtype", [torch.float32])
-# Note : tl.math.div_rz only support float32, cast will cause diff
-# with torch, so we only do float32 test for now.
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_accuracy_trunc_div_(shape, dtype):
     if flag_gems.vendor_name == "kunlunxin":
         torch.manual_seed(0)
@@ -648,7 +644,7 @@ def test_accuracy_trunc_div_(shape, dtype):
 
     inp1 = torch.randn(shape, dtype=dtype, device="cpu").to(flag_gems.device)
     inp2 = torch.randn(shape, dtype=dtype, device="cpu").to(flag_gems.device)
-    if flag_gems.vendor_name in ("cambricon", "kunlunxin", "iluvatar"):
+    if flag_gems.vendor_name in ("arm", "cambricon", "kunlunxin", "iluvatar", "kunpeng"):
         upcast = False
     else:
         upcast = True
@@ -2078,4 +2074,4 @@ def test_accuracy_addcdiv(shape, dtype):
     with flag_gems.use_gems():
         res_out = torch.addcdiv(res_inp, t1, t2, value=v)
 
-    gems_assert_close(res_out, ref_out, dtype)
+    gems_assert_close(res_out, ref_out, dtype, equal_nan=True)

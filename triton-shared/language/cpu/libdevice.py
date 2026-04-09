@@ -178,11 +178,10 @@ def pow(arg0, arg1, _builder=None):
 
 @core.extern
 def fmod(arg0, arg1, _builder=None):
-    return core.extern_elementwise(
-        "", "", [arg0, arg1], {
-            (core.dtype("fp32"), core.dtype("fp32")): ("Sleef_fmodf", core.dtype("fp32")),
-            (core.dtype("fp64"), core.dtype("fp64")): ("Sleef_fmodd1", core.dtype("fp64")),
-        }, is_pure=True, _builder=_builder)
+    arg0 = _to_tensor(arg0, _builder)
+    arg1 = _to_tensor(arg1, _builder)
+    arg0, arg1 = core.binary_op_type_legalization(arg0, arg1, _builder)
+    return core.tensor(_builder.create_frem(arg0.handle, arg1.handle), arg0.type)
 
 
 @core.extern
