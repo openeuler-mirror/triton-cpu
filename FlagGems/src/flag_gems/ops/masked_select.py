@@ -150,7 +150,10 @@ def masked_select(inp, mask):
     num_warps = min(16, BLOCK_SIZE // 32)
 
     # max degree of parallelism
-    np = torch_device_fn.get_device_properties(mask.device).multi_processor_count
+    if torch_device_fn == torch.cpu:
+        np = torch.get_num_threads()
+    else:
+        np = torch_device_fn.get_device_properties(mask.device).multi_processor_count
 
     # arranged as np rows of blocks
     n_blocks = triton.cdiv(N, BLOCK_SIZE)
