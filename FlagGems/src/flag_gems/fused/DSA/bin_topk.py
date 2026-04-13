@@ -81,20 +81,9 @@ def kernel_bucket_sort_topk(  # grid(B, BS)
         inval_int16 = convert_to_uint16(input)
         s_histogram += inval_int16.to(tl.int32).histogram(HISTOGRAM_SIZE)
 
-    s_histogram = s_histogram.cumsum(0, reverse=True)  # Suffix sum
-
-    mv_idx = (
-        tl.arange(1, HISTOGRAM_SIZE + 1) % HISTOGRAM_SIZE
-    )  # Construct offset index matrix
-
-    cond = (s_histogram > l_new_topk) & (
-        (s_histogram.gather(mv_idx, 0) <= l_new_topk) | (mv_idx == 0)
-    )
-    l_threshold_bin_id = cond.argmax(0)
-
-    l_new_topk -= tl.where(
-        tl.arange(0, HISTOGRAM_SIZE) == l_threshold_bin_id + 1, s_histogram, 0
-    ).max(0)
+    s_histogram = tl.cumsum(s_histogram, reverse=True)  # Suffix sum
+    l_threshold_bin_id = tl.max(tl.where(s_histogram > l_new_topk, tl.arange(0, HISTOGRAM_SIZE), 0), 0)
+    l_new_topk -= tl.max(tl.where(tl.arange(0, HISTOGRAM_SIZE) == l_threshold_bin_id + 1, s_histogram, 0), 0)
     sum = 0
     thre_bin_sum = 0
     for s in range(TS):
@@ -110,13 +99,13 @@ def kernel_bucket_sort_topk(  # grid(B, BS)
         # This method would slow down the speed, so using other=float("-inf") saves time.
 
         over_thre = inval_int16.to(tl.int32) > l_threshold_bin_id
-        cur_sum = over_thre.to(tl.int32).sum(-1)
+        cur_sum = tl.sum(over_thre.to(tl.int32), -1)
 
         eq_thre = inval_int16.to(tl.int32) == l_threshold_bin_id
-        thre_bin_cur_sum = eq_thre.to(tl.int32).sum(-1)
+        thre_bin_cur_sum = tl.sum(eq_thre.to(tl.int32), -1)
 
-        topk_idx = over_thre.to(tl.int32).cumsum(-1)
-        thre_bin_idx = eq_thre.to(tl.int32).cumsum(-1)
+        topk_idx = tl.cumsum(over_thre.to(tl.int32), -1)
+        thre_bin_idx = tl.cumsum(eq_thre.to(tl.int32), -1)
 
         concat_mask = tl.cat(over_thre, eq_thre, True)
         concat_input = tl.cat(input_idx, input_idx, True)
@@ -167,17 +156,9 @@ def kernel_bucket_sort_topk(  # grid(B, BS)
                 convert_to_uint32(s_input) >> (24 - round * 8)
             ) & 0xFF  # Ensure all bits except the last eight are zero
             s_histogram += inval_int32.to(tl.int32).histogram(HISTOGRAM_SIZE)
-        s_histogram = s_histogram.cumsum(0, reverse=True)  # Suffix sum
-        mv_idx = (
-            tl.arange(1, HISTOGRAM_SIZE + 1) % HISTOGRAM_SIZE
-        )  # Construct offset index matrix
-        cond = (s_histogram > l_new_topk) & (
-            (s_histogram.gather(mv_idx, 0) <= l_new_topk) | (mv_idx == 0)
-        )
-        l_threshold_bin_id = cond.argmax(0)
-        l_new_topk -= tl.where(
-            tl.arange(0, HISTOGRAM_SIZE) == l_threshold_bin_id + 1, s_histogram, 0
-        ).max(0)
+        s_histogram = tl.cumsum(s_histogram, reverse=True)  # Suffix sum
+        l_threshold_bin_id = tl.max(tl.where(s_histogram > l_new_topk, tl.arange(0, HISTOGRAM_SIZE), 0), 0)
+        l_new_topk -= tl.max(tl.where(tl.arange(0, HISTOGRAM_SIZE) == l_threshold_bin_id + 1, s_histogram, 0), 0)
         thre_bin_sum, old_thre_bin_sum = 0, thre_bin_sum
 
         for s in range(ss):
@@ -193,12 +174,12 @@ def kernel_bucket_sort_topk(  # grid(B, BS)
             inval_int32 = (convert_to_uint32(s_input) >> (24 - round * 8)) & 0xFF
 
             over_thre = inval_int32.to(tl.int32) > l_threshold_bin_id
-            cur_sum = over_thre.to(tl.int32).sum(-1)
+            cur_sum = tl.sum(over_thre.to(tl.int32), -1)
             eq_thre = inval_int32.to(tl.int32) == l_threshold_bin_id
-            thre_bin_cur_sum = eq_thre.to(tl.int32).sum(-1)
+            thre_bin_cur_sum = tl.sum(eq_thre.to(tl.int32), -1)
 
-            topk_idx = over_thre.to(tl.int32).cumsum(-1)
-            thre_bin_idx = eq_thre.to(tl.int32).cumsum(-1)
+            topk_idx = tl.cumsum(over_thre.to(tl.int32), -1)
+            thre_bin_idx = tl.cumsum(eq_thre.to(tl.int32), -1)
 
             concat_mask = tl.cat(over_thre, eq_thre, True)
             concat_input = tl.cat(input_idx, input_idx, True)
