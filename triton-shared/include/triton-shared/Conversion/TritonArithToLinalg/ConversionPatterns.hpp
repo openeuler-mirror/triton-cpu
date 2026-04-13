@@ -902,66 +902,6 @@ struct CallConverter : public OpConversionPattern<triton::CallOp> {
 struct FpToFpConverter : public OpConversionPattern<triton::FpToFpOp> {
   using OpConversionPattern<triton::FpToFpOp>::OpConversionPattern;
 
-  static Value cstI32(Location loc, Type i32Ty, int64_t value,
-                      ConversionPatternRewriter &rewriter) {
-    auto attr = rewriter.getI32IntegerAttr(value);
-    if (auto shapedTy = dyn_cast<ShapedType>(i32Ty))
-      return rewriter.create<arith::ConstantOp>(
-          loc, DenseElementsAttr::get(shapedTy, attr));
-    return rewriter.create<arith::ConstantOp>(loc, attr);
-  }
-
-  static Value cstF32(Location loc, Type f32Ty, float value,
-                      ConversionPatternRewriter &rewriter) {
-    auto attr = rewriter.getF32FloatAttr(value);
-    if (auto shapedTy = dyn_cast<ShapedType>(f32Ty))
-      return rewriter.create<arith::ConstantOp>(
-          loc, DenseElementsAttr::get(shapedTy, attr));
-    return rewriter.create<arith::ConstantOp>(loc, attr);
-  }
-
-  // Pre-round f32 to fp8e4m3fn precision using a magic bias trick (same as
-  // BFloat16TruncFOpConverter but for 3 mantissa bits), then emit TruncFOp.
-  // This fixes the missing RTNE rounding in arith-expand's fp8 converter.
-  LogicalResult
-  emitF32ToFp8E4M3RTNE(triton::FpToFpOp op,
-                       ConversionPatternRewriter &rewriter) const {
-    Location loc = op.getLoc();
-    Value input = op.getOperand();
-    Type inputTy = input.getType();
-    Type resultTy = op.getResult().getType();
-    Type i32Ty = rewriter.getI32Type();
-    Type f32Ty = rewriter.getF32Type();
-    if (auto shapedTy = dyn_cast<ShapedType>(inputTy)) {
-      i32Ty = shapedTy.clone(i32Ty);
-      f32Ty = shapedTy.clone(f32Ty);
-    }
-
-    Type inputETy = getElementTypeOrSelf(inputTy);
-    if (!inputETy.isF32()) {
-      if (inputETy.getIntOrFloatBitWidth() > 32)
-        input = rewriter.create<arith::TruncFOp>(loc, f32Ty, input);
-      else
-        input = rewriter.create<arith::ExtFOp>(loc, f32Ty, input);
-    }
-
-    Value clamped = rewriter.create<arith::MinimumFOp>(
-        loc, input, cstF32(loc, f32Ty, 448.0f, rewriter));
-    clamped = rewriter.create<arith::MaximumFOp>(
-        loc, clamped, cstF32(loc, f32Ty, -448.0f, rewriter));
-
-    auto c = [&](int64_t v) { return cstI32(loc, i32Ty, v, rewriter); };
-    Value bits = rewriter.create<arith::BitcastOp>(loc, i32Ty, clamped);
-    Value lsb = rewriter.create<arith::AndIOp>(
-        loc, rewriter.create<arith::ShRUIOp>(loc, bits, c(20)), c(1));
-    Value bias = rewriter.create<arith::AddIOp>(loc, lsb, c(0x7FFFF));
-    Value rounded = rewriter.create<arith::AddIOp>(loc, bits, bias);
-    Value roundedF32 = rewriter.create<arith::BitcastOp>(loc, f32Ty, rounded);
-
-    rewriter.replaceOpWithNewOp<arith::TruncFOp>(op, resultTy, roundedF32);
-    return success();
-  }
-
   LogicalResult
   matchAndRewrite(triton::FpToFpOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -984,10 +924,6 @@ struct FpToFpConverter : public OpConversionPattern<triton::FpToFpOp> {
            "Not a float-like operand or result");
 
     if (operandWidth.value() > resultWidth.value()) {
-      Type resultElemTy = getElementTypeOrSelf(resultType);
-      if (isa<Float8E4M3FNType>(resultElemTy))
-        return emitF32ToFp8E4M3RTNE(op, rewriter);
-
       Value truncatedValue = rewriter.create<arith::TruncFOp>(
           op.getLoc(), resultType, op.getOperand());
       rewriter.replaceOp(op, truncatedValue);
