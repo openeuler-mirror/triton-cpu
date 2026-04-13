@@ -190,8 +190,8 @@ def softmax_backward_kernel_non_inner(
         offsets_n = tl.arange(0, TILE_N)
         offsets = pid_m * N * K + offsets_n[:, None] * K + offsets_k
         mask = (offsets_n < N)[:, None] & (offsets_k < K)
-        out_tile = tl.load(out_ptr + offsets, mask=mask).to(tl.float32)
-        out_grad_tile = tl.load(out_grad_ptr + offsets, mask=mask).to(tl.float32)
+        out_tile = tl.load(out_ptr + offsets, mask=mask, other=0).to(tl.float32)
+        out_grad_tile = tl.load(out_grad_ptr + offsets, mask=mask, other=0).to(tl.float32)
         scale = tl.sum(out_tile * out_grad_tile, axis=0)
         in_grad_tile = out_tile * (out_grad_tile - scale[None, :])
         tl.store(in_grad_ptr + offsets, in_grad_tile, mask=mask)
@@ -201,8 +201,8 @@ def softmax_backward_kernel_non_inner(
         scale = tl.zeros([TILE_N, TILE_K], dtype=tl.float32)
         for _ in range(0, N, TILE_N):
             mask = (offsets_n < N)[:, None] & (offsets_k < K)
-            out_tile = tl.load(out_ptr + offsets, mask=mask).to(tl.float32)
-            out_grad_tile = tl.load(out_grad_ptr + offsets, mask=mask).to(tl.float32)
+            out_tile = tl.load(out_ptr + offsets, mask=mask, other=0).to(tl.float32)
+            out_grad_tile = tl.load(out_grad_ptr + offsets, mask=mask, other=0).to(tl.float32)
             scale += out_tile * out_grad_tile
             offsets_n += TILE_N
             offsets += TILE_N * K
@@ -212,8 +212,8 @@ def softmax_backward_kernel_non_inner(
         offsets = pid_m * N * K + offsets_n[:, None] * K + offsets_k
         for _ in range(0, N, TILE_N):
             mask = (offsets_n < N)[:, None] & (offsets_k < K)
-            out_tile = tl.load(out_ptr + offsets, mask=mask).to(tl.float32)
-            out_grad_tile = tl.load(out_grad_ptr + offsets, mask=mask).to(tl.float32)
+            out_tile = tl.load(out_ptr + offsets, mask=mask, other=0).to(tl.float32)
+            out_grad_tile = tl.load(out_grad_ptr + offsets, mask=mask, other=0).to(tl.float32)
             in_grad_tile = out_tile * (out_grad_tile - scale[None, :])
             tl.store(in_grad_ptr + offsets, in_grad_tile, mask=mask)
             offsets_n += TILE_N
