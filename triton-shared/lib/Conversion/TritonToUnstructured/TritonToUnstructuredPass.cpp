@@ -352,6 +352,59 @@ public:
 
                   return success();
                 })
+                .Case<triton::BitcastOp>([&](triton::BitcastOp op) {
+                  // tt.bitcast changes the pointee element type of a pointer
+                  // (e.g., !tt.ptr<i1> -> !tt.ptr<i8>, or the tensor variant).
+                  // The accumulated offset does not change, but the base pointer
+                  // type must be updated so downstream GatherOp / ScatterOp
+                  // (and the UnstructuredToMemref lowering) see a consistent
+                  // scalar pointer type.
+                  //
+                  // Strategy:
+                  //   1. Extract the scalar result element pointer type from the
+                  //      bitcast (works for both scalar and tensor-of-ptr).
+                  //   2. If the element type changes, insert a new scalar
+                  //      tt.bitcast of the original base (always scalar) to the
+                  //      new element pointer type.
+                  //   3. Use that new scalar pointer as the base in PtrOffset.
+                  //   4. Add the original bitcast to toDelete (its uses will
+                  //      have been replaced by the ptrUsers loop before erase).
+                  auto res = op.getResult();
+                  auto resType = res.getType();
+                  if (!triton::isPtrTypeLike(resType)) {
+                    return success();
+                  }
+                  auto offsetInfo = offsetMap.at(op.getSrc());
+
+                  // Extract scalar element pointer type from result.
+                  triton::PointerType resultElemPtrType;
+                  if (auto tensorType = dyn_cast<RankedTensorType>(resType)) {
+                    resultElemPtrType = cast<triton::PointerType>(
+                        tensorType.getElementType());
+                  } else {
+                    resultElemPtrType = cast<triton::PointerType>(resType);
+                  }
+
+                  // offsetInfo.ptr is always a scalar pointer (from a kernel
+                  // arg or IntToPtrOp). Insert a scalar bitcast if the element
+                  // type changes so that GatherOp / ScatterOp carry a ptr of
+                  // the correct element type for UnstructuredToMemref.
+                  Value newBase = offsetInfo.ptr;
+                  auto srcPtrType =
+                      cast<triton::PointerType>(offsetInfo.ptr.getType());
+                  if (srcPtrType != resultElemPtrType) {
+                    OpBuilder b{op};
+                    newBase = b.create<triton::BitcastOp>(
+                        op.getLoc(), resultElemPtrType, offsetInfo.ptr);
+                  }
+
+                  PtrOffset newOffsetInfo{newBase, resType,
+                                         offsetInfo.bitWidth, offsetInfo.offset};
+                  offsetMap.insert({res, newOffsetInfo});
+                  workList.push(res);
+                  toDelete.push_back(op);
+                  return success();
+                })
                 .Case<triton::SplatOp, triton::BroadcastOp,
                       triton::ExpandDimsOp>([&](Operation *op) {
                   auto res = op->getResult(0);

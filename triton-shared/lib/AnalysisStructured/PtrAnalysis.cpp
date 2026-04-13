@@ -871,6 +871,14 @@ LogicalResult PtrAnalysis::visitOperandExtSI(arith::ExtSIOp extOp,
   return visitOperand(extOp.getIn(), state, loc, builder);
 }
 
+LogicalResult PtrAnalysis::visitOperandExtUI(arith::ExtUIOp extOp,
+                                             PtrState &state,
+                                             const Location loc,
+                                             OpBuilder &builder) {
+  assert(state.isEmpty());
+  return visitOperand(extOp.getIn(), state, loc, builder);
+}
+
 LogicalResult PtrAnalysis::visitOperandMakeRange(triton::MakeRangeOp rangeOp,
                                                  PtrState &state, Location loc,
                                                  OpBuilder &builder) {
@@ -1245,6 +1253,8 @@ LogicalResult PtrAnalysis::visitOperand(Value operand, PtrState &state,
     return visitOperandRem(op, state, loc, builder);
   } else if (auto op = operand.getDefiningOp<arith::ExtSIOp>()) {
     return visitOperandExtSI(op, state, loc, builder);
+  } else if (auto op = operand.getDefiningOp<arith::ExtUIOp>()) {
+    return visitOperandExtUI(op, state, loc, builder);
   } else if (auto op = operand.getDefiningOp<scf::ForOp>()) {
     return visitOperandForOp(op, operand, state, loc, builder);
   } else if (!operand.getDefiningOp()) {
