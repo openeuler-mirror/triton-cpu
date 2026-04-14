@@ -550,8 +550,8 @@ public:
                 store->erase();
                 return success();
               })
-              .Case<triton::MakeTensorPtrOp,
-                    tts::MakeTensorPtrOp>([&](auto makeTensorPtr) {
+              .Case<triton::MakeTensorPtrOp>([&](triton::MakeTensorPtrOp
+                                                     makeTensorPtr) {
                 // For block pointers, the base could come from a sequence of
                 // `tt.addptr`. Accumulate the target offset with the offset we
                 // have saved.
@@ -593,6 +593,40 @@ public:
 
                 offsetOpnd.set(accumulatedOffset);
 
+                return success();
+              })
+              .Case<tts::MakeTensorPtrOp>([&](tts::MakeTensorPtrOp
+                                                  makeTensorPtr) {
+                // Structured tensor pointers may carry all offsets in the
+                // static attribute segment, leaving the dynamic offset operand
+                // range empty.
+                auto offsetInfo = offsetMap.at(makeTensorPtr.getBase());
+                auto baseOffset = offsetInfo.offset;
+
+                auto mixedOffsets = makeTensorPtr.getMixedOffsets();
+                if (mixedOffsets.empty()) {
+                  makeTensorPtr->emitError(
+                      "expected tensor pointer to have at least one offset");
+                  return failure();
+                }
+
+                makeTensorPtr.getBaseMutable().set(offsetInfo.ptr);
+                baseOffset = b.create<arith::IndexCastOp>(loc, b.getIndexType(),
+                                                          baseOffset);
+                mixedOffsets.front() =
+                    addOFRs(mixedOffsets.front(), baseOffset, loc, b);
+
+                // `updatedPtr` is needed to support both dynamic and static
+                // offsets for structured tensor pointers, and `updatedPtr`
+                // replaces `makeTensorPtr` after folding `baseOffset` into the
+                // first offset operand.
+                auto updatedPtr = b.create<tts::MakeTensorPtrOp>(
+                    loc, offsetInfo.ptr, makeTensorPtr.getSizes(),
+                    makeTensorPtr.getMixedStrides(), mixedOffsets,
+                    makeTensorPtr.getMixedShape(), makeTensorPtr.getOrder());
+
+                makeTensorPtr->replaceAllUsesWith(updatedPtr->getResults());
+                makeTensorPtr->erase();
                 return success();
               })
 
