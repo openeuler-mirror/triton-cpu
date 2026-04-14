@@ -574,7 +574,7 @@ def normed_cumsum(inp, dim=-1):
         else:
             num_sms = get_device_properties(device).multi_processor_count
 
-        TILE = 2048
+        TILE = 128 if is_cpu else 2048
         # Each row is split into n_chunks of chunks where each chunk is compised of
         # n_tiles of tiles. Different chunks are assigned to different ctas.
         n_rows = N // K

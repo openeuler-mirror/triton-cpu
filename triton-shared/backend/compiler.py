@@ -522,6 +522,7 @@ class CPUBackend(BaseBackend):
                     sequence.bodyTarget,
                     bufferize_function_boundaries=True,
                     allow_return_allocs_from_loops=True,
+                    copy_before_write=True,
                     memcpy_op="linalg.copy")
                 funcs = structured.MatchOp.match_op_names(
                     transform.AnyOpType.get(),
