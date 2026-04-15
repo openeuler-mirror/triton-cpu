@@ -524,23 +524,19 @@ class CPUBackend(BaseBackend):
                     allow_return_allocs_from_loops=True,
                     copy_before_write=True,
                     memcpy_op="linalg.copy")
-                funcs = structured.MatchOp.match_op_names(
-                    transform.AnyOpType.get(),
-                    oneshot.result,
-                    ["func.func"]
-                )
+
                 dealloc = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
-                    funcs.result,
-                    "buffer-deallocation"
+                    oneshot.result,
+                    "buffer-deallocation-pipeline"
                 )
-                transform.ApplyRegisteredPassOp(
+                memref = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
                     dealloc.result,
                     "convert-bufferization-to-memref"
                 )
 
-                transform.YieldOp([oneshot])
+                transform.YieldOp([memref])
 
         def main_bufferize():
             sequence = transform.NamedSequenceOp(
