@@ -40,11 +40,15 @@
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 
+#include "llvm/Support/Debug.h"
+
 using namespace mlir;
 using namespace triton;
 
 #define GEN_PASS_CLASSES
 #include "triton-shared/Conversion/TritonToLinalgExperimental/Passes.h.inc"
+
+#define DEBUG_TYPE "triton-to-linalg"
 
 namespace {
 
@@ -225,10 +229,29 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
 
     // Recover memref from Triton pointer
     Value memref;
-    if (auto fromMemref = tritonPtr.getDefiningOp<tptr::FromMemrefOp>())
+    SmallVector<Value, 1> indices;
+    auto resolvePtr = [&](Value ptr, Value offset) -> LogicalResult {
+      if (auto castOp = ptr.getDefiningOp<UnrealizedConversionCastOp>()) {
+        memref = castOp.getInputs()[0];
+        indices.push_back(rewriter.create<arith::IndexCastOp>(
+            loc, rewriter.getIndexType(), offset));
+        return success();
+      }
+      if (auto fromMemRef = ptr.getDefiningOp<tptr::FromMemrefOp>()) {
+        memref = fromMemRef.getOperand();
+        indices.push_back(rewriter.create<arith::IndexCastOp>(
+            loc, rewriter.getIndexType(), offset));
+        return success();
+      }
+      return rewriter.notifyMatchFailure(op,
+                                         "unsupported base ptr for addptr op");
+    };
+
+    if (auto fromMemref = tritonPtr.getDefiningOp<tptr::FromMemrefOp>()) {
+      indices.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
       memref = fromMemref.getOperand();
-    else if (auto tensorType =
-                 dyn_cast<RankedTensorType>(tritonPtr.getType())) {
+    } else if (auto tensorType =
+                   dyn_cast<RankedTensorType>(tritonPtr.getType())) {
       // shapes and rank
       SmallVector<int64_t> shape(tensorType.getShape().begin(),
                                  tensorType.getShape().end());
@@ -331,13 +354,27 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
       rewriter.replaceOp(op, resultTensor);
       return success();
 
+    } else if (auto castOp =
+                   tritonPtr.getDefiningOp<UnrealizedConversionCastOp>()) {
+      if (auto addPtrOp =
+              castOp.getOperand(0).getDefiningOp<triton::AddPtrOp>()) {
+        if (failed(resolvePtr(addPtrOp.getPtr(), addPtrOp.getOffset())))
+          return rewriter.notifyMatchFailure(op, "unsupported addptr");
+      } else if (auto addPtrOp =
+                     castOp.getOperand(0).getDefiningOp<tptr::PtrAddOp>()) {
+        if (failed(resolvePtr(addPtrOp.getOperand(0), addPtrOp.getOffset())))
+          return rewriter.notifyMatchFailure(op, "unsupported addptr");
+      } else
+        return rewriter.notifyMatchFailure(op, "unsupported cast");
+    } else if (auto addPtrOp = tritonPtr.getDefiningOp<triton::AddPtrOp>()) {
+      if (failed(resolvePtr(addPtrOp.getPtr(), addPtrOp.getOffset())))
+        return rewriter.notifyMatchFailure(op, "unsupported addptr");
+    } else if (auto addPtrOp = tritonPtr.getDefiningOp<tptr::PtrAddOp>()) {
+      if (failed(resolvePtr(addPtrOp.getOperand(0), addPtrOp.getOffset())))
+        return rewriter.notifyMatchFailure(op, "unsupported addptr");
     } else {
       return rewriter.notifyMatchFailure(op, "unsupported Triton pointer");
     }
-
-    // Use index 0 for rank-1 memrefs for now
-    Value idx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    SmallVector<Value, 1> indices{idx};
 
     if (mask) {
       auto ifOp = rewriter.create<scf::IfOp>(
