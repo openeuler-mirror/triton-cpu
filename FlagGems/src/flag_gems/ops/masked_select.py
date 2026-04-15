@@ -77,7 +77,7 @@ def mask_part_sum_kernel(
     np = tl.num_programs(0)
     if count == np - 1:
         mask = tl.arange(0, NP_BLOCK) < np
-        part_sums = tl.load(part_sums_ptr + tl.arange(0, NP_BLOCK), mask=mask)
+        part_sums = tl.load(part_sums_ptr + tl.arange(0, NP_BLOCK), mask=mask, other=0)
         final_sum = tl.sum(part_sums, axis=0)
         pre_sums = tl.cumsum(part_sums, axis=0)
         tl.store(
@@ -103,7 +103,7 @@ def write_back_kernel(
 
     start_block = row_id * num_blocks_per_row
     offset = start_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    advance = tl.load(part_sums_ptr + row_id)
+    out_offset = tl.load(part_sums_ptr + row_id)
 
     last_block_id = min(num_blocks - 1, start_block + num_blocks_per_row - 1)
 
@@ -111,18 +111,19 @@ def write_back_kernel(
         inp = tl.load(inp_ptr + offset)
         select_mask = tl.load(mask_ptr + offset).to(tl.int1)
         select_ints = select_mask.to(tl.constexpr(part_sums_ptr.dtype.element_ty))
-        out_ptr += advance
+        current_out_ptr = out_ptr + out_offset
         advance = tl.sum(select_ints, axis=0)
         pre_sums = tl.cumsum(select_ints, axis=0) - 1
-        tl.store(out_ptr + pre_sums, inp, mask=select_mask)
+        tl.store(current_out_ptr + pre_sums, inp, mask=select_mask)
+        out_offset += advance
         offset += BLOCK_SIZE
     # Peeled last block
     inp = tl.load(inp_ptr + offset, mask=offset < N)
     select_mask = tl.load(mask_ptr + offset, mask=offset < N, other=0).to(tl.int1)
     select_ints = select_mask.to(tl.constexpr(part_sums_ptr.dtype.element_ty))
-    out_ptr += advance
+    current_out_ptr = out_ptr + out_offset
     pre_sums = tl.cumsum(select_ints, axis=0) - 1
-    tl.store(out_ptr + pre_sums, inp, mask=(offset < N) & select_mask)
+    tl.store(current_out_ptr + pre_sums, inp, mask=(offset < N) & select_mask)
 
 
 def masked_select(inp, mask):
