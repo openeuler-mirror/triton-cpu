@@ -3,6 +3,7 @@ import logging
 import os
 from typing import Any, Callable, List, Mapping, Tuple
 
+import numpy as np
 import torch
 
 from flag_gems.utils.code_cache import code_cache_dir
@@ -219,6 +220,18 @@ _index_add_func = IndexAddFunction()
 
 def index_add(inp, dim, index, src, alpha=1):
     logger.debug("GEMS INDEX ADD")
+
+    # tl.atomic_add with data-dependent (scatter) indices is not supported by
+    # the triton-shared CPU backend (PtrAnalysis cannot represent scatter
+    # addresses as tts.make_tptr).  Fall back via numpy to avoid dispatch recursion.
+    if inp.device.type == "cpu":
+        dim = dim % inp.ndim
+        out_np = inp.detach().numpy().copy()
+        idx = [slice(None)] * inp.ndim
+        idx[dim] = index.detach().numpy()
+        np.add.at(out_np, tuple(idx), alpha * src.detach().numpy())
+        return torch.from_numpy(out_np)
+
     assert ((0 <= index) * (index < inp.size(dim))).equal(
         torch.ones(tuple(index.shape), dtype=torch.bool, device=inp.device)
     ), "0 <= index < self.size(dim)"
@@ -260,6 +273,15 @@ def index_add(inp, dim, index, src, alpha=1):
 
 def index_add_(inp, dim, index, src, alpha=1):
     logger.debug("GEMS INDEX ADD_")
+
+    if inp.device.type == "cpu":
+        dim = dim % inp.ndim
+        inp_np = inp.detach().numpy()
+        idx = [slice(None)] * inp.ndim
+        idx[dim] = index.detach().numpy()
+        np.add.at(inp_np, tuple(idx), alpha * src.detach().numpy())
+        return inp
+
     assert ((0 <= index) * (index < inp.size(dim))).equal(
         torch.ones(tuple(index.shape), dtype=torch.bool, device=inp.device)
     ), "0 <= index < self.size(dim)"
