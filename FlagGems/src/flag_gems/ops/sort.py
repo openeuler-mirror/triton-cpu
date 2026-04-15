@@ -250,7 +250,8 @@ def radix_sort(arr, k_bits=8, descending=False):
     dtype = arr.dtype
     num_bits = 1 if dtype == torch.bool else (arr.itemsize * 8)
 
-    TILE_N = 1024
+    is_cpu = torch_device_fn.__name__ == "torch.cpu"
+    TILE_N = 128 if is_cpu else 1024
     tiles_n_per_cta = 8
     CTA_TILE_N = tiles_n_per_cta * TILE_N
 
@@ -292,7 +293,7 @@ def radix_sort(arr, k_bits=8, descending=False):
 
         TILE_R = 8
         grid_r = triton.cdiv(num_bins, TILE_R)
-        TILE_N = 2048
+        TILE_N = 128 if is_cpu else 2048
         grid_n = triton.cdiv(n, TILE_N)
         grid_for_sweep = (m * grid_n, grid_r)
 

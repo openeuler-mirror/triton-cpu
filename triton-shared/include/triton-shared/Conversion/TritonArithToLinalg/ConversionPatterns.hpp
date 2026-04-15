@@ -2596,6 +2596,8 @@ public:
 
     // Map known Sleef calls to native MLIR math ops so they flow through
     // MathToLibm lowering (C libm) instead of direct Sleef function calls.
+    POPULATE_UNARY_OP("Sleef_rintf", math::RoundEvenOp);
+    POPULATE_UNARY_OP("Sleef_rint", math::RoundEvenOp);
     POPULATE_UNARY_OP("Sleef_ceilf", math::CeilOp);
     POPULATE_UNARY_OP("Sleef_ceild1", math::CeilOp);
 
