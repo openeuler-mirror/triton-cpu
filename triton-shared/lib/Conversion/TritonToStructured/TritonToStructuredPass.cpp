@@ -97,9 +97,15 @@ public:
       // We only care about tensor of index / int (in addition to pointer type)
       // because only values of int and index type can potentially be part of a
       // pointer arithmetic sequence.
+      // Specifically, Triton pointer offsets are always i32 or i64; narrower
+      // integer types (e.g. i16, i8) are data values and must not be treated
+      // as structured pointer offsets. This also matches the TT_IndexTensorLike
+      // constraint (I32Tensor | I64Tensor) in TritonStructuredDialect.td.
       auto elementType = tensorType.getElementType();
-      if (isa<triton::PointerType>(elementType) ||
-          (elementType.isIntOrIndex() && !elementType.isInteger(1))) {
+      bool isStructuredIntTensor =
+          elementType.isIndex() || elementType.isInteger(32) ||
+          elementType.isInteger(64);
+      if (isa<triton::PointerType>(elementType) || isStructuredIntTensor) {
         types =
             SmallVector<Type>{getStructuredStateTupleType(context, tensorType)};
         return success();
