@@ -86,20 +86,6 @@ test_libentry:
     TILE_N: 512
 - META:
     TILE_N: 1024
-naive_reduction:
-- gen: true
-  param_map:
-    META:
-      BLOCK_M: block_m
-      BLOCK_N: block_n
-    num_warps: 4
-  block_m:
-  - 1
-  - 2
-  - 4
-  - 8
-  block_n:
-  - 128
 min:
 - META:
     BLOCK_M: 8
