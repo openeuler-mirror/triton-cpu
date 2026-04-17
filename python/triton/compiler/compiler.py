@@ -285,14 +285,14 @@ def compile(src, target=None, options=None):
         print(f"Folder Name: {_base64(hash)}")
         start_time = time.perf_counter()
     for ext, compile_ir in list(stages.items())[first_stage:]:
-        try:    
+        try:
             next_module = compile_ir(module, metadata)
         except CPUFallbackException as e:
             if not compile._fallback_attempted:
                 compile._fallback_attempted = True
                 driver.set_active_to_cpu()
                 return compile(old_src, GPUTarget("cpu", "cpu", 1), old_options)
-            raise RuntimeError(f"CPU backend fallback failed: {e}") 
+            raise RuntimeError(f"CPU backend fallback failed: {e}")
         ir_filename = f"{file_name}.{ext}"
         if (fn_override_manager is not None and (full_name := fn_override_manager.get_file(ir_filename)) is not None):
             print(f"\nOverriding kernel with file {full_name}")
@@ -328,7 +328,7 @@ def make_backend(target):
     if target.backend == "cpu":
         if os.environ.get("TRITON_USE_SHARED_BACKEND", "0") == "1":
             return backends["triton_shared"].compiler(target)
-    return backends["cpu"].compiler(target)
+        return backends["cpu"].compiler(target)
 
     print(f"Target: {target}")
     actives = [x.compiler for x in backends.values() if x.compiler.supports_target(target)]
