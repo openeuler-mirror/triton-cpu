@@ -522,7 +522,7 @@ def block_update_kernel(
     # cols = [ grid.x * t * tile, (grid.x + 1) * t * tile )
     gridx = tle.program_id(0).to(tl.int64)
     gridy = tle.program_id(1).to(tl.int64)
-    n_gridx = tle.num_programs(1)
+    n_gridx = tle.num_programs(0)
 
     base += gridy * n_gridx + gridx
     rscale_ptr += gridy * rscale_stride
@@ -530,7 +530,7 @@ def block_update_kernel(
     for row in range(gridy, min(gridy + r, R)):
         d = tl.load(base)
         rscale = tl.load(rscale_ptr)
-        base += gridx
+        base += n_gridx
         rscale_ptr += rscale_stride
         row_offset = row * r_stride
         cols = gridx * t * TILE + tl.arange(0, TILE)
@@ -612,7 +612,7 @@ def normed_cumsum(inp, dim=-1):
 
         if inp.dtype != torch.float64:
             acc_dtype = torch.float32
-        sums = torch.empty((n_rows, n_chunks), dtype=acc_dtype, device=device.name)
+        sums = torch.empty((n_rows, n_chunks), dtype=acc_dtype, device=device)
         cumsums = torch.empty_like(sums)
         block_cumsum_kernel[grid](
             inp,
