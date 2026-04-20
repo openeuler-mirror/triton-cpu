@@ -141,7 +141,10 @@ def masked_scatter_impl(inp, mask, source, N):
     BLOCK_SIZE = bracket_next_power_of_2(N, 128, 4096)
     num_warps = min(16, BLOCK_SIZE // 32)
 
-    np = torch_device_fn.get_device_properties(mask.device).multi_processor_count
+    if torch_device_fn == torch.cpu:
+        np = torch.get_num_threads()
+    else:
+        np = torch_device_fn.get_device_properties(mask.device).multi_processor_count
     n_blocks = triton.cdiv(N, BLOCK_SIZE)
     np = min(n_blocks, np)
     n_blocks_per_row = triton.cdiv(n_blocks, np)
