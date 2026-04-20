@@ -416,7 +416,7 @@ struct AtomicCASOpConversion : public OpConversionPattern<AtomicCASOp> {
     Value tritonPtr = op.getPtr();
 
     // Recover memref from Triton pointer
-    Value memref = tritonPtr;
+    Value memref;
     if (auto fromMemref = tritonPtr.getDefiningOp<tptr::FromMemrefOp>())
       memref = fromMemref.getOperand();
     else if (auto tensorType =
@@ -425,19 +425,6 @@ struct AtomicCASOpConversion : public OpConversionPattern<AtomicCASOp> {
       SmallVector<int64_t> shape(tensorType.getShape().begin(),
                                  tensorType.getShape().end());
       unsigned rank = tensorType.getRank();
-
-      // pointer element type (e.g. !tt.ptr<f32> or !ptr.ptr<#...>)
-      Type lanePtrElemTy = tensorType.getElementType();
-      Type pointeeTy = nullptr;
-      if (auto ttPtr = mlir::dyn_cast<triton::PointerType>(lanePtrElemTy)) {
-        pointeeTy = ttPtr.getPointeeType();
-      } else if (auto genericPtr =
-                     mlir::dyn_cast<ptr::PtrType>(lanePtrElemTy)) {
-        pointeeTy = genericPtr.getElementType();
-      } else {
-        return rewriter.notifyMatchFailure(op,
-                                           "unsupported pointer element type");
-      }
 
       // the result tensor type should match 'val'
       auto resultTensorTy = replaceVal.getType().dyn_cast<RankedTensorType>();
@@ -470,9 +457,16 @@ struct AtomicCASOpConversion : public OpConversionPattern<AtomicCASOp> {
                   tritonPtr.getDefiningOp<UnrealizedConversionCastOp>())
           ttPtr = cast.getOperand(0);
 
+      // Allocate an empty result tensor to carry per-lane CAS old-values
+      // through the loop as an iter-arg.
+      Value resultEmpty = rewriter.create<tensor::EmptyOp>(
+          loc, shape, resultTensorTy.getElementType());
+
       scf::LoopNest nest = scf::buildLoopNest(
-          rewriter, loc, lbs, ubs, steps,
-          [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange ivs)  {
+          rewriter, loc, lbs, ubs, steps, ValueRange{resultEmpty},
+          [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange ivs,
+              ValueRange iterArgs) -> scf::ValueVector {
+            Value currentTensor = iterArgs[0];
 
             // 1. Extract pointer element for this lane
             Value lanePtr =
@@ -494,7 +488,7 @@ struct AtomicCASOpConversion : public OpConversionPattern<AtomicCASOp> {
             Value zeroIdx =
                 nestedBuilder.create<arith::ConstantIndexOp>(nestedLoc, 0);
 
-            // 5. Create the GenericAtomicRMWOp for cmpxhg atomic operation
+            // 5. Create the GenericAtomicRMWOp for cmpxchg atomic operation
             SmallVector<Value, 1> memIndices{zeroIdx};
             auto genericOp = nestedBuilder.create<memref::GenericAtomicRMWOp>(
                    nestedLoc, laneMemref, memIndices);
@@ -502,16 +496,49 @@ struct AtomicCASOpConversion : public OpConversionPattern<AtomicCASOp> {
 
             OpBuilder bodyBuilder =
               OpBuilder::atBlockEnd(genericOp.getBody(), rewriter.getListener());
-            auto isEqual = bodyBuilder.create<arith::CmpIOp>(nestedLoc,
-                arith::CmpIPredicate::eq, currentValue, laneCmpVal);
+
+            // arith.cmpi requires integer operands. For float element types,
+            // bitcast to an equal-width integer before comparing.  This also
+            // matches hardware cmpxchg bit-pattern equality semantics.
+            Value isEqual;
+            if (auto floatTy = dyn_cast<FloatType>(elemTy)) {
+              Type intTy = IntegerType::get(bodyBuilder.getContext(),
+                                            floatTy.getWidth());
+              Value curInt = bodyBuilder.create<arith::BitcastOp>(
+                  nestedLoc, intTy, currentValue);
+              Value cmpInt = bodyBuilder.create<arith::BitcastOp>(
+                  nestedLoc, intTy, laneCmpVal);
+              isEqual = bodyBuilder.create<arith::CmpIOp>(
+                  nestedLoc, arith::CmpIPredicate::eq, curInt, cmpInt);
+            } else {
+              isEqual = bodyBuilder.create<arith::CmpIOp>(
+                  nestedLoc, arith::CmpIPredicate::eq, currentValue,
+                  laneCmpVal);
+            }
 
             auto result = bodyBuilder.create<arith::SelectOp>(nestedLoc, isEqual,
                 laneReplaceVal, currentValue);
 
             bodyBuilder.create<memref::AtomicYieldOp>(nestedLoc, result);
+
+            // 6. Insert the scalar CAS result into the accumulating tensor.
+            Value updatedTensor = nestedBuilder.create<tensor::InsertOp>(
+                nestedLoc, genericOp.getResult(), currentTensor, ivs);
+            return {updatedTensor};
           });
-      rewriter.eraseOp(op);
+      rewriter.replaceOp(op, nest.results.front());
       return success();
+    } else if (auto castOp =
+                   tritonPtr.getDefiningOp<UnrealizedConversionCastOp>()) {
+      // Scalar pointer via TritonToPtr: unrealized_conversion_cast from
+      // !ptr.ptr back to !tt.ptr<T>.  Recover a memref via ToMemrefOp.
+      Value ptrVal = castOp.getInputs().front();
+      auto pointeeTy =
+          cast<triton::PointerType>(tritonPtr.getType()).getPointeeType();
+      memref = rewriter.create<tptr::ToMemrefOp>(
+          loc, MemRefType::get({1}, pointeeTy), ptrVal);
+    } else {
+      return rewriter.notifyMatchFailure(op, "unsupported Triton pointer");
     }
     Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     SmallVector<Value, 1> memIndices{zeroIdx};
@@ -521,13 +548,28 @@ struct AtomicCASOpConversion : public OpConversionPattern<AtomicCASOp> {
 
     OpBuilder bodyBuilder =
         OpBuilder::atBlockEnd(genericOp.getBody(), rewriter.getListener());
-    auto isEqual = bodyBuilder.create<arith::CmpIOp>(loc,
-         arith::CmpIPredicate::eq, currentValue, compareVal);
+
+    // arith.cmpi requires integer operands (see tensor path comment above).
+    auto elemTy = replaceVal.getType();
+    Value isEqual;
+    if (auto floatTy = dyn_cast<FloatType>(elemTy)) {
+      Type intTy =
+          IntegerType::get(bodyBuilder.getContext(), floatTy.getWidth());
+      Value curInt =
+          bodyBuilder.create<arith::BitcastOp>(loc, intTy, currentValue);
+      Value cmpInt =
+          bodyBuilder.create<arith::BitcastOp>(loc, intTy, compareVal);
+      isEqual = bodyBuilder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                                  curInt, cmpInt);
+    } else {
+      isEqual = bodyBuilder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                                  currentValue, compareVal);
+    }
 
     auto result = bodyBuilder.create<arith::SelectOp>(loc, isEqual,
         replaceVal, currentValue);
     bodyBuilder.create<memref::AtomicYieldOp>(loc, result);
-    rewriter.replaceOp(op, genericOp);
+    rewriter.replaceOp(op, genericOp.getResult());
     return success();
   }
 };

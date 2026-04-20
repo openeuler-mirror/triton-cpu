@@ -440,7 +440,8 @@ public:
                 .Case<tts::MakeGatherScatterTensorPtrOp>(
                     [&](Operation *op) { return success(); })
                 .Case<triton::LoadOp, triton::StoreOp, triton::MakeTensorPtrOp,
-                      tts::MakeTensorPtrOp>([&](Operation *op) {
+                      tts::MakeTensorPtrOp, triton::AtomicCASOp>(
+                    [&](Operation *op) {
                   // Special case:
                   // We do not want to create "unstructured tensor pointer" into
                   // tts.make_tptr if the base pointer is directly from the
@@ -550,8 +551,28 @@ public:
                 store->erase();
                 return success();
               })
-              .Case<triton::MakeTensorPtrOp>([&](triton::MakeTensorPtrOp
-                                                     makeTensorPtr) {
+              .Case<triton::AtomicCASOp>([&](Operation *op) {
+                    auto ptrOperand = op->getOperand(0);
+                    auto offsetInfo = offsetMap.at(ptrOperand);
+                    Value basePtr = offsetInfo.ptr;
+
+                    // If the resolved pointer type is a tensor but the base is
+                    // a scalar (e.g. broadcast pattern), splat it to match.
+                    if (isa<RankedTensorType>(offsetInfo.ptrType) &&
+                        !isa<RankedTensorType>(basePtr.getType())) {
+                      basePtr = b.create<triton::SplatOp>(
+                          loc, offsetInfo.ptrType, basePtr);
+                    }
+
+                    // Re-materialize the pointer as tt.addptr(base, offset)
+                    // so that downstream patterns can handle it uniformly.
+                    auto materializedAddPtr = b.create<triton::AddPtrOp>(
+                        loc, offsetInfo.ptrType, basePtr, offsetInfo.offset);
+                    op->setOperand(0, materializedAddPtr);
+                    return success();
+                  })
+              .Case<triton::MakeTensorPtrOp,
+                    tts::MakeTensorPtrOp>([&](auto makeTensorPtr) {
                 // For block pointers, the base could come from a sequence of
                 // `tt.addptr`. Accumulate the target offset with the offset we
                 // have saved.
