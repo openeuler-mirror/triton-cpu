@@ -393,9 +393,11 @@ private:
     auto cast1 = rewriter.create<memref::ReinterpretCastOp>(
         loc, resultType, adaptor.getBase(), targetOffset, sizes1, strideVals);
 
-    // Second chunk
+    // Second chunk - clamp column size to modN to prevent out of bound reads
+    // when the block requires multiple wraparounds (d2 > modN).
     Value d2 = rewriter.create<arith::SubIOp>(loc, colSize, d1);
-    SmallVector<Value> sizes2{rowSize, d2};
+    Value d2Clamped = rewriter.create<arith::MinSIOp>(loc, d2, modN);
+    SmallVector<Value> sizes2{rowSize, d2Clamped};
 
     auto cast2 = rewriter.create<memref::ReinterpretCastOp>(
         loc, resultType, adaptor.getBase(), y, sizes2, strideVals);
@@ -680,7 +682,7 @@ private:
   using OpConversionPattern<tts::LoadOp>::OpConversionPattern;
 
   void createSideBySideCopies(Value block1, Value block2, Value dst,
-                              Location loc,
+                              Value totalRows, Value totalCols, Location loc,
                               ConversionPatternRewriter &rewriter) const {
 
     auto zero =
@@ -689,31 +691,46 @@ private:
     auto one =
         rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
 
-    Value block1Row = rewriter.create<memref::DimOp>(loc, block1, 0);
     Value block1Col = rewriter.create<memref::DimOp>(loc, block1, 1);
-
-    Value block2Row = rewriter.create<memref::DimOp>(loc, block2, 0);
     Value block2Col = rewriter.create<memref::DimOp>(loc, block2, 1);
 
-    auto block1Dst =
-        rewriter.create<memref::SubViewOp>(loc, dst, /* offsets */
-                                           ValueRange{zero, zero},
-                                           /* sizes */
-                                           ValueRange{block1Row, block1Col},
-                                           /* strides */
-                                           ValueRange{one, one});
+    // d1 = min(block1Col, totalCols): the number of columns from block1
+    Value d1 = rewriter.create<arith::MinSIOp>(loc, block1Col, totalCols);
+    // d2 = totalCols - d1: the number of remaining columns to fill from block2
+    Value d2 = rewriter.create<arith::SubIOp>(loc, totalCols, d1);
 
-    auto block2Dst =
-        rewriter.create<memref::SubViewOp>(loc, dst,
-                                           /* offsets */
-                                           ValueRange{zero, block1Col},
-                                           /* sizes */
-                                           ValueRange{block2Row, block2Col},
-                                           /* strides */
-                                           ValueRange{one, one});
+    // Copy block1[0:row, 0:d1] to dst[0:row, 0:d1]
+    auto block1Src = rewriter.create<memref::SubViewOp>(
+        loc, block1, /* offsets */ ValueRange{zero, zero},
+        /* sizes */ ValueRange{totalRows, d1},
+        /* strides */ ValueRange{one, one});
+    auto block1Dst = rewriter.create<memref::SubViewOp>(
+        loc, dst, /* offsets */ ValueRange{zero, zero},
+        /* sizes */ ValueRange{totalRows, d1},
+        /* strides */ ValueRange{one, one});
+    rewriter.create<memref::CopyOp>(loc, block1Src, block1Dst);
 
-    rewriter.create<memref::CopyOp>(loc, block1, block1Dst);
-    rewriter.create<memref::CopyOp>(loc, block2, block2Dst);
+    // Tile block2 across the remaining d2 columns
+    auto loop = rewriter.create<scf::ForOp>(loc, zero, d2, block2Col);
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(loop.getBody());
+      Value iv = loop.getInductionVar();
+      Value remaining = rewriter.create<arith::SubIOp>(loc, d2, iv);
+      Value thisChunk =
+          rewriter.create<arith::MinSIOp>(loc, block2Col, remaining);
+      Value dstOffset = rewriter.create<arith::AddIOp>(loc, d1, iv);
+
+      auto srcSubview = rewriter.create<memref::SubViewOp>(
+          loc, block2, /* offsets */ ValueRange{zero, zero},
+          /* sizes */ ValueRange{totalRows, thisChunk},
+          /* strides */ ValueRange{one, one});
+      auto dstSubview = rewriter.create<memref::SubViewOp>(
+          loc, dst, /* offsets */ ValueRange{zero, dstOffset},
+          /* sizes */ ValueRange{totalRows, thisChunk},
+          /* strides */ ValueRange{one, one});
+      rewriter.create<memref::CopyOp>(loc, srcSubview, dstSubview);
+    }
   }
 
   void createStackedCopies(Value block1, Value block2, Value dst, Location loc,
@@ -841,7 +858,12 @@ private:
       auto block2 = memrefs[1];
 
       if (unrealizedCast->hasAttr(WRAP_SIDE_BY_SIDE)) {
-        createSideBySideCopies(block1, block2, alloc, loc, rewriter);
+        Value totalRows =
+            rewriter.create<memref::DimOp>(loc, alloc, 0).getResult();
+        Value totalCols =
+            rewriter.create<memref::DimOp>(loc, alloc, 1).getResult();
+        createSideBySideCopies(block1, block2, alloc, totalRows, totalCols, loc,
+                               rewriter);
       } else if (unrealizedCast->hasAttr(WRAP_STACKED)) {
         createStackedCopies(block1, block2, alloc, loc, rewriter);
       } else {
@@ -912,9 +934,10 @@ private:
       auto block2 = memrefs[1];
 
       if (unrealizedCast->hasAttr(WRAP_SIDE_BY_SIDE)) {
-        auto [subview1, subview2] =
-            getSideBySideSubviews(mixedDims, block1, block2, loc, rewriter);
-        createSideBySideCopies(subview1, subview2, alloc, loc, rewriter);
+        Value totalRows = ofrToIndexValue(mixedDims[0], loc, rewriter);
+        Value totalCols = ofrToIndexValue(mixedDims[1], loc, rewriter);
+        createSideBySideCopies(block1, block2, alloc, totalRows, totalCols, loc,
+                               rewriter);
       } else if (unrealizedCast->hasAttr(WRAP_STACKED)) {
         auto [subview1, subview2] =
             getStackedSubviews(mixedDims, block1, block2, loc, rewriter);
