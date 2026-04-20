@@ -43,7 +43,38 @@ def pytest_addoption(parser):
         choices=["none", "log"],
         help="tests function param recorded in log files or not",
     )
+    parser.addoption(
+        "--skip",
+        action="store",
+        default=None,
+        required=False,
+        help="input skip tests file (e.g.: --skip='skip_tests.txt')"
+    )
 
+
+def pytest_collection_modifyitems(config, items):
+    skip_filename = config.getoption("--skip")
+    if not skip_filename:
+        return
+
+    skip_file = os.path.join(config.rootdir, skip_filename)
+    if not os.path.exists(skip_file):
+        print(f"\n[Warning] Skip list file not found: {skip_file}")
+        return
+
+    with open(skip_file, "r", encoding="utf-8") as f:
+        skip_names = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+    if not skip_names:
+        return
+
+    skip_marker = pytest.mark.skip(reason=f"Matched in {skip_filename}")
+
+    for item in items:
+        for name in skip_names:
+            if name in item.nodeid:
+                item.add_marker(skip_marker)
+                break
 
 def pytest_configure(config):
     global TO_CPU
