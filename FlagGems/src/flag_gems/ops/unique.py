@@ -190,7 +190,7 @@ def local_quick_unique_flat_impl(
     b = tl.load(sorted_data_ptr + i0_prev, mask=mask)
 
     # ne & cumsum
-    ne_result = tl.where(i0 > 0, a != b, 0)
+    ne_result = tl.where((i0 > 0) & mask, a != b, 0)
     cumsum = tl.cumsum(ne_result)
 
     # local_id or local_unique
