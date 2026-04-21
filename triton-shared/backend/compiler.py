@@ -38,12 +38,38 @@ def _get_llvm_bin_path(bin_name: str) -> str:
     return os.path.join(path, bin_name)
 
 
-def _dump_ir_if_needed(files):
-    path = os.getenv("TRITON_SHARED_DUMP_PATH", "")
+def _dump_ir_if_needed(path, files):
     if not path:
         return
     for f in files:
         shutil.copy(f, os.path.join(path, os.path.basename(f)))
+
+
+def _sanitize_dump_component(value: str) -> str:
+    safe = re.sub(r"[^0-9A-Za-z_.-]+", "_", value or "")
+    return safe.strip("._")[:80] or "unknown"
+
+
+def _extract_kernel_tag_from_ir(ir_text: str) -> str:
+    # Prefer transform sequence symbol if present, fall back to function symbol.
+    m = re.search(r'sym_name\s*=\s*"([^"]+)"', ir_text)
+    if m:
+        return _sanitize_dump_component(m.group(1))
+    m = re.search(r'@([A-Za-z_.$][A-Za-z0-9_.$]*)\s*\(', ir_text)
+    if m:
+        return _sanitize_dump_component(m.group(1))
+    return "unknown"
+
+# Create a unique directory for dumping IR, to prevent overwrite.
+def _new_debug_dump_dir(ir_text: str) -> str:
+    _debug_dump_dir = os.getenv("TRITON_SHARED_DUMP_PATH", "")
+    if not _debug_dump_dir:
+        return ""
+
+    kernel_tag = _extract_kernel_tag_from_ir(ir_text)
+    out_dir = os.path.join(_debug_dump_dir, kernel_tag)
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
 
 
 def timer(func):
@@ -202,7 +228,8 @@ class CPUBackend(BaseBackend):
             src_path = os.path.join(tmpdir, "tt.mlir")
             dst_path = os.path.join(tmpdir, "ttshared.mlir")
             Path(src_path).write_text(ttir_code)
-            _dump_ir_if_needed([src_path])
+            kernel_debug_dir = _new_debug_dump_dir(ttir_code)
+            _dump_ir_if_needed(kernel_debug_dir, [src_path])
             triton_shared_opt_path = _get_triton_shared_opt_path()
             try:
                 # If mlir dump is enabled, pass option --mlir-print-ir-after-all to triton-shared
@@ -1391,31 +1418,30 @@ class CPUBackend(BaseBackend):
             llmlir_path = os.path.join(tmpdir, "ll.mlir")
             llir_path = os.path.join(tmpdir, "ll.ir")
             Path(ttshared_path).write_text(ttsharedir)
-            _dump_ir_if_needed([ttshared_path])
+            kernel_debug_dir = _new_debug_dump_dir(ttsharedir)
+            _dump_ir_if_needed(kernel_debug_dir, [ttshared_path])
             context = ir.context()
             triton_shared.ir.load_dialects(context)
             mod = ir.parse_mlir_module(ttshared_path, context)
             pm = ir.pass_manager(context)
             pm.enable_debug()
-            
-            
+
+
             if FORCE_SME or FORCE_SVE or (self.cpu_arch == "aarch64" and {"sme", "sve"} & set(self.cpu_features)):
                 # DEBUG: run passes one at a time and dump IR between each
-                _debug_dump = os.getenv("TRITON_DEBUG_SVE_PASSES", "")
-                if _debug_dump:
-                    _debug_dir = _debug_dump
-                    os.makedirs(_debug_dir, exist_ok=True)
-                    Path(os.path.join(_debug_dir, "00_input.mlir")).write_text(str(mod))
+                if kernel_debug_dir:
+                    os.makedirs(kernel_debug_dir, exist_ok=True)
+                    Path(os.path.join(kernel_debug_dir, "00_input.mlir")).write_text(str(mod))
                     
                     pm1 = ir.pass_manager(context)
                     triton_shared.to_llir.add_transform_interpreter(pm1)
                     pm1.run(mod)
-                    Path(os.path.join(_debug_dir, "01_after_transform_interpreter.mlir")).write_text(str(mod))
+                    Path(os.path.join(kernel_debug_dir, "01_after_transform_interpreter.mlir")).write_text(str(mod))
                     
                     pm2 = ir.pass_manager(context)
                     triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm2)
                     pm2.run(mod)
-                    Path(os.path.join(_debug_dir, "02_after_erase_schedule.mlir")).write_text(str(mod))
+                    Path(os.path.join(kernel_debug_dir, "02_after_erase_schedule.mlir")).write_text(str(mod))
                     
                     pm3 = ir.pass_manager(context)
                     triton_shared.to_llir.add_convert_math_to_libm(pm3)
@@ -1423,22 +1449,22 @@ class CPUBackend(BaseBackend):
                     triton_shared.to_llir.add_convert_to_llvm(pm3)
                     triton_shared.to_llir.add_promote_i1_to_i8(pm3)
                     pm3.run(mod)
-                    Path(os.path.join(_debug_dir, "03_after_convert_to_llvm.mlir")).write_text(str(mod))
+                    Path(os.path.join(kernel_debug_dir, "03_after_convert_to_llvm.mlir")).write_text(str(mod))
                     
                     pm4 = ir.pass_manager(context)
                     triton_shared.to_llir.add_canonicalizer(pm4)
                     pm4.run(mod)
-                    Path(os.path.join(_debug_dir, "04_after_canonicalize.mlir")).write_text(str(mod))
+                    Path(os.path.join(kernel_debug_dir, "04_after_canonicalize.mlir")).write_text(str(mod))
                     
                     pm5 = ir.pass_manager(context)
                     triton_shared.to_llir.add_strip_debug_info(pm5)
                     pm5.run(mod)
-                    Path(os.path.join(_debug_dir, "05_after_strip_debug.mlir")).write_text(str(mod))
+                    Path(os.path.join(kernel_debug_dir, "05_after_strip_debug.mlir")).write_text(str(mod))
 
                     pm6 = ir.pass_manager(context)
                     triton_shared.to_llir.add_llvm_legalize_float8_types(pm6)
                     pm6.run(mod)
-                    Path(os.path.join(_debug_dir, "06_after_legalize_float8.mlir")).write_text(str(mod))
+                    Path(os.path.join(kernel_debug_dir, "06_after_legalize_float8.mlir")).write_text(str(mod))
                 else:
                     triton_shared.to_llir.add_transform_interpreter(pm)
                     triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm)
@@ -1468,14 +1494,14 @@ class CPUBackend(BaseBackend):
 
             # TritonShared-MLIR to LLVM-MLIR
             self._extract_mlir_function(llmlir_path)
-            _dump_ir_if_needed([llmlir_path])
+            _dump_ir_if_needed(kernel_debug_dir, [llmlir_path])
             # LLVM-MLIR to LLVM-IR
             mlir_translate_path = _get_llvm_bin_path("mlir-translate")
             subprocess.check_call([mlir_translate_path, llmlir_path,
                 "--mlir-to-llvmir",
                 "-o",
                 llir_path])
-            _dump_ir_if_needed([llir_path])
+            _dump_ir_if_needed(kernel_debug_dir, [llir_path])
             return Path(llir_path).read_text()
 
 
@@ -1510,7 +1536,8 @@ class CPUBackend(BaseBackend):
             
             subprocess.check_call([llc_path, src_path, "-filetype=obj", "-o", dst_path] + list(flags))
             ## dump binary
-            _dump_ir_if_needed([dst_path])
+            _debug_dump_dir = os.getenv("TRITON_SHARED_DUMP_PATH", "")
+            _dump_ir_if_needed(_debug_dump_dir, [dst_path])
             return Path(dst_path).read_bytes()
 
 
