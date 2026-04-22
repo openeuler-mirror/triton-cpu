@@ -98,10 +98,10 @@ def kernel_bucket_sort_topk(  # grid(B, BS)
         # inval_int16 = tl.where(input_mask, inval_int16, 0)
         # This method would slow down the speed, so using other=float("-inf") saves time.
 
-        over_thre = inval_int16.to(tl.int32) > l_threshold_bin_id
+        over_thre = (inval_int16.to(tl.int32) > l_threshold_bin_id) & input_mask
         cur_sum = tl.sum(over_thre.to(tl.int32), -1)
 
-        eq_thre = inval_int16.to(tl.int32) == l_threshold_bin_id
+        eq_thre = (inval_int16.to(tl.int32) == l_threshold_bin_id) & input_mask
         thre_bin_cur_sum = tl.sum(eq_thre.to(tl.int32), -1)
 
         topk_idx = tl.cumsum(over_thre.to(tl.int32), -1)
