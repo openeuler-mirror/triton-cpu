@@ -571,8 +571,8 @@ public:
                     op->setOperand(0, materializedAddPtr);
                     return success();
                   })
-              .Case<triton::MakeTensorPtrOp,
-                    tts::MakeTensorPtrOp>([&](auto makeTensorPtr) {
+              .Case<triton::MakeTensorPtrOp>([&](triton::MakeTensorPtrOp
+                                                     makeTensorPtr) {
                 // For block pointers, the base could come from a sequence of
                 // `tt.addptr`. Accumulate the target offset with the offset we
                 // have saved.
