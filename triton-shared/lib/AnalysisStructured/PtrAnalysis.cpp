@@ -251,6 +251,63 @@ LogicalResult PtrState::rebuildAsGatherScatter(Value op, int nonContinuousDim) {
   return success();
 }
 
+// Materialize a per-element linear offset tensor:
+//   result[j] = base + stride * j,  for j = 0 .. N-1
+// The output element type matches the element type of `targetTypeRef` (a
+// shaped-type OFR used only for its type).
+static OpFoldResult materializeLinearOffsetTensor(OpFoldResult base,
+                                                  OpFoldResult stride,
+                                                  int64_t N,
+                                                  OpFoldResult targetTypeRef,
+                                                  Location loc,
+                                                  OpBuilder &builder) {
+  // Determine target element type from targetTypeRef.
+  Value targetVal = cast<Value>(targetTypeRef);
+  auto targetShapedTy = cast<ShapedType>(targetVal.getType());
+  Type targetEltTy = targetShapedTy.getElementType();
+  auto targetTensorTy = RankedTensorType::get({N}, targetEltTy);
+
+  // Build arange [0, 1, ..., N-1] as tensor<N x i32> via tt.make_range.
+  auto i32Ty = builder.getI32Type();
+  auto i32TensorTy = RankedTensorType::get({N}, i32Ty);
+  Value arangeI32 =
+      builder
+          .create<triton::MakeRangeOp>(loc, i32TensorTy, /*start=*/0,
+                                       /*end=*/static_cast<uint32_t>(N))
+          .getResult();
+
+  // Cast arange to target element type.
+  Value arange;
+  if (targetEltTy == builder.getIndexType()) {
+    arange = builder.create<arith::IndexCastOp>(loc, targetTensorTy, arangeI32)
+                 .getResult();
+  } else if (targetEltTy.isIntOrIndex()) {
+    unsigned targetWidth = targetEltTy.getIntOrFloatBitWidth();
+    if (targetWidth > 32)
+      arange =
+          builder.create<arith::ExtSIOp>(loc, targetTensorTy, arangeI32)
+              .getResult();
+    else if (targetWidth < 32)
+      arange =
+          builder.create<arith::TruncIOp>(loc, targetTensorTy, arangeI32)
+              .getResult();
+    else
+      arange = arangeI32; // already i32
+  } else {
+    // Fallback: index cast.
+    arange = builder.create<arith::IndexCastOp>(loc, targetTensorTy, arangeI32)
+                 .getResult();
+  }
+
+  OpFoldResult arangeOFR = getAsOpFoldResult(arange);
+  // stride * arange  (element-wise, splat scalar stride to match tensor type).
+  OpFoldResult strideSplat = expandOFRIndex(stride, arangeOFR, loc, builder);
+  OpFoldResult arangeStride = mulOFRs(arangeOFR, strideSplat, loc, builder);
+  // base + stride * arange  (splat scalar base).
+  OpFoldResult baseSplat = expandOFRIndex(base, arangeStride, loc, builder);
+  return addOFRs(baseSplat, arangeStride, loc, builder);
+}
+
 LogicalResult PtrState::addState(const PtrState &lhsState,
                                  const PtrState &rhsState,
                                  bool isAnalysisingUnstructured, Operation *op,
@@ -334,19 +391,59 @@ LogicalResult PtrState::addState(const PtrState &lhsState,
           // offset * stride and new stride is set to 1.
           // Then we'll have strides equal as 1, and merge them as PtrState with
           // same strides.
+          //
+          // Special case: when one side is STRUCTURED (scalar base offset with
+          // non-zero stride representing `base + stride * j` per element) and
+          // the other is UNSTRUCTURED (explicit per-element tensor), we must
+          // materialize the structured side as a concrete linear tensor
+          // [base, base+stride, ..., base+(N-1)*stride] rather than computing
+          // the incorrect `base * stride`.
           if (lhsOffset != rhsOffset && lhsStride != rhsStride) {
-            // Expand offset since unstructured offset has tensor type.
-            OpFoldResult stride =
-                expandOFRIndex(lhsStride, lhsOffset, loc, builder);
-            // new offset = offset * stride
-            lhsOffset = mulOFRs(lhsOffset, stride, loc, builder);
-            // Expand offset since unstructured offset has tensor type.
-            stride = expandOFRIndex(rhsStride, rhsOffset, loc, builder);
-            // new offset = offset * stride
-            rhsOffset = mulOFRs(rhsOffset, stride, loc, builder);
-            // Set both strides to 1.
-            lhsStride = builder.getIndexAttr(1);
-            rhsStride = builder.getIndexAttr(1);
+            if (lhsState.dimIsStructured(i) && !rhsState.dimIsStructured(i)) {
+              // lhs is structured (scalar base + implicit arange stride),
+              // rhs is unstructured (explicit per-element tensor).
+              // Materialize lhs as per-element linear tensor.
+              auto N = getIntAttr(lhsState.sizes[i]);
+              assert(N.has_value() &&
+                     "expected static size for linear offset materialization");
+              lhsOffset = materializeLinearOffsetTensor(lhsOffset, lhsStride,
+                                                        N.value(), rhsOffset,
+                                                        loc, builder);
+              lhsStride = builder.getIndexAttr(1);
+              // Normalize rhs: offset * stride (rhs is already unstructured).
+              OpFoldResult rhsExpandedStride =
+                  expandOFRIndex(rhsStride, rhsOffset, loc, builder);
+              rhsOffset = mulOFRs(rhsOffset, rhsExpandedStride, loc, builder);
+              rhsStride = builder.getIndexAttr(1);
+            } else if (!lhsState.dimIsStructured(i) &&
+                       rhsState.dimIsStructured(i)) {
+              // Symmetric: rhs is structured, lhs is unstructured.
+              auto N = getIntAttr(rhsState.sizes[i]);
+              assert(N.has_value() &&
+                     "expected static size for linear offset materialization");
+              rhsOffset = materializeLinearOffsetTensor(rhsOffset, rhsStride,
+                                                        N.value(), lhsOffset,
+                                                        loc, builder);
+              rhsStride = builder.getIndexAttr(1);
+              OpFoldResult lhsExpandedStride =
+                  expandOFRIndex(lhsStride, lhsOffset, loc, builder);
+              lhsOffset = mulOFRs(lhsOffset, lhsExpandedStride, loc, builder);
+              lhsStride = builder.getIndexAttr(1);
+            } else {
+              // Both unstructured: original logic.
+              // Expand offset since unstructured offset has tensor type.
+              OpFoldResult stride =
+                  expandOFRIndex(lhsStride, lhsOffset, loc, builder);
+              // new offset = offset * stride
+              lhsOffset = mulOFRs(lhsOffset, stride, loc, builder);
+              // Expand offset since unstructured offset has tensor type.
+              stride = expandOFRIndex(rhsStride, rhsOffset, loc, builder);
+              // new offset = offset * stride
+              rhsOffset = mulOFRs(rhsOffset, stride, loc, builder);
+              // Set both strides to 1.
+              lhsStride = builder.getIndexAttr(1);
+              rhsStride = builder.getIndexAttr(1);
+            }
           }
 
           if (lhsStride == rhsStride) {
@@ -1293,10 +1390,13 @@ LogicalResult PtrAnalysis::rewriteAddptrOp(triton::AddPtrOp op) {
       auto maketptrOp = state.createTTSMakeTensorPtrOp(builder, op.getLoc());
       ptrMap.map(op.getResult(), maketptrOp.getResult());
     } else if (enableMakeGatherScatterTensorPtr) {
-      // If there is only one dimension, return failure since there are no
-      // continuous dimensions.
-      if (state.getRank() == 1)
-        return failure();
+      // For rank-1 non-structured (indirect/gather) pointers there is no
+      // "continuous" dimension, but we can still lower them via
+      // MakeGatherScatterTensorPtrOp by treating element 0 as the sole
+      // gather dimension.  The second-pass unstructured analysis and
+      // mergeUnstructuredState work correctly for rank-1: the second pass
+      // computes the full flat offset tensor (e.g. offsets_n * C + tgt),
+      // and StructuredToMemref emits a scalar load/store loop over it.
       PtrState unstructuredState;
       // Switch to unstructured state analysis to create offsets and strides
       // for the non-structured dimension.
