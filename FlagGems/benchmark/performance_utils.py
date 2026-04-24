@@ -37,6 +37,8 @@ if device == "musa":
 elif device == "npu":
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+elif device == "cpu":
+    pass
 else:
     torch_backend_device.matmul.allow_tf32 = False
 
@@ -404,12 +406,13 @@ class Benchmark:
                         )
                         metric.gbps = self.get_gbps(args, latency=metric.latency)
                     if "tflops" in self.to_bench_metrics:
-                        metric.tflops = (
-                            self.get_tflops(self.torch_op, *args, **kwargs)
-                            / metric.latency
-                            / 1e12
-                            * 1e3
-                        )
+                        with flag_gems.use_gems():
+                            metric.tflops = (
+                                self.get_tflops(self.torch_op, *args, **kwargs)
+                                / metric.latency
+                                / 1e12
+                                * 1e3
+                            )
                         # utilization = metric.tflops / metric.latency / 1e12 * 1e3
                 except Exception as e:
                     metric.error_msg = str(e)
