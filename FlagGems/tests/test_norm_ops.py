@@ -651,7 +651,8 @@ def test_accuracy_vectornorm(shape, ord, dim, keepdim, dtype):
     with flag_gems.use_gems():
         res_out = torch.linalg.vector_norm(inp, ord, dim, keepdim)
 
-    gems_assert_close(res_out, ref_out, dtype)
+    reduce_dim = math.prod([shape[i] for i in dim]) if isinstance(dim, list) else shape[dim]
+    gems_assert_close(res_out, ref_out, dtype, reduce_dim=reduce_dim)
 
 
 @pytest.mark.batch_norm
