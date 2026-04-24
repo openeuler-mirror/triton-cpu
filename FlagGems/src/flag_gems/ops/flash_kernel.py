@@ -1378,7 +1378,7 @@ def flash_varlen_fwd_kernel(
         block_shape=(BLOCK_M, BLOCK_K),
         order=(1, 0),
     )
-    bQ = tl.load(gQ.advance([m_block * BLOCK_M, 0]), boundary_check=(0, 1))
+    bQ = tl.load(gQ.advance([m_block * BLOCK_M, 0]), boundary_check=(0, 1), padding_option="zero")
 
     acc_ = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
     rowmax_ = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)

@@ -183,6 +183,7 @@ class CPUBackend(BaseBackend):
         passes.common.add_inliner(pm)
         passes.ttir.add_combine(pm)
         passes.common.add_canonicalizer(pm)
+        passes.ttir.add_rewrite_tensor_pointer(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
         passes.common.add_licm(pm)
