@@ -507,8 +507,14 @@ private:
             ValueRange{strideRow, strideCol});
 
     // Second chunk
+    // Clamp d2 to the number of rows in the modulo range so that block2
+    // never exceeds the modulo boundary.  See createSideBySideCastOps for
+    // rationale.
+    Value modRowCount =
+        rewriter.create<arith::DivSIOp>(loc, modRow, strideRow);
     Value d2 = rewriter.create<arith::SubIOp>(loc, rowSize, d1);
-    SmallVector<Value> sizes2{d2, colSize};
+    Value d2Clamped = rewriter.create<arith::MinSIOp>(loc, d2, modRowCount);
+    SmallVector<Value> sizes2{d2Clamped, colSize};
     memref::ReinterpretCastOp cast2 =
         rewriter.create<memref::ReinterpretCastOp>(
             loc, resultType, adaptor.getBase(), wrappedAroundOff, sizes2,
@@ -788,8 +794,14 @@ private:
     OpFoldResult col1 =
         rewriter.create<memref::DimOp>(loc, block1, 1).getResult();
     OpFoldResult subviewCol1 = minOFRs(col1, subviewColFull, loc, rewriter);
-    OpFoldResult subviewCol2 =
+    OpFoldResult subviewCol2Raw =
         subOFRs(subviewColFull, subviewCol1, loc, rewriter);
+    // Clamp to block2's column dimension so the subview stays in bounds
+    // when the block size exceeds twice the modulo.
+    OpFoldResult col2 =
+        rewriter.create<memref::DimOp>(loc, block2, 1).getResult();
+    OpFoldResult subviewCol2 =
+        minOFRs(subviewCol2Raw, col2, loc, rewriter);
 
     SmallVector<OpFoldResult> offsets(dims.size(), rewriter.getIndexAttr(0));
     SmallVector<OpFoldResult> strides(dims.size(), rewriter.getIndexAttr(1));
@@ -810,8 +822,14 @@ private:
     OpFoldResult row1 =
         rewriter.create<memref::DimOp>(loc, block1, 0).getResult();
     OpFoldResult subviewRow1 = minOFRs(row1, subviewRowFull, loc, rewriter);
-    OpFoldResult subviewRow2 =
+    OpFoldResult subviewRow2Raw =
         subOFRs(subviewRowFull, subviewRow1, loc, rewriter);
+    // Clamp to block2's row dimension so the subview stays in bounds
+    // when the block size exceeds twice the modulo.
+    OpFoldResult row2 =
+        rewriter.create<memref::DimOp>(loc, block2, 0).getResult();
+    OpFoldResult subviewRow2 =
+        minOFRs(subviewRow2Raw, row2, loc, rewriter);
 
     SmallVector<OpFoldResult> offsets(dims.size(), rewriter.getIndexAttr(0));
     SmallVector<OpFoldResult> strides(dims.size(), rewriter.getIndexAttr(1));
@@ -1259,6 +1277,83 @@ public:
   StoreConverter(const TypeConverter &typeConverter, MLIRContext *context)
       : OpConversionPattern<tts::StoreOp>(typeConverter, context) {}
 
+  void createSideBySideStores(Value block1, Value block2, Value src,
+                              Location loc,
+                              ConversionPatternRewriter &rewriter) const {
+    auto zero =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
+    auto one =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
+
+    Value block1Row = rewriter.create<memref::DimOp>(loc, block1, 0);
+    Value block1Col = rewriter.create<memref::DimOp>(loc, block1, 1);
+
+    Value block2Row = rewriter.create<memref::DimOp>(loc, block2, 0);
+    Value block2Col = rewriter.create<memref::DimOp>(loc, block2, 1);
+
+    auto srcType = cast<RankedTensorType>(src.getType());
+    auto elemType = srcType.getElementType();
+
+    // Extract the first slice [0:rows, 0:block1Col] and store to block1.
+    auto slice1Type = RankedTensorType::get(
+        {ShapedType::kDynamic, ShapedType::kDynamic}, elemType);
+    auto slice1 = rewriter.create<tensor::ExtractSliceOp>(
+        loc, slice1Type, src, ValueRange{zero, zero},
+        ValueRange{block1Row, block1Col}, ValueRange{one, one});
+    auto store1 = rewriter.create<bufferization::MaterializeInDestinationOp>(
+        loc, slice1, block1);
+    store1.setWritable(true);
+
+    // Extract the second slice [0:rows, block1Col:block1Col+block2Col]
+    // and store to block2.
+    auto slice2Type = RankedTensorType::get(
+        {ShapedType::kDynamic, ShapedType::kDynamic}, elemType);
+    auto slice2 = rewriter.create<tensor::ExtractSliceOp>(
+        loc, slice2Type, src, ValueRange{zero, block1Col},
+        ValueRange{block2Row, block2Col}, ValueRange{one, one});
+    auto store2 = rewriter.create<bufferization::MaterializeInDestinationOp>(
+        loc, slice2, block2);
+    store2.setWritable(true);
+  }
+
+  void createStackedStores(Value block1, Value block2, Value src, Location loc,
+                           ConversionPatternRewriter &rewriter) const {
+    auto zero =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
+    auto one =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
+
+    Value block1Row = rewriter.create<memref::DimOp>(loc, block1, 0);
+    Value block1Col = rewriter.create<memref::DimOp>(loc, block1, 1);
+
+    Value block2Row = rewriter.create<memref::DimOp>(loc, block2, 0);
+    Value block2Col = rewriter.create<memref::DimOp>(loc, block2, 1);
+
+    auto srcType = cast<RankedTensorType>(src.getType());
+    auto elemType = srcType.getElementType();
+
+    // Extract the first slice [0:block1Row, 0:cols] and store to block1.
+    auto slice1Type = RankedTensorType::get(
+        {ShapedType::kDynamic, ShapedType::kDynamic}, elemType);
+    auto slice1 = rewriter.create<tensor::ExtractSliceOp>(
+        loc, slice1Type, src, ValueRange{zero, zero},
+        ValueRange{block1Row, block1Col}, ValueRange{one, one});
+    auto store1 = rewriter.create<bufferization::MaterializeInDestinationOp>(
+        loc, slice1, block1);
+    store1.setWritable(true);
+
+    // Extract the second slice [block1Row:block1Row+block2Row, 0:cols]
+    // and store to block2.
+    auto slice2Type = RankedTensorType::get(
+        {ShapedType::kDynamic, ShapedType::kDynamic}, elemType);
+    auto slice2 = rewriter.create<tensor::ExtractSliceOp>(
+        loc, slice2Type, src, ValueRange{block1Row, zero},
+        ValueRange{block2Row, block2Col}, ValueRange{one, one});
+    auto store2 = rewriter.create<bufferization::MaterializeInDestinationOp>(
+        loc, slice2, block2);
+    store2.setWritable(true);
+  }
+
   LogicalResult
   matchAndRewrite(tts::StoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -1288,6 +1383,41 @@ public:
       if (op.hasMask())
         mixedDims =
             applyPermutation<OpFoldResult>(mixedDims, transposePermutation);
+    }
+
+    auto ptrDefiningOp = ptr.getDefiningOp();
+    if (ptrDefiningOp &&
+        (ptrDefiningOp->hasAttr(WRAP_SIDE_BY_SIDE) ||
+         ptrDefiningOp->hasAttr(WRAP_STACKED))) {
+      // Transposed block pointers go through a different lowering path and
+      // must not reach the wraparound store rewrite.
+      assert(!originalOrderAttr &&
+             "wraparound pointer must not carry transpose order");
+
+      auto unrealizedCast = cast<UnrealizedConversionCastOp>(ptrDefiningOp);
+      auto memrefs = unrealizedCast.getOperands();
+      assert(memrefs.size() == 2);
+      auto block1 = memrefs[0];
+      auto block2 = memrefs[1];
+
+      if (op.hasMask()) {
+        emitError(op.getLoc())
+            << "masked store with wraparound pointer is not yet supported";
+        return failure();
+      }
+
+      if (unrealizedCast->hasAttr(WRAP_SIDE_BY_SIDE)) {
+        createSideBySideStores(block1, block2, storeValue, loc, rewriter);
+      } else {
+        createStackedStores(block1, block2, storeValue, loc, rewriter);
+      }
+
+      // Do not erase the unrealized_conversion_cast: the same wrap pointer
+      // may have other users (e.g. a subsequent load). Dead code elimination
+      // will clean it up once all users are rewritten. This mirrors the
+      // LoadConverter wraparound path.
+      rewriter.eraseOp(op);
+      return success();
     }
 
     if (op.hasMask()) {
