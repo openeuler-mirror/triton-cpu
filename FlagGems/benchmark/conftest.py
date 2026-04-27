@@ -4,6 +4,7 @@ import os
 
 import pytest
 import torch
+import yaml
 
 import flag_gems
 from benchmark.attri_util import (
@@ -22,6 +23,20 @@ from flag_gems.runtime import torch_device_fn
 
 device = flag_gems.device
 vendor_name = flag_gems.vendor_name
+recordLogger = logging.getLogger("flag_gems_benchmark")
+recordLogger.propagate = False
+
+
+def emit_record_logger(message: str) -> None:
+    if recordLogger.handlers:
+        handler = recordLogger.handlers[0]
+        if getattr(handler, "stream", None) is None:
+            handler.acquire()
+            try:
+                handler.stream = handler._open()
+            finally:
+                handler.release()
+    recordLogger.info(message)
 
 
 class BenchConfig:
@@ -40,9 +55,11 @@ class BenchConfig:
         self.user_desired_metrics = None
         self.shape_file = os.path.join(os.path.dirname(__file__), "core_shapes.yaml")
         self.query = False
+        self.parallel = 0
 
 
 Config = BenchConfig()
+REGISTERED_MARKS = []
 
 
 def pytest_addoption(parser):
@@ -55,8 +72,8 @@ def pytest_addoption(parser):
         required=False,
         choices=["kernel", "operator", "wrapper"],
         help=(
-            "Specify how to measure latency, 'kernel' for device kernel, ",
-            "'operator' for end2end operator or 'wrapper' for runtime wrapper.",
+            "Specify how to measure latency, 'kernel' for device kernel, "
+            "'operator' for end2end operator or 'wrapper' for runtime wrapper."
         ),
     )
 
@@ -120,18 +137,52 @@ def pytest_addoption(parser):
         help="Specify the shape file name for benchmarks. If not specified, a default shape list will be used.",
     )
 
+    try:
+        parser.addoption(
+            "--record",
+            action="store",
+            default="none",
+            required=False,
+            choices=["none", "log"],
+            help="Benchmark info recorded in log files or not",
+        )
+    except ValueError:
+        # Mixed test+benchmark pytest runs may already register --record in
+        # tests/conftest.py. Reuse the existing option in that case.
+        pass
+
     parser.addoption(
-        "--record",
+        "--parallel",
         action="store",
-        default="none",
-        required=False,
-        choices=["none", "log"],
-        help="Benchmark info recorded in log files or not",
+        type=int,
+        default=0,
+        help=(
+            "Enable multi-GPU parallel benchmark execution across shapes. "
+            "Example: --parallel 8 means using GPU 0~7 in parallel. "
+            "Default 0 means serial execution."
+        ),
     )
+
+    try:
+        parser.addoption(
+            "--collect-marks",
+            action="store_true",
+            help="Collect the tests with marker information without executing them",
+        )
+    except ValueError:
+        # Mixed test+benchmark pytest runs may already register this option in
+        # tests/conftest.py. Reuse the existing option in that case.
+        pass
 
 
 def pytest_configure(config):
     global Config  # noqa: F824
+    global REGISTERED_MARKS
+
+    REGISTERED_MARKS = {
+        marker.split(":")[0].strip() for marker in config.getini("markers")
+    }
+
     mode_value = config.getoption(
         "--mode" if vendor_name != "kunlunxin" else "--fg_mode"
     )
@@ -159,18 +210,30 @@ def pytest_configure(config):
     Config.shape_file = shape_file_str
 
     Config.record_log = config.getoption("--record") == "log"
+    Config.parallel = int(config.getoption("--parallel") or 0)
     if Config.record_log:
         cmd_args = [
             arg.replace(".py", "").replace("=", "_").replace("/", "_")
             for arg in config.invocation_params.args
         ]
 
-        logging.basicConfig(
-            filename="result_{}.log".format("_".join(cmd_args)).replace("_-", "-"),
-            filemode="w",
-            level=logging.INFO,
-            format="[%(levelname)s] %(message)s",
-        )
+        log_file = "result_{}.log".format("_".join(cmd_args)).replace("_-", "-")
+
+        for h in list(recordLogger.handlers):
+            recordLogger.removeHandler(h)
+            try:
+                h.close()
+            except Exception as e:
+                import warnings
+
+                warnings.warn(f"Failed to close handler: {e}")
+
+        handler = logging.FileHandler(log_file, mode="w", encoding="utf-8", delay=False)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+        recordLogger.addHandler(handler)
+        recordLogger.setLevel(logging.INFO)
+        emit_record_logger("Benchmark record logger enabled")
 
 
 BUILTIN_MARKS = {
@@ -198,13 +261,13 @@ def setup_once(request):
     #     print(note_info)
 
 
-@pytest.fixture(scope="function", autouse=flag_gems.device != "cpu")
+@pytest.fixture(scope="function", autouse=True)
 def clear_function_cache():
     yield
     torch_device_fn.empty_cache()
 
 
-@pytest.fixture(scope="module", autouse=flag_gems.device != "cpu")
+@pytest.fixture(scope="module", autouse=True)
 def clear_module_cache():
     yield
     torch_device_fn.empty_cache()
@@ -237,6 +300,35 @@ def extract_and_log_op_attributes(request):
         pytest.skip("Skipping benchmark due to the query parameter.")
 
     yield
-
     if Config.record_log and op_attributes:
-        logging.info(json.dumps(op_attributes, indent=2))
+        emit_record_logger(json.dumps(op_attributes, indent=2))
+
+
+def pytest_collection_modifyitems(session, config, items):
+    if config.getoption("--collect-marks"):
+        report = []
+        for item in items:
+            data = {}
+
+            # Collect some general information
+            if item.cls:
+                data["class"] = item.cls.__name__
+            data["test_case"] = item.name
+            if item.originalname:
+                data["function"] = item.originalname
+            data["file"] = item.location[0]
+
+            all_marks = list(item.iter_markers())
+            op_marks = [
+                mark.name
+                for mark in all_marks
+                if mark.name not in BUILTIN_MARKS and mark.name not in REGISTERED_MARKS
+            ]
+
+            data["marks"] = op_marks
+            report.append(data)
+
+        print(yaml.dump(report, indent=2))
+
+        # Skip all tests
+        items.clear()
