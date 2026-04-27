@@ -72,16 +72,15 @@ def triton_sparse_mla_fwd(
 
     q_ptr = q_base + offs_h[:, None] * stride_qh + offs_d[None, :] * stride_qd
     q_msk = mask_h[:, None] & mask_d[None, :]
-    q_blk = tl.load(q_ptr, q_msk, other=0.0).to(tl.float16)
+    q_blk = tl.load(q_ptr, q_msk, other=0.0).to(tl.float32)
 
     tq_ptr = tq_base + offs_h[:, None] * stride_qh + offs_td[None, :] * stride_qd
     tq_msk = mask_h[:, None] & mask_td[None, :]
-    tq_blk = tl.load(tq_ptr, tq_msk, other=0.0).to(tl.float16)
+    tq_blk = tl.load(tq_ptr, tq_msk, other=0.0).to(tl.float32)
 
-    max_log = tl.full([BH], float("-inf"), dtype=tl.float16)
-    sum_exp = tl.full([BH], 1.0, dtype=tl.float16)
-    acc = tl.zeros([BH, DP], dtype=tl.float16)
-    qk = tl.zeros([BH, BK], dtype=tl.float16)
+    max_log = tl.full([BH], float("-inf"), dtype=tl.float32)
+    sum_exp = tl.full([BH], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BH, DP], dtype=tl.float32)
 
     log_scale: tl.constexpr = sm_scale * 1.44269504
 
@@ -102,33 +101,33 @@ def triton_sparse_mla_fwd(
                 kv_base + offs_d[:, None] * stride_kvd + kv_ids[None, :] * stride_kvn
             )
             kv_msk = mask_d[:, None] & mask_ids[None, :]
-            kv_blk = tl.load(kv_ptr, kv_msk, other=0.0).to(tl.float16)  # [DP, BK]
+            kv_blk = tl.load(kv_ptr, kv_msk, other=0.0).to(tl.float32)  # [DP, BK]
 
             tkv_ptr = (
                 tkv_base + offs_td[:, None] * stride_kvd + kv_ids[None, :] * stride_kvn
             )
             tkv_msk = mask_td[:, None] & mask_ids[None, :]
-            tkv_blk = tl.load(tkv_ptr, tkv_msk, other=0.0).to(tl.float16)  # [TDP, BK]
+            tkv_blk = tl.load(tkv_ptr, tkv_msk, other=0.0).to(tl.float32)  # [TDP, BK]
 
-            qk = tl.dot(q_blk, kv_blk, out_dtype=tl.float16)
-            qk = tl.dot(tq_blk, tkv_blk, qk, out_dtype=tl.float16) * log_scale
-            # qk = tl.dot(tq_blk, tkv_blk, qk, out_dtype=tl.float16) * sm_scale
+            qk = tl.dot(q_blk, kv_blk, out_dtype=tl.float32)
+            qk = tl.dot(tq_blk, tkv_blk, qk, out_dtype=tl.float32) * log_scale
+            # qk = tl.dot(tq_blk, tkv_blk, qk, out_dtype=tl.float32) * sm_scale
 
             qk = tl.where(mask_ids[None, :], qk, float("-inf"))  # [BH, BK]
 
             new_max = tl.maximum(max_log, tl.max(qk, axis=1))
-            exp_qk = tl.math.exp2(qk - new_max[:, None]).to(tl.float16)
-            # exp_qk = tl.math.exp(qk - new_max[:, None]).to(tl.float16)
+            exp_qk = tl.math.exp2(qk - new_max[:, None])
+            # exp_qk = tl.math.exp(qk - new_max[:, None])
             sum_qk = tl.sum(exp_qk, axis=1)
-            alpha = tl.math.exp2(max_log - new_max).to(tl.float16)
-            # alpha = tl.math.exp(max_log - new_max).to(tl.float16)
+            alpha = tl.math.exp2(max_log - new_max)
+            # alpha = tl.math.exp(max_log - new_max)
             sum_exp = sum_exp * alpha + sum_qk
             acc = acc * alpha[:, None]
             acc = tl.dot(
-                exp_qk, kv_blk.trans(), acc, out_dtype=tl.float16
+                exp_qk, kv_blk.trans(), acc, out_dtype=tl.float32
             )  # [BH, BK] @ [BK, DP] = [BH, DP]
 
-            max_log = new_max.to(tl.float16)
+            max_log = new_max
 
     out_vals = acc / sum_exp[:, None]
     o_ptr = o_base + offs_h[:, None] * stride_oh + offs_od[None, :] * stride_od
