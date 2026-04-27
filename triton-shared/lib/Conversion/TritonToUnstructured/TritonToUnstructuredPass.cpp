@@ -440,7 +440,8 @@ public:
                 .Case<tts::MakeGatherScatterTensorPtrOp>(
                     [&](Operation *op) { return success(); })
                 .Case<triton::LoadOp, triton::StoreOp, triton::MakeTensorPtrOp,
-                      tts::MakeTensorPtrOp, triton::AtomicCASOp>(
+                      tts::MakeTensorPtrOp, triton::AtomicCASOp,
+                      triton::AtomicRMWOp>(
                     [&](Operation *op) {
                   // Special case:
                   // We do not want to create "unstructured tensor pointer" into
@@ -526,6 +527,18 @@ public:
               .Case<triton::LoadOp>([&](triton::LoadOp load) {
                 auto offsetInfo = offsetMap.at(load.getPtr());
 
+                // Scalar loads (non-tensor pointer) cannot be lowered to
+                // tts.gather which requires a tensor result type. Instead,
+                // re-materialize the pointer as tt.addptr(base, offset) and
+                // leave the load for downstream passes.
+                if (!isa<RankedTensorType>(load.getType())) {
+                  auto materializedAddPtr = b.create<triton::AddPtrOp>(
+                      loc, offsetInfo.ptrType, offsetInfo.ptr,
+                      offsetInfo.offset);
+                  load.getPtrMutable().set(materializedAddPtr);
+                  return success();
+                }
+
                 auto other = load.getOther();
 
                 if (other) {
@@ -546,6 +559,19 @@ public:
               })
               .Case<triton::StoreOp>([&](triton::StoreOp store) {
                 auto offsetInfo = offsetMap.at(store.getPtr());
+
+                // Scalar stores (non-tensor value) cannot be lowered to
+                // tts.scatter which requires a tensor operand. Instead,
+                // re-materialize the pointer as tt.addptr(base, offset) and
+                // leave the store for downstream passes.
+                if (!isa<RankedTensorType>(store.getValue().getType())) {
+                  auto materializedAddPtr = b.create<triton::AddPtrOp>(
+                      loc, offsetInfo.ptrType, offsetInfo.ptr,
+                      offsetInfo.offset);
+                  store.getPtrMutable().set(materializedAddPtr);
+                  return success();
+                }
+
                 b.create<tts::ScatterOp>(loc, offsetInfo.ptr, offsetInfo.offset,
                                          store.getValue(), store.getMask());
                 store->erase();
@@ -571,8 +597,29 @@ public:
                     op->setOperand(0, materializedAddPtr);
                     return success();
                   })
+              .Case<triton::AtomicRMWOp>([&](triton::AtomicRMWOp op) {
+                    // Re-materialize the pointer as tt.addptr(base, offset) so
+                    // that downstream patterns can handle it uniformly, whether
+                    // the pointer is scalar or a tensor (e.g. broadcast pattern).
+                    auto ptrOperand = op.getPtr();
+                    auto offsetInfo = offsetMap.at(ptrOperand);
+                    Value basePtr = offsetInfo.ptr;
+
+                    // If the resolved pointer type is a tensor but the base is
+                    // a scalar (e.g. broadcast pattern), splat it to match.
+                    if (isa<RankedTensorType>(offsetInfo.ptrType) &&
+                        !isa<RankedTensorType>(basePtr.getType())) {
+                      basePtr = b.create<triton::SplatOp>(
+                          loc, offsetInfo.ptrType, basePtr);
+                    }
+
+                    auto materializedAddPtr = b.create<triton::AddPtrOp>(
+                        loc, offsetInfo.ptrType, basePtr, offsetInfo.offset);
+                    op.getPtrMutable().set(materializedAddPtr);
+                    return success();
+                  })
               .Case<triton::MakeTensorPtrOp>([&](triton::MakeTensorPtrOp
-                                                     makeTensorPtr) {
+                                        makeTensorPtr) {
                 // For block pointers, the base could come from a sequence of
                 // `tt.addptr`. Accumulate the target offset with the offset we
                 // have saved.
