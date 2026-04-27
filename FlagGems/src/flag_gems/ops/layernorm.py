@@ -246,7 +246,7 @@ def layer_norm_backward_kernel(
     Rstd += pid
 
     mean = tl.load(Mean, mask=row_mask).to(tl.float32)
-    rstd = tl.load(Rstd, mask=row_mask).to(tl.float32)
+    rstd = tl.load(Rstd, mask=row_mask, other=0.0).to(tl.float32)
 
     dx_part2 = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
     dx_part3 = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
@@ -255,14 +255,14 @@ def layer_norm_backward_kernel(
         cols = off + tl.arange(0, BLOCK_COL_SIZE)
         col_mask = cols[None, :] < N
         mask = row_mask and col_mask
-        dy = tl.load(dY + cols[None, :], mask).to(tl.float32)
+        dy = tl.load(dY + cols[None, :], mask, other=0.0).to(tl.float32)
         x = tl.load(X + cols[None, :], mask).to(tl.float32)
         x = tl.where(mask, x - mean, 0.0)
         x_hat = x * rstd
         if W is None:
             w = 1
         else:
-            w = tl.load(W + cols, mask=cols < N).to(tl.float32)
+            w = tl.load(W + cols, mask=cols < N, other=0.0).to(tl.float32)
         dx_hat = dy * w
         dx_part2 += dx_hat
         dx_part3 += dx_hat * x_hat
@@ -274,12 +274,12 @@ def layer_norm_backward_kernel(
         cols = off + tl.arange(0, BLOCK_COL_SIZE)
         col_mask = cols[None, :] < N
         mask = row_mask and col_mask
-        dy = tl.load(dY + cols[None, :], mask).to(tl.float32)
+        dy = tl.load(dY + cols[None, :], mask, other=0.0).to(tl.float32)
         x = tl.load(X + cols[None, :], mask).to(tl.float32)
         if W is None:
             w = 1
         else:
-            w = tl.load(W + cols, mask=cols < N).to(tl.float32)
+            w = tl.load(W + cols, mask=cols < N, other=0.0).to(tl.float32)
         x = tl.where(mask, x - mean, 0.0)
         x_hat = x * rstd
         dx_hat = dy * w
@@ -315,10 +315,10 @@ def weight_bias_backward_kernel(
         rows = off + tl.arange(0, BLOCK_ROW_SIZE)[:, None]
         row_mask = rows < M
         mask = row_mask and col_mask[None, :]
-        dy = tl.load(dY + rows * N, mask).to(tl.float32)
+        dy = tl.load(dY + rows * N, mask, other=0.0).to(tl.float32)
         x = tl.load(X + rows * N, mask).to(tl.float32)
-        mean = tl.load(Mean + rows, mask=rows < M).to(tl.float32)
-        rstd = tl.load(Rstd + rows, mask=rows < M).to(tl.float32)
+        mean = tl.load(Mean + rows, mask=rows < M, other=0.0).to(tl.float32)
+        rstd = tl.load(Rstd + rows, mask=rows < M, other=0.0).to(tl.float32)
         x = tl.where(mask, x - mean, 0.0)
         accW += dy * x * rstd
         accB += dy
