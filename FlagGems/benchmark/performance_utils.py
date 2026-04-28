@@ -38,6 +38,8 @@ if device == "musa":
 elif device == "npu":
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+elif device == "cpu":
+    pass
 else:
     # Attempt to disallow tf32
     try:
@@ -194,7 +196,13 @@ class Benchmark:
 
                 # self.shapes = additional_shapes
                 if additional_shapes:
-                    self.shapes = list(dict.fromkeys(self.shapes + additional_shapes))
+                    normalized_additional_shapes = [
+                        tuple(shape) if isinstance(shape, list) else shape
+                        for shape in additional_shapes
+                    ]
+                    self.shapes = list(
+                        dict.fromkeys(self.shapes + normalized_additional_shapes)
+                    )
 
                 if vendor_name == "enflame":
                     if self.op_name in ["isin"]:
@@ -422,12 +430,13 @@ class Benchmark:
                         metric.gbps = self.get_gbps(args, latency=metric.latency)
 
                     if "tflops" in self.to_bench_metrics:
-                        metric.tflops = (
-                            self.get_tflops(self.torch_op, *args, **kwargs)
-                            / metric.latency
-                            / 1e12
-                            * 1e3
-                        )
+                        with flag_gems.use_gems(exclude=["zero_"]):
+                            metric.tflops = (
+                                self.get_tflops(self.torch_op, *args, **kwargs)
+                                / metric.latency
+                                / 1e12
+                                * 1e3
+                            )
                         # utilization = metric.tflops / metric.latency / 1e12 * 1e3
                 except (RuntimeError, Exception) as e:
                     metric.error_msg = str(e)
