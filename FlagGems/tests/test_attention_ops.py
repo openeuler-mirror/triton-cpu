@@ -210,7 +210,7 @@ def torch_sdpa(q, k, v, scale, is_causal, enable_gqa=False):
             is_causal=is_causal,
         )
     else:
-        if flag_gems.vendor_name == "iluvatar" and TO_CPU:
+        if flag_gems.vendor_name in ["iluvatar", "kunpeng"] and TO_CPU:
             from torch.nn.attention import SDPBackend, sdpa_kernel
 
             ctx = sdpa_kernel(backends=[SDPBackend.MATH])
