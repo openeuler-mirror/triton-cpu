@@ -247,6 +247,15 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
                                          "unsupported base ptr for addptr op");
     };
 
+    // Helper: for a pointer value of ptr::PtrType or tptr::TPtrType that has
+    // already been processed by TritonToPtrPass (i.e. it may be a PtrAddOp
+    // result encoding a byte offset), use tptr::ToMemrefOp to get a
+    // Get the scalar element type from the value operand (ptr::PtrType is
+    // opaque and carries no element type itself).
+    Type scalarElemTy = val.getType();
+    if (auto tensorTy = dyn_cast<RankedTensorType>(scalarElemTy))
+      scalarElemTy = tensorTy.getElementType();
+
     if (auto fromMemref = tritonPtr.getDefiningOp<tptr::FromMemrefOp>()) {
       indices.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
       memref = fromMemref.getOperand();
@@ -362,16 +371,25 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
           return rewriter.notifyMatchFailure(op, "unsupported addptr");
       } else if (auto addPtrOp =
                      castOp.getOperand(0).getDefiningOp<tptr::PtrAddOp>()) {
-        if (failed(resolvePtr(addPtrOp.getOperand(0), addPtrOp.getOffset())))
-          return rewriter.notifyMatchFailure(op, "unsupported addptr");
+        // The ptradd result already encodes a byte-offset.  Using
+        // resolvePtr() here would incorrectly pass the byte offset as an
+        // element index (e.g. offset=4 for f32 element 1).  Instead, use
+        // tptr::ToMemrefOp on the ptr::PtrType value so the byte addressing
+        // is handled correctly and we access the result at element index 0.
+        Value ptrVal = castOp.getOperand(0); // !ptr.ptr<...>
+        memref = rewriter.create<tptr::ToMemrefOp>(
+            loc, MemRefType::get({1}, scalarElemTy), ptrVal);
+        indices.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
       } else
         return rewriter.notifyMatchFailure(op, "unsupported cast");
     } else if (auto addPtrOp = tritonPtr.getDefiningOp<triton::AddPtrOp>()) {
       if (failed(resolvePtr(addPtrOp.getPtr(), addPtrOp.getOffset())))
         return rewriter.notifyMatchFailure(op, "unsupported addptr");
     } else if (auto addPtrOp = tritonPtr.getDefiningOp<tptr::PtrAddOp>()) {
-      if (failed(resolvePtr(addPtrOp.getOperand(0), addPtrOp.getOffset())))
-        return rewriter.notifyMatchFailure(op, "unsupported addptr");
+      // Direct tptr.ptradd — byte offset, use ToMemrefOp at index 0.
+      memref = rewriter.create<tptr::ToMemrefOp>(
+          loc, MemRefType::get({1}, scalarElemTy), tritonPtr);
+      indices.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
     } else {
       return rewriter.notifyMatchFailure(op, "unsupported Triton pointer");
     }
