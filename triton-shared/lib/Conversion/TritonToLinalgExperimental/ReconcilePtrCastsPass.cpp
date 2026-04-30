@@ -347,6 +347,8 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
             SmallVector<Value, 1> memIndices{zeroIdx};
             auto atomic = nestedBuilder.create<memref::AtomicRMWOp>(
                 nestedLoc, kindAttr, laneVal, laneMemref, memIndices);
+            if (auto memSemantic = op->getAttr("sem"))
+              atomic->setAttr("sem", memSemantic);
 
             // 5. Insert the atomic result back into the current tensor
             Value updatedTensor = nestedBuilder.create<tensor::InsertOp>(
@@ -401,6 +403,8 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
           [&](OpBuilder &b, Location l) {
             Value atomic = b.create<memref::AtomicRMWOp>(l, kindAttr, val,
                                                          memref, indices);
+            if (auto memSemantic = op->getAttr("sem"))
+              atomic.getDefiningOp()->setAttr("sem", memSemantic);
             b.create<scf::YieldOp>(l, atomic);
           },
           /*elseBuilder=*/
@@ -414,8 +418,11 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
       rewriter.replaceOp(op, ifOp.getResult(0));
     } else {
       // Replace with memref.atomic_rmw
-      rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kindAttr, val,
+      auto atomic = rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op,
+                                                       kindAttr, val,
                                                        memref, indices);
+      if (auto memSemantic = op->getAttr("sem"))
+        atomic->setAttr("sem", memSemantic);
     }
 
     return success();
@@ -511,6 +518,8 @@ struct AtomicCASOpConversion : public OpConversionPattern<AtomicCASOp> {
             auto genericOp = nestedBuilder.create<memref::GenericAtomicRMWOp>(
                    nestedLoc, laneMemref, memIndices);
             Value currentValue = genericOp.getCurrentValue();
+            if (auto memSemantic = op->getAttr("sem"))
+              genericOp->setAttr("sem", memSemantic);
 
             OpBuilder bodyBuilder =
               OpBuilder::atBlockEnd(genericOp.getBody(), rewriter.getListener());
@@ -562,6 +571,8 @@ struct AtomicCASOpConversion : public OpConversionPattern<AtomicCASOp> {
     SmallVector<Value, 1> memIndices{zeroIdx};
     auto genericOp = rewriter.create<memref::GenericAtomicRMWOp>(
                    loc, memref, memIndices);
+    if (auto memSemantic = op->getAttr("sem"))
+      genericOp->setAttr("sem", memSemantic);
     Value currentValue = genericOp.getCurrentValue();
 
     OpBuilder bodyBuilder =
