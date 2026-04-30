@@ -177,7 +177,9 @@ struct ToMemrefConverter : public OpRewritePattern<UnrealizedConversionCastOp> {
   }
 };
 
-static std::optional<arith::AtomicRMWKind> mapTritonToMLIR(uint32_t triKind) {
+static std::optional<arith::AtomicRMWKind> mapTritonToMLIR(uint32_t triKind,
+                                                            Type valType) {
+  bool isFloat = isa<FloatType>(valType);
   switch (triKind) {
   case 1:
     return arith::AtomicRMWKind::andi; // Triton AND
@@ -190,9 +192,11 @@ static std::optional<arith::AtomicRMWKind> mapTritonToMLIR(uint32_t triKind) {
   case 5:
     return arith::AtomicRMWKind::addf; // Triton FADD
   case 6:
-    return arith::AtomicRMWKind::maxs; // Triton signed max
+    // Triton max: use float variant for floating-point value types
+    return isFloat ? arith::AtomicRMWKind::maximumf : arith::AtomicRMWKind::maxs;
   case 7:
-    return arith::AtomicRMWKind::mins; // Triton signed min
+    // Triton min: use float variant for floating-point value types
+    return isFloat ? arith::AtomicRMWKind::minimumf : arith::AtomicRMWKind::mins;
   case 8:
     return arith::AtomicRMWKind::maxu; // Triton unsigned max
   case 9:
@@ -220,7 +224,7 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
       return rewriter.notifyMatchFailure(op, "missing Triton atomic kind");
 
     uint32_t triKind = kindIntAttr.getInt();
-    auto mlirKindOpt = mapTritonToMLIR(triKind);
+    auto mlirKindOpt = mapTritonToMLIR(triKind, val.getType());
     if (!mlirKindOpt)
       return rewriter.notifyMatchFailure(op, "unsupported Triton atomic kind");
 
@@ -369,7 +373,7 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
               castOp.getOperand(0).getDefiningOp<triton::AddPtrOp>()) {
         if (failed(resolvePtr(addPtrOp.getPtr(), addPtrOp.getOffset())))
           return rewriter.notifyMatchFailure(op, "unsupported addptr");
-      } else if (auto addPtrOp =
+      } else if (auto ptrAddOp =
                      castOp.getOperand(0).getDefiningOp<tptr::PtrAddOp>()) {
         // The ptradd result already encodes a byte-offset.  Using
         // resolvePtr() here would incorrectly pass the byte offset as an
