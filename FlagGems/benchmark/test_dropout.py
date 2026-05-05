@@ -8,6 +8,8 @@ from . import performance_utils as base
 @pytest.mark.dropout
 def test_dropout():
     bench = base.UnaryPointwiseBenchmark(
-        op_name="dropout", torch_op=torch.nn.Dropout(p=0.5), dtypes=attrs.FLOAT_DTYPES
+        op_name="dropout",
+        torch_op=lambda x: torch.ops.aten.native_dropout(x, 0.5, True),
+        dtypes=attrs.FLOAT_DTYPES,
     )
     bench.run()
