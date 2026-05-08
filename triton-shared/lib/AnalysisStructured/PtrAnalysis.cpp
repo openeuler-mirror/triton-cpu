@@ -398,17 +398,24 @@ LogicalResult PtrState::addState(const PtrState &lhsState,
           // materialize the structured side as a concrete linear tensor
           // [base, base+stride, ..., base+(N-1)*stride] rather than computing
           // the incorrect `base * stride`.
+          // However, if stride is 0 (from splat/expandDims), it means all
+          // elements point to the same offset, so we should not materialize
+          // a linear tensor - instead just splat the scalar offset to tensor.
           if (lhsOffset != rhsOffset && lhsStride != rhsStride) {
             if (lhsState.dimIsStructured(i) && !rhsState.dimIsStructured(i)) {
-              // lhs is structured (scalar base + implicit arange stride),
-              // rhs is unstructured (explicit per-element tensor).
-              // Materialize lhs as per-element linear tensor.
               auto N = getIntAttr(lhsState.sizes[i]);
               assert(N.has_value() &&
                      "expected static size for linear offset materialization");
-              lhsOffset = materializeLinearOffsetTensor(lhsOffset, lhsStride,
-                                                        N.value(), rhsOffset,
-                                                        loc, builder);
+              // If stride is 0 (from splat), just splat the offset to tensor
+              // instead of creating a linear offset tensor. All elements
+              // will have the same offset value.
+              if (hasConstZero(lhsState.strides[i])) {
+                lhsOffset = expandOFRIndex(lhsOffset, rhsOffset, loc, builder);
+              } else {
+                lhsOffset = materializeLinearOffsetTensor(lhsOffset, lhsStride,
+                                                          N.value(), rhsOffset,
+                                                          loc, builder);
+              }
               lhsStride = builder.getIndexAttr(1);
               // Normalize rhs: offset * stride (rhs is already unstructured).
               OpFoldResult rhsExpandedStride =
@@ -417,13 +424,19 @@ LogicalResult PtrState::addState(const PtrState &lhsState,
               rhsStride = builder.getIndexAttr(1);
             } else if (!lhsState.dimIsStructured(i) &&
                        rhsState.dimIsStructured(i)) {
-              // Symmetric: rhs is structured, lhs is unstructured.
               auto N = getIntAttr(rhsState.sizes[i]);
               assert(N.has_value() &&
                      "expected static size for linear offset materialization");
-              rhsOffset = materializeLinearOffsetTensor(rhsOffset, rhsStride,
-                                                        N.value(), lhsOffset,
-                                                        loc, builder);
+              // If stride is 0 (from splat), just splat the offset to tensor
+              // instead of creating a linear offset tensor. All elements
+              // will have the same offset value.
+              if (hasConstZero(rhsState.strides[i])) {
+                rhsOffset = expandOFRIndex(rhsOffset, lhsOffset, loc, builder);
+              } else {
+                rhsOffset = materializeLinearOffsetTensor(rhsOffset, rhsStride,
+                                                          N.value(), lhsOffset,
+                                                          loc, builder);
+              }
               rhsStride = builder.getIndexAttr(1);
               OpFoldResult lhsExpandedStride =
                   expandOFRIndex(lhsStride, lhsOffset, loc, builder);
