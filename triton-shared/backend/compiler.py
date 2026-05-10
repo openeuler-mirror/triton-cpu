@@ -1501,11 +1501,13 @@ class CPUBackend(BaseBackend):
                 flags = (
                     "-mtriple=aarch64-linux-gnu",
                     "-mattr=+sme,+dotprod",
+                    "-disable-interleaved-load-combine=true",
                 )
             elif FORCE_SVE or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
                 flags = (
                     "-mtriple=aarch64-linux-gnu",
                     "-mattr=+sve,+dotprod",
+                    "-disable-interleaved-load-combine=true",
                 )
             
             subprocess.check_call([llc_path, src_path, "-filetype=obj", "-o", dst_path] + list(flags))
