@@ -433,10 +433,17 @@ class CompiledKernel:
         self.module, self.function, self.n_regs, self.n_spills = driver.active.utils.load_binary(
             self.name, self.kernel, self.metadata.shared, device)
 
-    def __getattribute__(self, name):
+    def __getattr__(self, name):
+        # __getattr__ is only called when normal lookup fails (i.e. the attribute
+        # is absent from __dict__).  self.run is not set in __init__, so the first
+        # access lands here, initialises handles, and stores self.run in __dict__.
+        # Subsequent accesses find it in __dict__ and never reach this method,
+        # avoiding the per-call overhead of __getattribute__ which fired on every
+        # attribute access (12x per kernel invocation even after initialisation).
         if name == 'run':
             self._init_handles()
-        return super().__getattribute__(name)
+            return self.run
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def launch_metadata(self, grid, stream, *args):
         if CompiledKernel.launch_enter_hook is None:
