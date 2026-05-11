@@ -273,6 +273,11 @@ def compile_module(launcher_src, kernel_placeholder_name):
     cpu_backend_path = Path(__file__).resolve().parent
     include_dir = os.path.join(cpu_backend_path, "include")
 
+    # Mutable cell: _cached_key[0] holds the MD5 hex string after the first call.
+    # kernel_obj (cu_function) and kernel_name are fixed for a given compiled kernel,
+    # so src and therefore the key never change across calls to this closure.
+    _cached_key = [None]
+
     def launch(
         gridX, gridY, gridZ, stream, cu_function,
         kernel_metadata, launch_metadata,
@@ -283,11 +288,20 @@ def compile_module(launcher_src, kernel_placeholder_name):
         # See CPUUtils.load_binary method.
         kernel_obj = cu_function
         kernel_name = kernel_metadata[6] # see pack_metadata in compiler.py
+
+        # Fast path: key and .so are both cached — skip MD5, src build, and all filesystem work.
+        if _cached_key[0] is not None and _cached_key[0] in _LAUNCHER_MODULE_CACHE:
+            return _LAUNCHER_MODULE_CACHE[_cached_key[0]](gridX, gridY, gridZ,
+                                                          kernel_metadata, launch_metadata,
+                                                          launch_enter_hook, launch_exit_hook,
+                                                          *args)
+
         src = launcher_src.replace(kernel_placeholder_name, kernel_name)
-
         key = hashlib.md5(src.encode("utf-8") + kernel_obj).hexdigest()
+        _cached_key[0] = key
 
-        # Fast path: .so already loaded in this process — skip all filesystem work.
+        # Second fast path: module already loaded (e.g. from a prior process run that
+        # populated _LAUNCHER_MODULE_CACHE) but _cached_key was not yet set.
         if key in _LAUNCHER_MODULE_CACHE:
             return _LAUNCHER_MODULE_CACHE[key](gridX, gridY, gridZ,
                                                kernel_metadata, launch_metadata,
