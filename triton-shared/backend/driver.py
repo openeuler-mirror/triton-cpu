@@ -4,6 +4,11 @@ import sysconfig
 import time
 import triton
 
+# Maps MD5 launcher key -> loaded mod.launch function.
+# Avoids re-instantiating FileCacheManager (and its ~100µs of Path.home() +
+# lstat syscalls) on every kernel dispatch once the .so is already loaded.
+_LAUNCHER_MODULE_CACHE: dict = {}
+
 import os, subprocess, tempfile, platform
 import importlib
 import importlib.util
@@ -281,6 +286,14 @@ def compile_module(launcher_src, kernel_placeholder_name):
         src = launcher_src.replace(kernel_placeholder_name, kernel_name)
 
         key = hashlib.md5(src.encode("utf-8") + kernel_obj).hexdigest()
+
+        # Fast path: .so already loaded in this process — skip all filesystem work.
+        if key in _LAUNCHER_MODULE_CACHE:
+            return _LAUNCHER_MODULE_CACHE[key](gridX, gridY, gridZ,
+                                               kernel_metadata, launch_metadata,
+                                               launch_enter_hook, launch_exit_hook,
+                                               *args)
+
         cache = get_cache_manager(key)
         name = "__triton_shared_ref_cpu_kernel_launcher"
 
@@ -332,6 +345,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
             raise RuntimeError(f"Cannot find {name} module in {cache_path}")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+        _LAUNCHER_MODULE_CACHE[key] = mod.launch
         return mod.launch(gridX, gridY, gridZ,
                           kernel_metadata, launch_metadata,
                           launch_enter_hook, launch_exit_hook,
