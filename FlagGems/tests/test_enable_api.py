@@ -16,7 +16,8 @@ def get_path_log_name():
     This phenomenon is related to the filehandler of the logging system.
     The current solution is to clear the current test log content after reading it.
     """
-    return "./gems_enable_test.log"
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "master")
+    return f"./gems_enable_test_{worker_id}.log"
 
 
 def save_log_file(ori_log, sv_log):
