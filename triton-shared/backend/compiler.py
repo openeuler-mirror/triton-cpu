@@ -55,7 +55,7 @@ def _extract_kernel_tag_from_ir(ir_text: str) -> str:
     m = re.search(r'sym_name\s*=\s*"([^"]+)"', ir_text)
     if m:
         return _sanitize_dump_component(m.group(1))
-    m = re.search(r'@([A-Za-z_.$][A-Za-z0-9_.$]*)\s*\(', ir_text)
+    m = re.search(r'@([A-Za-z_.$][A-Za-z0-9_.$]*kernel[A-Za-z0-9_.$]*)\s*\(', ir_text)
     if m:
         return _sanitize_dump_component(m.group(1))
     return "unknown"
