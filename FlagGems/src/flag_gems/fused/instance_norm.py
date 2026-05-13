@@ -331,51 +331,61 @@ def instance_norm_backward_kernel(
     BLOCK_COL_SIZE: tl.constexpr,
     HAS_WEIGHT_BIAS: tl.constexpr,
 ):
-    pid = tl.program_id(0) * BLOCK_ROW_SIZE + tl.arange(0, BLOCK_ROW_SIZE)[:, None]
-    c_offsets = pid % C
+    pid = tl.program_id(0) * BLOCK_ROW_SIZE + tl.arange(0, BLOCK_ROW_SIZE)
     row_mask = pid < M
-    dY += pid * N
-    X += pid * N
-    dX += pid * N
-    Mean += pid
-    Rstd += pid
+    
+    # Cast row indices to int64 to prevent overflow during large offset calculations (e.g., Row * N)
+    offsets_row_i64 = pid.to(tl.int64)
+    c_offsets = (offsets_row_i64 % C).to(tl.int32)
 
-    mean = tl.load(Mean, mask=row_mask, other=0.0).to(tl.float32)
-    rstd = tl.load(Rstd, mask=row_mask, other=1.0).to(tl.float32)
+    # Use absolute offsets rather than pointer increments to simplify backend pointer analysis
+    mean = tl.load(Mean + offsets_row_i64, mask=row_mask, other=0.0).to(tl.float32)[:, None]
+    rstd = tl.load(Rstd + offsets_row_i64, mask=row_mask, other=0.0).to(tl.float32)[:, None]
+    
     if HAS_WEIGHT_BIAS:
-        w = tl.load(W + c_offsets, mask=row_mask).to(tl.float32)
+        w = tl.load(W + c_offsets, mask=row_mask, other=0.0).to(tl.float32)[:, None]
     else:
-        w = 1
+        w = 1.0
 
+    # Ensure base row pointer calculation is performed in 64-bit precision
+    row_start_ptr = offsets_row_i64 * N
+    offsets_col = tl.arange(0, BLOCK_COL_SIZE)[None, :]
+    
     dx_part2 = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
     dx_part3 = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
 
     for off in range(0, N, BLOCK_COL_SIZE):
-        cols = off + tl.arange(0, BLOCK_COL_SIZE)
-        col_mask = cols[None, :] < N
-        mask = row_mask and col_mask
-        dy = tl.load(dY + cols[None, :], mask).to(tl.float32)
-        x = tl.load(X + cols[None, :], mask).to(tl.float32)
-        x = tl.where(mask, x - mean, 0.0)
-        x_hat = x * rstd
+        col_idx = off + offsets_col
+        col_mask = col_idx < N
+        mask = row_mask[:, None] & col_mask
+        
+        # Flatten pointer arithmetic to a single 'Base + Offset' form for better vectorization
+        curr_off = row_start_ptr[:, None] + col_idx
+        dy = tl.load(dY + curr_off, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(X + curr_off, mask=mask, other=0.0).to(tl.float32)
+        
+        x_hat = (x - mean) * rstd
         dx_hat = dy * w
-        dx_part2 += dx_hat
-        dx_part3 += dx_hat * x_hat
+        dx_part2 += tl.where(mask, dx_hat, 0.0)
+        dx_part3 += tl.where(mask, dx_hat * x_hat, 0.0)
 
     dx_2 = tl.sum(dx_part2, axis=1)[:, None]
     dx_3 = tl.sum(dx_part3, axis=1)[:, None]
 
     for off in range(0, N, BLOCK_COL_SIZE):
-        cols = off + tl.arange(0, BLOCK_COL_SIZE)
-        col_mask = cols[None, :] < N
-        mask = row_mask and col_mask
-        dy = tl.load(dY + cols[None, :], mask).to(tl.float32)
-        x = tl.load(X + cols[None, :], mask).to(tl.float32)
-        x = tl.where(mask, x - mean, 0.0)
-        x_hat = x * rstd
+        col_idx = off + offsets_col
+        col_mask = col_idx < N
+        mask = row_mask[:, None] & col_mask
+        
+        curr_off = row_start_ptr[:, None] + col_idx
+        dy = tl.load(dY + curr_off, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(X + curr_off, mask=mask, other=0.0).to(tl.float32)
+        
+        x_hat = (x - mean) * rstd
         dx_hat = dy * w
         dx = rstd * (dx_hat - (dx_2 + x_hat * dx_3) / N)
-        tl.store(dX + cols, dx, mask=mask)
+        
+        tl.store(dX + curr_off, dx, mask=mask)
 
 
 @libentry()
@@ -398,35 +408,45 @@ def weight_bias_backward_kernel(
     BLOCK_BATCH_SIZE: tl.constexpr,
     BLOCK_COL_SIZE: tl.constexpr,
 ):
-    cid = tl.program_id(0)[None]
-    cid = cid[:, None]
-    dW += cid
-    dB += cid
-    c_mask = cid < C
+    cid = tl.program_id(0)
+    if cid >= C:
+        return
 
     accW = tl.zeros([BLOCK_BATCH_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
     accB = tl.zeros([BLOCK_BATCH_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
 
     for b_off in range(0, B, BLOCK_BATCH_SIZE):
         bid = b_off + tl.arange(0, BLOCK_BATCH_SIZE)[:, None]
-        mid = bid * C + cid
         row_mask = bid < B
-        mean = tl.load(Mean + mid, mask=row_mask).to(tl.float32)
-        rstd = tl.load(Rstd + mid, mask=row_mask).to(tl.float32)
+        
+        # Explicit i64 casting prevents overflow when calculating index (Batch * C + Channel)
+        mid_i64 = (bid.to(tl.int64) * C + cid)
+        
+        mean = tl.load(Mean + mid_i64, mask=row_mask, other=0.0).to(tl.float32)
+        rstd = tl.load(Rstd + mid_i64, mask=row_mask, other=0.0).to(tl.float32)
+        
+        # Pre-calculate 64-bit base data offset for the inner loop
+        base_data_off = mid_i64 * N
+        
         for off in range(0, N, BLOCK_COL_SIZE):
-            cols = off + tl.arange(0, BLOCK_COL_SIZE)
-            col_mask = cols[None, :] < N
-            mask = row_mask and col_mask
-            dy = tl.load(dY + mid * N + cols[None, :], mask).to(tl.float32)
-            x = tl.load(X + mid * N + cols[None, :], mask).to(tl.float32)
-            x = tl.where(mask, x - mean, 0.0)
-            x_hat = x * rstd
-            accW += dy * x_hat
-            accB += dy
+            cols = off + tl.arange(0, BLOCK_COL_SIZE)[None, :]
+            col_mask = cols < N
+            mask = row_mask & col_mask
+            
+            # Simplified pointer logic (Base + Offset) helps the CPU backend vectorize loads
+            curr_off = base_data_off + cols
+            dy = tl.load(dY + curr_off, mask=mask, other=0.0).to(tl.float32)
+            x = tl.load(X + curr_off, mask=mask, other=0.0).to(tl.float32)
+            
+            x_hat = (x - mean) * rstd
+            # Masked accumulation ensures invalid/NaN data outside N is not summed
+            accW += tl.where(mask, dy * x_hat, 0.0)
+            accB += tl.where(mask, dy, 0.0)
+
     dw = tl.sum(accW)
     db = tl.sum(accB)
-    tl.store(dW, dw, mask=c_mask)
-    tl.store(dB, db, mask=c_mask)
+    tl.store(dW + cid, dw)
+    tl.store(dB + cid, db)
 
 
 class InstanceNorm(torch.autograd.Function):
