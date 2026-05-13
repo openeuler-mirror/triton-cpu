@@ -1368,6 +1368,17 @@ LogicalResult PtrAnalysis::visitOperand(Value operand, PtrState &state,
   } else if (auto op = operand.getDefiningOp<scf::ForOp>()) {
     return visitOperandForOp(op, operand, state, loc, builder);
   } else if (!operand.getDefiningOp()) {
+    // In unstructured analysis mode, shaped integer block args (e.g.
+    // tensor<128xi32> loop iter-args like `start`/`end` in a binary search)
+    // must be treated as opaque per-element gather offsets, not looked up in
+    // knownPtrs (which would return a wrong structured zero-offset state).
+    if (isAnalysisingUnstructured) {
+      if (auto shapedTy = dyn_cast<ShapedType>(operand.getType())) {
+        if (!isa<triton::PointerType>(shapedTy.getElementType()) &&
+            !isa<IndexType>(shapedTy.getElementType()))
+          return state.rebuildAsUnsupportedOp(operand);
+      }
+    }
     if (!knownPtrs.contains(operand)) {
       return failure();
     }
@@ -1702,7 +1713,15 @@ PtrAnalysis::rewriteGetStructuredStateOp(tts::GetStructuredStateOp op) {
   if (!knownPtrs.contains(tritonValue)) {
     op.emitRemark(
         "Rewrite GetStructuredStateOp failed. Could not find PtrState.");
-    op.getResult(0).replaceAllUsesWith(tritonValue);
+    // If rewrite failed, put the original op back.
+    OpBuilder builder(op);
+    SmallVector<Value> replacements{tritonValue};
+    for (auto result : op.getResults().drop_front(1)) {
+      (void)result;
+      replacements.push_back(builder.create<arith::ConstantOp>(
+          op.getLoc(), builder.getIndexAttr(0)));
+    }
+    op->replaceAllUsesWith(replacements);
     return failure();
   }
 
@@ -1710,7 +1729,15 @@ PtrAnalysis::rewriteGetStructuredStateOp(tts::GetStructuredStateOp op) {
   if (!state.isStructured()) {
     op.emitRemark(
         "Rewrite GetStructuredStateOp failed. PtrState is not structured.");
-    op.getResult(0).replaceAllUsesWith(tritonValue);
+    // If rewrite failed, put the original op back.
+    OpBuilder builder(op);
+    SmallVector<Value> replacements{tritonValue};
+    for (auto result : op.getResults().drop_front(1)) {
+      (void)result;
+      replacements.push_back(builder.create<arith::ConstantOp>(
+          op.getLoc(), builder.getIndexAttr(0)));
+    }
+    op->replaceAllUsesWith(replacements);
     return failure();
   }
   Value remappedValue =
