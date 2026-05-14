@@ -266,8 +266,8 @@ def rms_norm_forward(x, normalized_shape, weight, eps=1e-5):
     inv_rms = torch.empty((M,), device=x.device, dtype=torch.float32)
 
     with torch_device_fn.device(x.device):
-        BLOCK_SIZE = triton.next_power_of_2(N)
-        if BLOCK_SIZE <= 4096:
+        if N < 4096:
+            BLOCK_SIZE = triton.next_power_of_2(N)
             rms_norm_kernel[M,](y, inv_rms, x, weight, N, 1, N, 1, N, eps, BLOCK_SIZE)
         else:
             BLOCK_SIZE = 4096
@@ -288,8 +288,8 @@ def rms_norm_backward(dy, x, inv_rms, normalized_shape, weight, eps=1e-5):
     dx = torch.empty_like(x)
 
     with torch_device_fn.device(x.device):
-        BLOCK_SIZE = triton.next_power_of_2(N)
-        if BLOCK_SIZE <= 4096:
+        if N < 4096:
+            BLOCK_SIZE = triton.next_power_of_2(N)
             rms_norm_grad_dx_kernel[M,](
                 x, dy, inv_rms, dx, weight, N, 1, N, 1, N, eps, BLOCK_SIZE
             )

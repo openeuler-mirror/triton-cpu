@@ -143,8 +143,8 @@ class SkipLayerNorm(torch.autograd.Function):
         y = torch.empty_like(x)
 
         with torch_device_fn.device(x.device):
-            BLOCK_SIZE = triton.next_power_of_2(N)
-            if BLOCK_SIZE <= 4096:
+            if N < 4096:
+                BLOCK_SIZE = triton.next_power_of_2(N)
                 skip_layer_norm_kernel[M,](
                     y, x, residual, weight, bias, N, 1, N, 1, N, 1, N, eps, BLOCK_SIZE
                 )

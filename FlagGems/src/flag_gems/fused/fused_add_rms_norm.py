@@ -1,7 +1,6 @@
 import logging
 import math
 
-import torch
 import triton
 import triton.language as tl
 
@@ -133,8 +132,8 @@ def fused_add_rms_norm(x, residual, normalized_shape, weight, eps=1e-5):
     weight = weight.contiguous()
 
     with torch_device_fn.device(x.device):
-        BLOCK_SIZE = triton.next_power_of_2(N)
-        if BLOCK_SIZE <= 4096:
+        if N < 4096:
+            BLOCK_SIZE = triton.next_power_of_2(N)
             fused_add_rms_norm_kernel[M,](
                 x, residual, weight, N, 1, N, 1, N, eps, BLOCK_SIZE
             )
