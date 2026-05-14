@@ -463,7 +463,8 @@ class CompiledKernel:
         return ret
 
     def __getitem__(self, grid):
-        self._init_handles()
+        if 'run' not in self.__dict__:
+            self._init_handles()
 
         def runner(*args, stream=None):
             if stream is None:

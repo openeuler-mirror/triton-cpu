@@ -559,23 +559,32 @@ class JITFunction(KernelInterface[T]):
         self.specialised_indices = [
             i for (i, p) in enumerate(self.params) if (not p.do_not_specialize) and (not p.is_constexpr)
         ]
+        # Cache values that are constant across all kernel invocations so that
+        # run() does not re-evaluate them on every dispatch.
+        self._cached_debug = os.environ.get("TRITON_DEBUG", "0") == "1"
+        self._cached_device = driver.active.get_current_device()
+        self._cached_target = driver.active.get_current_target()
+        self._cached_backend = make_backend(self._cached_target)
 
     def run(self, *args, grid, warmup, **kwargs):
-        kwargs["debug"] = kwargs.get("debug", False) or os.environ.get("TRITON_DEBUG", "0") == "1"
-
         # parse options
-        from ..compiler import make_backend
-        device = driver.active.get_current_device()
+        if self.binder is None:
+            from ..compiler import make_backend
+            device = driver.active.get_current_device()
+            target = driver.active.get_current_target()
+            backend = make_backend(target)
+            self.create_binder(backend)
+
+        kwargs["debug"] = kwargs.get("debug", False) or self._cached_debug
+        device = self._cached_device
         stream = driver.active.get_current_stream(device)
-        target = driver.active.get_current_target()
-        backend = make_backend(target)
+        target = self._cached_target
+        backend = self._cached_backend
 
         # Execute pre run hooks with args and kwargs
-        for hook in self.pre_run_hooks:
-            hook(*args, **kwargs)
-
-        if self.binder is None:
-            self.create_binder(backend)
+        if self.pre_run_hooks:
+            for hook in self.pre_run_hooks:
+                hook(*args, **kwargs)
 
         bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs = self.binder(*args, **kwargs)
 
