@@ -15,19 +15,19 @@ logger = logging.getLogger(__name__)
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
 def skip_layer_norm_kernel(
-    Y,
-    X,
-    R,
-    W,
-    B,
+    Y,  # pointer to the output
+    X,  # pointer to the input
+    R,  # pointer to the residual
+    W,  # pointer to the weights
+    B,  # pointer to the biases
     y_stride_r,
     y_stride_c,
-    x_stride_r,
-    x_stride_c,
-    r_stride_r,
-    r_stride_c,
-    N,
-    eps,
+    x_stride_r,  # how much to increase the pointer when moving by 1 row
+    x_stride_c,  # how much to increase the pointer when moving by 1 col
+    r_stride_r,  # how much to increase the pointer when moving by 1 row
+    r_stride_c,  # how much to increase the pointer when moving by 1 col
+    N,  # number of columns in X
+    eps,  # epsilon to avoid division by zero
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tle.program_id(0)
@@ -35,6 +35,7 @@ def skip_layer_norm_kernel(
     X += pid * x_stride_r
     R += pid * r_stride_r
 
+    # First pass: compute mean and variance with Welford's online algorithm
     m = 0.0
     s = 0.0
     cnt = 0
@@ -48,6 +49,7 @@ def skip_layer_norm_kernel(
         r = tl.load(R + n_offsets * r_stride_c, mask=mask, other=0.0).to(tl.float32)
         x = tl.where(mask, x + r, 0.0)
         valid_cnt = tl.sum(mask.to(tl.int32))
+        # First batch: initialize directly
         if step == 0:
             m = tl.sum(x) / valid_cnt
             s = tl.sum(tl.where(mask, (x - m) * (x - m), 0.0))
@@ -63,6 +65,7 @@ def skip_layer_norm_kernel(
     var = s / cnt
     rstd = 1 / tl.sqrt(var + eps)
 
+    # Second pass: normalize and apply weight/bias, also store residual
     for step in range(0, num_steps, 1):
         start_n = step * BLOCK_SIZE
         n_offsets = start_n + tl.arange(0, BLOCK_SIZE)

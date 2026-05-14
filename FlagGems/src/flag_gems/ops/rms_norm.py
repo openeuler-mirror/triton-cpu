@@ -15,16 +15,16 @@ logger = logging.getLogger(__name__)
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
 def rms_norm_kernel(
-    out_ptr,
-    INV_RMS,
-    in_ptr,
-    w_ptr,
+    out_ptr,  # pointer to the output
+    INV_RMS,  # pointer to inverse rms
+    in_ptr,  # pointer to the input
+    w_ptr,  # pointer to the weights
     y_stride_r,
     y_stride_c,
-    x_stride_r,
-    x_stride_c,
-    N,
-    eps,
+    x_stride_r,  # how much to increase the pointer when moving by 1 row
+    x_stride_c,  # how much to increase the pointer when moving by 1 col
+    N,  # number of columns in X
+    eps,  # epsilon to avoid division by zero
     BLOCK_SIZE: tl.constexpr,
 ):
     if tl.constexpr(in_ptr.dtype.element_ty == tl.float16) or tl.constexpr(
@@ -38,6 +38,7 @@ def rms_norm_kernel(
     out_ptr += pid * y_stride_r
     in_ptr += pid * x_stride_r
 
+    # First pass: compute variance (sum of squares)
     var_sum = 0.0
     num_steps = tl.cdiv(N, BLOCK_SIZE)
 
@@ -52,6 +53,7 @@ def rms_norm_kernel(
     rrms = 1 / tl.sqrt(var + eps)
     tl.store(INV_RMS + pid, rrms)
 
+    # Second pass: normalize and apply weights
     for step in range(0, num_steps, 1):
         start_n = step * BLOCK_SIZE
         n_offsets = start_n + tl.arange(0, BLOCK_SIZE)
@@ -65,17 +67,17 @@ def rms_norm_kernel(
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
 def rms_norm_grad_dx_kernel(
-    X,
+    X,  # pointer to the input
     DY,
-    INV_RMS,
-    DX,
-    W,
+    INV_RMS,  # pointer to inverse rms
+    DX,  # pointer to the output
+    W,  # pointer to the weights
     dx_stride_r,
     dx_stride_c,
-    x_stride_r,
-    x_stride_c,
-    N,
-    eps,
+    x_stride_r,  # how much to increase the pointer when moving by 1 row
+    x_stride_c,  # how much to increase the pointer when moving by 1 col
+    N,  # number of columns in X
+    eps,  # epsilon to avoid division by zero
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tle.program_id(0)
@@ -86,6 +88,7 @@ def rms_norm_grad_dx_kernel(
 
     inv_rms = tl.load(INV_RMS).to(tl.float32)
 
+    # First pass: compute row sum statistics
     row_sum_stats = 0.0
     num_steps = tl.cdiv(N, BLOCK_SIZE)
 
@@ -100,6 +103,7 @@ def rms_norm_grad_dx_kernel(
         normalized_buf = x * inv_rms
         row_sum_stats += tl.sum(tl.where(mask, normalized_buf * dy, 0.0)).to(tl.float32)
 
+    # Second pass: compute dx
     for step in range(0, num_steps, 1):
         start_n = step * BLOCK_SIZE
         n_offsets = start_n + tl.arange(0, BLOCK_SIZE)
