@@ -89,7 +89,7 @@ class CPUOptions:
     debug: bool = False
     arch: str = None
     num_warps: int = 0
-    num_threads: int = 1
+    num_threads: int = 0
     num_ctas: int = 0
     num_stages: int = 1
     num_buffers_warp_spec: int = 0
@@ -208,7 +208,8 @@ class CPUBackend(BaseBackend):
             metadata.cluster_dims[0],
             metadata.cluster_dims[1],
             metadata.cluster_dims[2],
-            metadata.name
+            metadata.name,
+            metadata.num_threads,  # index 7: read by the CPU launcher C extension
         )
 
     # Our compilation pipeline isn't in python like nvidia or amd, no need to load

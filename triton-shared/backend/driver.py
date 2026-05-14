@@ -192,13 +192,14 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   //  }}
 
   
+  // num_threads is at index 7 in the packed_metadata tuple (see pack_metadata in compiler.py)
   int num_threads = 0;
   if (kernel_metadata && kernel_metadata != Py_None) {{
-    PyObject *num_threads_attr = PyObject_GetAttrString(kernel_metadata, "num_threads");
-    if (num_threads_attr) {{
-      if (PyLong_Check(num_threads_attr))
-        num_threads = PyLong_AsLong(num_threads_attr);
-      Py_DECREF(num_threads_attr);
+    PyObject *num_threads_item = PySequence_GetItem(kernel_metadata, 7);
+    if (num_threads_item) {{
+      if (PyLong_Check(num_threads_item))
+        num_threads = PyLong_AsLong(num_threads_item);
+      Py_DECREF(num_threads_item);
     }} else {{
       PyErr_Clear(); // Avoid leaving a lingering Python exception
     }}
