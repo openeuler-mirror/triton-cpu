@@ -50,7 +50,7 @@ def skip_layer_norm_kernel(
         valid_cnt = tl.sum(mask.to(tl.int32))
         if step == 0:
             m = tl.sum(x) / valid_cnt
-            s = tl.sum((x - m) * (x - m))
+            s = tl.sum(tl.where(mask, (x - m) * (x - m), 0.0))
             cnt = valid_cnt
         else:
             new_m = m + tl.sum(tl.where(mask, x - m, 0.0)) / (cnt + valid_cnt)
