@@ -1526,13 +1526,13 @@ class CPUBackend(BaseBackend):
             if FORCE_SME or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
                 flags = (
                     "-mtriple=aarch64-linux-gnu",
-                    "-mattr=+sme,+dotprod",
+                    "-mattr=+sme,+dotprod,+v9a,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+sve,+sve2",
                     "-disable-interleaved-load-combine=true",
                 )
             elif FORCE_SVE or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
                 flags = (
                     "-mtriple=aarch64-linux-gnu",
-                    "-mattr=+sve,+dotprod",
+                    "-mattr=+sve,+dotprod,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+spe",
                     "-disable-interleaved-load-combine=true",
                 )
             
