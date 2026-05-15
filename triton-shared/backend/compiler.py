@@ -1507,7 +1507,23 @@ class CPUBackend(BaseBackend):
 
     @timer
     def _optimize_llir(self, llir: str):
-        # We don't apply any optimizations now, but we can add passes if needed.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_path = os.path.join(tmpdir, "kernel.ll")
+            llir_path = os.path.join(tmpdir, "ll.ir")
+            Path(src_path).write_text(llir)
+            opt_path = _get_llvm_bin_path("opt")
+            if os.path.exists(opt_path):
+                subprocess.check_call([
+                    opt_path,
+                    "-S",
+                    "-passes=instcombine,simplifycfg,dse",
+                    src_path,
+                    "-o",
+                    llir_path,
+                ])
+                kernel_debug_dir = _new_debug_dump_dir(llir)
+                _dump_ir_if_needed(kernel_debug_dir, [llir_path])
+                return Path(llir_path).read_text()
         return llir
 
 
