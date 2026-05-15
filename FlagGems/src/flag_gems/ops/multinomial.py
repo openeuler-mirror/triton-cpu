@@ -61,6 +61,12 @@ def multinomial(prob, n_samples, with_replacement=False, *, gen=None):
         with_replacement or n_samples <= n_categories
     ), "cannot sample n_samples > prob.size(-1) samples without replacement."
 
+    # float16s do not have enough bits for the precision required by multinomial,
+    # which risks 0-values when very small values are divided or rounded in normed_cumsum below.
+    # Therefore, upcast them to float32.
+    if prob.dtype in (torch.float16, torch.bfloat16):
+        prob = prob.to(torch.float32)
+
     # Sampling without replacement
     if (not with_replacement) or n_samples == 1:
         # In case of with_replacement, sampling is approximated by selecing
