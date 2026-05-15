@@ -559,6 +559,12 @@ class JITFunction(KernelInterface[T]):
         self.specialised_indices = [
             i for (i, p) in enumerate(self.params) if (not p.do_not_specialize) and (not p.is_constexpr)
         ]
+        self._param_names = [p.name for p in self.params]
+        # Single-entry fast cache: skip binder when arg types haven't changed
+        self._fast_args_fp = None   # fingerprint of last args
+        self._fast_key = None       # last computed cache key
+        self._fast_kernel = None    # last compiled kernel
+        self._fast_non_constexpr = None  # last non_constexpr_vals
         # Cache values that are constant across all kernel invocations so that
         # run() does not re-evaluate them on every dispatch.
         self._cached_debug = os.environ.get("TRITON_DEBUG", "0") == "1"
@@ -586,11 +592,33 @@ class JITFunction(KernelInterface[T]):
             for hook in self.pre_run_hooks:
                 hook(*args, **kwargs)
 
-        bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs = self.binder(*args, **kwargs)
+        # Fast path: compute a cheap fingerprint (dtype + alignment for tensors,
+        # value identity for scalars) and skip the expensive binder call when
+        # arg types haven't changed since the last invocation.
+        _fp = tuple(
+            (a.dtype, a.data_ptr() & 15 == 0) if hasattr(a, 'dtype') else (type(a), a)
+            for a in args
+        ) + tuple(sorted(kwargs.items()))
 
-        # compute cache key
-        key = ''.join(sig_and_spec) + str((constexpr_vals, excess_kwargs))
-        kernel = self.cache[device].get(key, None)
+        # The fast-path index trick only works when all params are passed positionally
+        # (len(args) == len(self.params)).  When the autotuner passes constexpr configs
+        # as kwargs, args is shorter and args[i] for a constexpr-skipping index would
+        # be out of range.
+        _all_positional = len(args) == len(self.params)
+
+        if _fp == self._fast_args_fp and _all_positional:
+            kernel = self._fast_kernel
+            # Always extract fresh values from current args (pointers change each call)
+            non_constexpr_vals = tuple(args[i] for i in self.non_constexpr_indices)
+            bound_args = None  # reconstructed lazily below if grid is callable
+        else:
+            bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs = self.binder(*args, **kwargs)
+            # compute cache key
+            key = ''.join(sig_and_spec) + str((constexpr_vals, excess_kwargs))
+            kernel = self.cache[device].get(key, None)
+            if kernel is not None and _all_positional:
+                self._fast_args_fp = _fp
+                self._fast_kernel = kernel
 
         if kernel is None:
             # Kernel is not cached; we have to compile.
@@ -651,6 +679,10 @@ class JITFunction(KernelInterface[T]):
                 # Arguments are passed as a dict to `grid`, by contract.
                 # TODO(jlebar): In the new launch API, pass the compiler flags as a
                 # second parameter to `grid`.
+                if bound_args is None:
+                    # Fast path: reconstruct bound_args cheaply from param names
+                    bound_args = dict(zip(self._param_names, args))
+                    bound_args.update(kwargs)
                 grid = grid(bound_args)
             grid_size = len(grid)
             grid_0 = grid[0]
