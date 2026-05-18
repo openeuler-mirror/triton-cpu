@@ -316,11 +316,11 @@ def compile_module(launcher_src, kernel_placeholder_name):
                     dump_path = os.environ["TRITON_SHARED_DUMP_PATH"]
                     shutil.copy(launcher_src_path, dump_path)
                   subprocess.check_call([
-                    "g++", "-O3", "-g", "-std=c++17", launcher_src_path, obj_path,
+                    "clang++", "-O3", "-g", "-std=c++17", launcher_src_path, obj_path,
                     f"-I{py_include_dir}", f"-I{include_dir}", f"-L{py_lib_dir}",
                     "-shared", f"-l{py_lib}", "-fPIC", "-fopenmp",
                     f"-L{_triton_C_dir}", "-lsleef", f"-Wl,-rpath,{_triton_C_dir}",
-                    "-o", so_path
+                    "-o", so_path, "-rtlib=compiler-rt"
                   ])
 
               with open(so_path, "rb") as f:
