@@ -48,6 +48,7 @@ using namespace mlir;
 
 static const std::string WRAP_SIDE_BY_SIDE = "wrap_side_by_side";
 static const std::string WRAP_STACKED = "wrap_stacked";
+static const std::string WRAP_1D = "wrap_1d";
 static const std::string ORIGINAL_ORDER_ATTR = "tts.original_order";
 
 static memref::SubViewOp getSubview(int rank, ArrayRef<OpFoldResult> dims,
@@ -310,6 +311,60 @@ private:
   }
 
   std::pair<memref::ReinterpretCastOp, memref::ReinterpretCastOp>
+  create1DCastOps(tts::MakeTensorPtrOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const {
+    auto loc = op->getLoc();
+    auto resultShape = cast<RankedTensorType>(op.getType()).getShape();
+    assert(resultShape.size() == 1);
+
+    auto targetOffset = ofrToIndexValue(
+        accumulateTargetOffset(op.getLoc(), op.getMixedOffsets(), rewriter),
+        loc, rewriter);
+
+    auto resultType = getResultMemrefType(
+        op, /* offset */ ShapedType::kDynamic,
+        /* staticStrides */
+        SmallVector<int64_t>(resultShape.size(), ShapedType::kDynamic),
+        /* result shape */ SmallVector<int64_t>{ShapedType::kDynamic});
+
+    Value rowSize = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIndexAttr(op.getSizes()[0]));
+    Value stride = ofrToIndexValue(op.getMixedStrides()[0], loc, rewriter);
+    Value modSize = ofrToIndexValue(op.getMixedShape()[0], loc, rewriter);
+    auto one =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
+
+    auto ceilDiv = [&](Value lhs, Value rhs) {
+      Value lhsMinusOne = rewriter.create<arith::SubIOp>(loc, lhs, one);
+      Value quotient = rewriter.create<arith::DivSIOp>(loc, lhsMinusOne, rhs);
+      return rewriter.create<arith::AddIOp>(loc, quotient, one).getResult();
+    };
+
+    Value wrappedAroundOff =
+        rewriter.create<arith::RemSIOp>(loc, targetOffset, modSize);
+    Value remainingSpan =
+        rewriter.create<arith::SubIOp>(loc, modSize, wrappedAroundOff);
+    Value modCount = ceilDiv(modSize, stride);
+    Value d1 = ceilDiv(remainingSpan, stride);
+    d1 = rewriter.create<arith::MinSIOp>(loc, d1, rowSize);
+
+    SmallVector<Value> sizes1{d1};
+    auto cast1 = rewriter.create<memref::ReinterpretCastOp>(
+        loc, resultType, adaptor.getBase(), wrappedAroundOff, sizes1,
+        ValueRange{stride});
+
+    Value d2 = rewriter.create<arith::SubIOp>(loc, rowSize, d1);
+    Value d2Clamped = rewriter.create<arith::MinSIOp>(loc, d2, modCount);
+    auto zero =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
+    SmallVector<Value> sizes2{d2Clamped};
+    auto cast2 = rewriter.create<memref::ReinterpretCastOp>(
+        loc, resultType, adaptor.getBase(), zero, sizes2, ValueRange{stride});
+
+    return {cast1, cast2};
+  }
+
+  std::pair<memref::ReinterpretCastOp, memref::ReinterpretCastOp>
   createSideBySideCastOps(tts::MakeTensorPtrOp op, OpAdaptor adaptor,
                           ConversionPatternRewriter &rewriter) const {
     auto loc = op->getLoc();
@@ -526,8 +581,6 @@ private:
   LogicalResult rewriteSplitPtr(tts::MakeTensorPtrOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const {
     auto parentShape = op.getStaticShape();
-    assert(parentShape.size() == 2 &&
-           "Only support split pointer for 2D tensors only");
     SmallVector<Value> casts;
     StringRef wrapType;
 
@@ -538,7 +591,25 @@ private:
       return dim == ShapedType::kDynamic || dim != 0;
     };
 
-    if (isSplitDimension(parentShape[0])) {
+    if (parentShape.size() == 1) {
+      if (!isSplitDimension(parentShape[0])) {
+        emitError(op.getLoc()) << "unexpected split pointer shape";
+        return failure();
+      }
+      auto stride = getIntAttr(op.getMixedStrides()[0]);
+      if (!stride || stride.value() != 1) {
+        emitError(op.getLoc())
+            << "1D split pointer lowering only supports unit stride";
+        return failure();
+      }
+      auto [cast1, cast2] = create1DCastOps(op, adaptor, rewriter);
+      casts = {cast1.getResult(), cast2.getResult()};
+      wrapType = WRAP_1D;
+    } else if (parentShape.size() != 2) {
+      emitError(op.getLoc()) << "split pointer lowering only supports 1D or "
+                                "2D tensor pointers";
+      return failure();
+    } else if (isSplitDimension(parentShape[0])) {
       // Stacked case
       assert(parentShape[1] == 0);
       auto [cast1, cast2] = createStackedCastOps(op, adaptor, rewriter);
@@ -739,6 +810,49 @@ private:
     }
   }
 
+  void create1DCopies(Value block1, Value block2, Value dst, Value totalElems,
+                      Location loc,
+                      ConversionPatternRewriter &rewriter) const {
+    auto zero =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
+    auto one =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
+
+    Value block1Elems = rewriter.create<memref::DimOp>(loc, block1, 0);
+    Value block2Elems = rewriter.create<memref::DimOp>(loc, block2, 0);
+
+    Value d1 = rewriter.create<arith::MinSIOp>(loc, block1Elems, totalElems);
+    Value d2 = rewriter.create<arith::SubIOp>(loc, totalElems, d1);
+
+    auto block1Src = rewriter.create<memref::SubViewOp>(
+        loc, block1, /* offsets */ ValueRange{zero},
+        /* sizes */ ValueRange{d1}, /* strides */ ValueRange{one});
+    auto block1Dst = rewriter.create<memref::SubViewOp>(
+        loc, dst, /* offsets */ ValueRange{zero},
+        /* sizes */ ValueRange{d1}, /* strides */ ValueRange{one});
+    rewriter.create<memref::CopyOp>(loc, block1Src, block1Dst);
+
+    Value loopStep = rewriter.create<arith::MaxSIOp>(loc, block2Elems, one);
+    auto loop = rewriter.create<scf::ForOp>(loc, zero, d2, loopStep);
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(loop.getBody());
+      Value iv = loop.getInductionVar();
+      Value remaining = rewriter.create<arith::SubIOp>(loc, d2, iv);
+      Value thisChunk =
+          rewriter.create<arith::MinSIOp>(loc, block2Elems, remaining);
+      Value dstOffset = rewriter.create<arith::AddIOp>(loc, d1, iv);
+
+      auto srcSubview = rewriter.create<memref::SubViewOp>(
+          loc, block2, /* offsets */ ValueRange{zero},
+          /* sizes */ ValueRange{thisChunk}, /* strides */ ValueRange{one});
+      auto dstSubview = rewriter.create<memref::SubViewOp>(
+          loc, dst, /* offsets */ ValueRange{dstOffset},
+          /* sizes */ ValueRange{thisChunk}, /* strides */ ValueRange{one});
+      rewriter.create<memref::CopyOp>(loc, srcSubview, dstSubview);
+    }
+  }
+
   void createStackedCopies(Value block1, Value block2, Value dst, Location loc,
                            ConversionPatternRewriter &rewriter) const {
 
@@ -867,7 +981,8 @@ private:
 
     auto ptrDefiningOp = ptr.getDefiningOp();
     if (ptrDefiningOp->hasAttr(WRAP_SIDE_BY_SIDE) ||
-        ptrDefiningOp->hasAttr(WRAP_STACKED)) {
+        ptrDefiningOp->hasAttr(WRAP_STACKED) ||
+        ptrDefiningOp->hasAttr(WRAP_1D)) {
 
       auto unrealizedCast = cast<UnrealizedConversionCastOp>(ptrDefiningOp);
       auto memrefs = unrealizedCast.getOperands();
@@ -882,6 +997,10 @@ private:
             rewriter.create<memref::DimOp>(loc, alloc, 1).getResult();
         createSideBySideCopies(block1, block2, alloc, totalRows, totalCols, loc,
                                rewriter);
+      } else if (unrealizedCast->hasAttr(WRAP_1D)) {
+        Value totalElems =
+            rewriter.create<memref::DimOp>(loc, alloc, 0).getResult();
+        create1DCopies(block1, block2, alloc, totalElems, loc, rewriter);
       } else if (unrealizedCast->hasAttr(WRAP_STACKED)) {
         createStackedCopies(block1, block2, alloc, loc, rewriter);
       } else {
@@ -942,7 +1061,8 @@ private:
 
     auto ptrDefiningOp = ptr.getDefiningOp();
     if (ptrDefiningOp->hasAttr(WRAP_SIDE_BY_SIDE) ||
-        ptrDefiningOp->hasAttr(WRAP_STACKED)) {
+        ptrDefiningOp->hasAttr(WRAP_STACKED) ||
+        ptrDefiningOp->hasAttr(WRAP_1D)) {
 
       auto unrealizedCast = cast<UnrealizedConversionCastOp>(ptrDefiningOp);
 
@@ -956,6 +1076,9 @@ private:
         Value totalCols = ofrToIndexValue(mixedDims[1], loc, rewriter);
         createSideBySideCopies(block1, block2, alloc, totalRows, totalCols, loc,
                                rewriter);
+      } else if (unrealizedCast->hasAttr(WRAP_1D)) {
+        Value totalElems = ofrToIndexValue(mixedDims[0], loc, rewriter);
+        create1DCopies(block1, block2, alloc, totalElems, loc, rewriter);
       } else if (unrealizedCast->hasAttr(WRAP_STACKED)) {
         auto [subview1, subview2] =
             getStackedSubviews(mixedDims, block1, block2, loc, rewriter);
@@ -1316,6 +1439,55 @@ public:
     store2.setWritable(true);
   }
 
+  void create1DStores(Value block1, Value block2, Value src, Location loc,
+                      ConversionPatternRewriter &rewriter) const {
+    auto zero =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
+    auto one =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
+
+    Value block1Elems = rewriter.create<memref::DimOp>(loc, block1, 0);
+    Value block2Elems = rewriter.create<memref::DimOp>(loc, block2, 0);
+
+    auto srcType = cast<RankedTensorType>(src.getType());
+    auto elemType = srcType.getElementType();
+    Value totalElems = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIndexAttr(srcType.getShape()[0]));
+
+    Value d1 = rewriter.create<arith::MinSIOp>(loc, block1Elems, totalElems);
+    Value d2 = rewriter.create<arith::SubIOp>(loc, totalElems, d1);
+
+    auto sliceType = RankedTensorType::get({ShapedType::kDynamic}, elemType);
+    auto slice1 = rewriter.create<tensor::ExtractSliceOp>(
+        loc, sliceType, src, ValueRange{zero}, ValueRange{d1},
+        ValueRange{one});
+    auto store1 = rewriter.create<bufferization::MaterializeInDestinationOp>(
+        loc, slice1, block1);
+    store1.setWritable(true);
+
+    Value loopStep = rewriter.create<arith::MaxSIOp>(loc, block2Elems, one);
+    auto loop = rewriter.create<scf::ForOp>(loc, zero, d2, loopStep);
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(loop.getBody());
+      Value iv = loop.getInductionVar();
+      Value remaining = rewriter.create<arith::SubIOp>(loc, d2, iv);
+      Value thisChunk =
+          rewriter.create<arith::MinSIOp>(loc, block2Elems, remaining);
+      Value srcOffset = rewriter.create<arith::AddIOp>(loc, d1, iv);
+
+      auto slice = rewriter.create<tensor::ExtractSliceOp>(
+          loc, sliceType, src, ValueRange{srcOffset}, ValueRange{thisChunk},
+          ValueRange{one});
+      auto dstSubview = rewriter.create<memref::SubViewOp>(
+          loc, block2, /* offsets */ ValueRange{zero},
+          /* sizes */ ValueRange{thisChunk}, /* strides */ ValueRange{one});
+      auto store = rewriter.create<bufferization::MaterializeInDestinationOp>(
+          loc, slice, dstSubview);
+      store.setWritable(true);
+    }
+  }
+
   void createStackedStores(Value block1, Value block2, Value src, Location loc,
                            ConversionPatternRewriter &rewriter) const {
     auto zero =
@@ -1388,7 +1560,8 @@ public:
     auto ptrDefiningOp = ptr.getDefiningOp();
     if (ptrDefiningOp &&
         (ptrDefiningOp->hasAttr(WRAP_SIDE_BY_SIDE) ||
-         ptrDefiningOp->hasAttr(WRAP_STACKED))) {
+         ptrDefiningOp->hasAttr(WRAP_STACKED) ||
+         ptrDefiningOp->hasAttr(WRAP_1D))) {
       // Transposed block pointers go through a different lowering path and
       // must not reach the wraparound store rewrite.
       assert(!originalOrderAttr &&
@@ -1408,6 +1581,8 @@ public:
 
       if (unrealizedCast->hasAttr(WRAP_SIDE_BY_SIDE)) {
         createSideBySideStores(block1, block2, storeValue, loc, rewriter);
+      } else if (unrealizedCast->hasAttr(WRAP_1D)) {
+        create1DStores(block1, block2, storeValue, loc, rewriter);
       } else {
         createStackedStores(block1, block2, storeValue, loc, rewriter);
       }
