@@ -1516,7 +1516,7 @@ class CPUBackend(BaseBackend):
                 subprocess.check_call([
                     opt_path,
                     "-S",
-                    "-passes=instcombine<no-verify-fixpoint>,simplifycfg,dse",
+                    "-passes=simplifycfg,dse",
                     src_path,
                     "-o",
                     llir_path,
