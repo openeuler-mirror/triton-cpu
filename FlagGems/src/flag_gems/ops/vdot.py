@@ -234,7 +234,7 @@ def vdot(input: Tensor, other: Tensor):
         grid_size = min(num_blocks, 1024)
 
         partial_real_sums = torch.empty(
-            grid_size, dtype=inp_real.dtype, device=inp.device
+            2 * grid_size, dtype=inp_real.dtype, device=inp.device
         )
         grid = (grid_size,)
         vdot_kernel_complex[grid](
