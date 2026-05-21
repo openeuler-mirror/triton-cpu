@@ -1096,8 +1096,7 @@ def get_diag_embed_shape_and_dims():
 
     for s in shapes:
         dim_pairs = get_dim1_dim2(len(s) + 1)
-        if dim_pairs:
-            dim1, dim2 = random.choice(dim_pairs)
+        for di1m, dim2 in dim_pairs:
             result.append((s, dim1, dim2))
 
     return result
