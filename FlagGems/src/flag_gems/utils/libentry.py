@@ -625,14 +625,28 @@ class LibEntry(triton.KernelInterface):
         self.lock = multiprocessing.Lock()
         self.signature = fn.signature
 
+        # Precompute hot-path constants to avoid repeated work in run()
+        self._param_names = list(self.signature.parameters.keys())
+        self._specialize_set = set(self.specialize_indices)
+        self._dns_set = set(self.do_not_specialize_indices)
+        # Sorted non-constexpr positional arg positions for fast k_args building
+        _runtime_pos = sorted(self._specialize_set | self._dns_set)
+        self._k_arg_pairs = [(i, self._param_names[i]) for i in _runtime_pos]
+        # Instance-level single-entry fast cache to skip dict hash on repeated same key
+        self._fast_key = None
+        self._fast_kernel = None
+        self._fast_constexprs = None
+
     def key(self, spec_args, dns_args, const_args):
+        _div = self.divisibility
         def spec_arg(arg):
-            if hasattr(arg, "data_ptr"):
-                return (arg.dtype, arg.data_ptr() % self.divisibility == 0)
+            # Use type check instead of hasattr to avoid attribute lookup overhead
+            if hasattr(arg, "dtype"):
+                return (arg.dtype, arg.data_ptr() % _div == 0)
             return (type(arg), arg)
 
         def dns_arg(arg):
-            if hasattr(arg, "data_ptr"):
+            if hasattr(arg, "dtype"):
                 return arg.dtype
             if not isinstance(arg, int):
                 return type(arg)
@@ -655,31 +669,31 @@ class LibEntry(triton.KernelInterface):
         dns_args = []  # do not specialize arguments
         const_args = []  # constexpr arguments
         k_args = OrderedDict()
-        param_names = list(self.signature.parameters.keys())
+        _spec_set = self._specialize_set
+        _dns_set = self._dns_set
+        _param_names = self._param_names
+        _is_v35 = major_version == 3 and 3 <= minor_version <= 5
         for i, arg in enumerate(args):
-            hashable_arg = arg
-            if (
-                hasattr(arg, "__class__")
-                and arg.__class__.__name__ == "TensorDescriptor"
-            ):
-                # Create a hashable representation of TensorDescriptor
+            # Fast TensorDescriptor check without hasattr(__class__) which is always True
+            if type(arg).__name__ == "TensorDescriptor":
                 hashable_arg = (
                     "TensorDescriptor",
                     tuple(arg.shape) if hasattr(arg, "shape") else None,
                     tuple(arg.strides) if hasattr(arg, "strides") else None,
                     tuple(arg.block_shape) if hasattr(arg, "block_shape") else None,
                     arg.padding if hasattr(arg, "padding") else None,
-                    # Add other relevant attributes
                 )
-            if i in self.specialize_indices:
-                k_args[param_names[i]] = arg
+            else:
+                hashable_arg = arg
+            if i in _spec_set:
+                k_args[_param_names[i]] = arg
                 spec_args.append(hashable_arg)
-            elif i in self.do_not_specialize_indices:
-                k_args[param_names[i]] = arg
+            elif i in _dns_set:
+                k_args[_param_names[i]] = arg
                 dns_args.append(hashable_arg)
             else:
-                if major_version == 3 and 3 <= minor_version <= 5:
-                    k_args[param_names[i]] = arg
+                if _is_v35:
+                    k_args[_param_names[i]] = arg
                 const_args.append(hashable_arg)
         for p in self.jit_function.params[len(args) :]:
             if p.name in kwargs:
@@ -701,57 +715,65 @@ class LibEntry(triton.KernelInterface):
                 k_args[p.name] = val
 
         entry_key = self.key(spec_args, dns_args, const_args)
-        device = torch_device_fn.current_device()
-        cache = self.kernel_cache[device]
-        while entry_key not in cache:
-            # NOTE: we serialize the first run of a jit function regardless of which device to run on
-            # because Triton runtime is currently not threadsafe.
-            with self.lock:
-                if entry_key in cache:
-                    break
-                kernel = self.fn.run(*args, **kwargs)
-                fn = self.fn
-                # collect constexpr arguments for grid computation
-                constexprs = {}
-                tune_constexprs = {}
-                heur_constexprs = {}
-                while not isinstance(fn, triton.runtime.JITFunction):
-                    if isinstance(fn, triton.runtime.Autotuner):
-                        config = fn.best_config
-                        constexprs["num_warps"] = config.num_warps
-                        constexprs["num_stages"] = config.num_stages
-                        constexprs["num_ctas"] = config.num_ctas
-                        constexprs = {**constexprs, **config.kwargs}
-                        tune_constexprs = {**tune_constexprs, **config.kwargs}
-                    elif isinstance(fn, triton.runtime.Heuristics):
-                        for v, heur in fn.values.items():
-                            heur_constexprs[v] = heur(
-                                {
-                                    **dict(zip(fn.arg_names, args)),
-                                    **kwargs,
-                                    **constexprs,
-                                }
-                            )
-                            constexprs[v] = heur_constexprs[v]
-                    else:
-                        raise RuntimeError("Invalid Runtime Function")
-                    fn = fn.fn
-                for p in self.jit_function.params:
-                    if (
-                        p.is_constexpr
-                        and p.name not in constexprs
-                        and (p.default is not inspect._empty)
-                    ):
-                        constexprs[p.name] = p.default
-                cache[entry_key] = (
-                    kernel,
-                    constexprs,
-                    tune_constexprs,
-                    heur_constexprs,
-                )
-            return kernel, constexprs
 
-        kernel, constexprs, tune_constexprs, heur_constexprs = cache[entry_key]
+        # Fast path: same key as last call (common case for fixed-size, fixed-dtype tensors)
+        if entry_key == self._fast_key:
+            kernel, constexprs = self._fast_kernel, self._fast_constexprs
+        else:
+            device = torch_device_fn.current_device()
+            cache = self.kernel_cache[device]
+            while entry_key not in cache:
+                # NOTE: we serialize the first run of a jit function regardless of which device to run on
+                # because Triton runtime is currently not threadsafe.
+                with self.lock:
+                    if entry_key in cache:
+                        break
+                    kernel = self.fn.run(*args, **kwargs)
+                    fn = self.fn
+                    # collect constexpr arguments for grid computation
+                    constexprs = {}
+                    tune_constexprs = {}
+                    heur_constexprs = {}
+                    while not isinstance(fn, triton.runtime.JITFunction):
+                        if isinstance(fn, triton.runtime.Autotuner):
+                            config = fn.best_config
+                            constexprs["num_warps"] = config.num_warps
+                            constexprs["num_stages"] = config.num_stages
+                            constexprs["num_ctas"] = config.num_ctas
+                            constexprs = {**constexprs, **config.kwargs}
+                            tune_constexprs = {**tune_constexprs, **config.kwargs}
+                        elif isinstance(fn, triton.runtime.Heuristics):
+                            for v, heur in fn.values.items():
+                                heur_constexprs[v] = heur(
+                                    {
+                                        **dict(zip(fn.arg_names, args)),
+                                        **kwargs,
+                                        **constexprs,
+                                    }
+                                )
+                                constexprs[v] = heur_constexprs[v]
+                        else:
+                            raise RuntimeError("Invalid Runtime Function")
+                        fn = fn.fn
+                    for p in self.jit_function.params:
+                        if (
+                            p.is_constexpr
+                            and p.name not in constexprs
+                            and (p.default is not inspect._empty)
+                        ):
+                            constexprs[p.name] = p.default
+                    cache[entry_key] = (
+                        kernel,
+                        constexprs,
+                        tune_constexprs,
+                        heur_constexprs,
+                    )
+                return kernel, constexprs
+
+            kernel, constexprs, tune_constexprs, heur_constexprs = cache[entry_key]
+            self._fast_key = entry_key
+            self._fast_kernel = kernel
+            self._fast_constexprs = constexprs
 
         if callable(grid):
             # collect all arguments to the grid fn，ie:

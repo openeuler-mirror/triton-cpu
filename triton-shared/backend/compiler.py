@@ -127,17 +127,35 @@ class CPUOptions:
 class CPUBackend(BaseBackend):
     binary_ext = 'obj'
 
+    # Class-level caches so expensive LLVM introspection and subprocess SVE
+    # detection only run once per process, not on every kernel invocation.
+    _cpu_features_cache = None
+    _cpu_arch_cache = None
+    _sve_vscale_cache = None
+    _sve_vscale_detected = False
+
     @staticmethod
     def supports_target(target: GPUTarget):
         return target.backend == 'cpu'
 
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
-        self.cpu_features = llvm.get_cpu_features()
-        self.cpu_arch = llvm.get_cpu_tripple().split("-")[0]
+        # Cache get_cpu_features() - it calls into LLVM and costs ~150µs on aarch64.
+        if CPUBackend._cpu_features_cache is None:
+            CPUBackend._cpu_features_cache = llvm.get_cpu_features()
+            CPUBackend._cpu_arch_cache = llvm.get_cpu_tripple().split("-")[0]
+        self.cpu_features = CPUBackend._cpu_features_cache
+        self.cpu_arch = CPUBackend._cpu_arch_cache
         # Only detect vscale on aarch64 with SVE; None means SVE unused
+        # Use class-level cache to avoid re-running the subprocess on every call.
         if self.cpu_arch == "aarch64" and "sve" in self.cpu_features:
-            self.sve_vscale = self._detect_sve_vscale()
+            # _detect_sve_vscale() is an expensive call that runs a subprocess and costs 39 ms,
+            # so we only want to do it once and cache the result.
+            # We also want to be able to force SVE on or off for testing purposes, even if the hardware does or doesn't support it.
+            if not CPUBackend._sve_vscale_detected:
+                CPUBackend._sve_vscale_cache = self._detect_sve_vscale()
+                CPUBackend._sve_vscale_detected = True
+            self.sve_vscale = CPUBackend._sve_vscale_cache
         else:
             self.sve_vscale = None
 

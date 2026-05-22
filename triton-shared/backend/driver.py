@@ -4,6 +4,11 @@ import sysconfig
 import time
 import triton
 
+# Maps MD5 launcher key -> loaded mod.launch function.
+# Avoids re-instantiating FileCacheManager (and its ~100µs of Path.home() +
+# lstat syscalls) on every kernel dispatch once the .so is already loaded.
+_LAUNCHER_MODULE_CACHE: dict = {}
+
 import os, subprocess, tempfile, platform
 import importlib
 import importlib.util
@@ -268,6 +273,11 @@ def compile_module(launcher_src, kernel_placeholder_name):
     cpu_backend_path = Path(__file__).resolve().parent
     include_dir = os.path.join(cpu_backend_path, "include")
 
+    # Mutable cell: _cached_key[0] holds the MD5 hex string after the first call.
+    # kernel_obj (cu_function) and kernel_name are fixed for a given compiled kernel,
+    # so src and therefore the key never change across calls to this closure.
+    _cached_key = [None]
+
     def launch(
         gridX, gridY, gridZ, stream, cu_function,
         kernel_metadata, launch_metadata,
@@ -278,9 +288,26 @@ def compile_module(launcher_src, kernel_placeholder_name):
         # See CPUUtils.load_binary method.
         kernel_obj = cu_function
         kernel_name = kernel_metadata[6] # see pack_metadata in compiler.py
-        src = launcher_src.replace(kernel_placeholder_name, kernel_name)
 
+        # Fast path: key and .so are both cached — skip MD5, src build, and all filesystem work.
+        if _cached_key[0] is not None and _cached_key[0] in _LAUNCHER_MODULE_CACHE:
+            return _LAUNCHER_MODULE_CACHE[_cached_key[0]](gridX, gridY, gridZ,
+                                                          kernel_metadata, launch_metadata,
+                                                          launch_enter_hook, launch_exit_hook,
+                                                          *args)
+
+        src = launcher_src.replace(kernel_placeholder_name, kernel_name)
         key = hashlib.md5(src.encode("utf-8") + kernel_obj).hexdigest()
+        _cached_key[0] = key
+
+        # Second fast path: module already loaded (e.g. from a prior process run that
+        # populated _LAUNCHER_MODULE_CACHE) but _cached_key was not yet set.
+        if key in _LAUNCHER_MODULE_CACHE:
+            return _LAUNCHER_MODULE_CACHE[key](gridX, gridY, gridZ,
+                                               kernel_metadata, launch_metadata,
+                                               launch_enter_hook, launch_exit_hook,
+                                               *args)
+
         cache = get_cache_manager(key)
         name = "__triton_shared_ref_cpu_kernel_launcher"
 
@@ -332,6 +359,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
             raise RuntimeError(f"Cannot find {name} module in {cache_path}")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+        _LAUNCHER_MODULE_CACHE[key] = mod.launch
         return mod.launch(gridX, gridY, gridZ,
                           kernel_metadata, launch_metadata,
                           launch_enter_hook, launch_exit_hook,

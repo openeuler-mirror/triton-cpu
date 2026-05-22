@@ -323,19 +323,35 @@ def compile(src, target=None, options=None):
     return CompiledKernel(src, metadata_group, hash)
 
 
+# Cache backend instances by (backend, arch, warp_size) so that CPUBackend.__init__
+# (which calls the expensive get_cpu_features() LLVM introspection) only runs once
+# per process rather than on every kernel invocation.
+_make_backend_cache: dict = {}
+
+
 def make_backend(target):
+    cache_key = (target.backend, target.arch, target.warp_size)
+    cached = _make_backend_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     # Handle CPU backend selection
     if target.backend == "cpu":
         if os.environ.get("TRITON_USE_SHARED_BACKEND", "0") == "1":
-            return backends["triton_shared"].compiler(target)
-        return backends["cpu"].compiler(target)
+            backend = backends["triton_shared"].compiler(target)
+        else:
+            backend = backends["cpu"].compiler(target)
+        _make_backend_cache[cache_key] = backend
+        return backend
 
     print(f"Target: {target}")
     actives = [x.compiler for x in backends.values() if x.compiler.supports_target(target)]
     if len(actives) != 1:
         raise RuntimeError(
             f"{len(actives)} compatible backends for target ({target.backend}) ({actives}). There should only be one.")
-    return actives[0](target)
+    backend = actives[0](target)
+    _make_backend_cache[cache_key] = backend
+    return backend
 
 
 class LazyDict:
@@ -417,10 +433,17 @@ class CompiledKernel:
         self.module, self.function, self.n_regs, self.n_spills = driver.active.utils.load_binary(
             self.name, self.kernel, self.metadata.shared, device)
 
-    def __getattribute__(self, name):
+    def __getattr__(self, name):
+        # __getattr__ is only called when normal lookup fails (i.e. the attribute
+        # is absent from __dict__).  self.run is not set in __init__, so the first
+        # access lands here, initialises handles, and stores self.run in __dict__.
+        # Subsequent accesses find it in __dict__ and never reach this method,
+        # avoiding the per-call overhead of __getattribute__ which fired on every
+        # attribute access (12x per kernel invocation even after initialisation).
         if name == 'run':
             self._init_handles()
-        return super().__getattribute__(name)
+            return self.run
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def launch_metadata(self, grid, stream, *args):
         if CompiledKernel.launch_enter_hook is None:
@@ -440,7 +463,8 @@ class CompiledKernel:
         return ret
 
     def __getitem__(self, grid):
-        self._init_handles()
+        if 'run' not in self.__dict__:
+            self._init_handles()
 
         def runner(*args, stream=None):
             if stream is None:
