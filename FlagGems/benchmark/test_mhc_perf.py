@@ -8,13 +8,16 @@ Usage:
 import pytest
 import torch
 
-from flag_gems.fused.mhc.hc_split_sinkhorn import (
-    hc_split_sinkhorn,
-    mhc_split_sinkhorn_torch_ref,
-)
-from flag_gems.fused.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
-from flag_gems.fused.mhc.mhc_post import mhc_post, mhc_post_ref
-from flag_gems.fused.mhc.mhc_pre import mhc_pre, mhc_pre_ref
+try:
+    from flag_gems.fused.mhc.hc_split_sinkhorn import (
+        hc_split_sinkhorn,
+        mhc_split_sinkhorn_torch_ref,
+    )
+    from flag_gems.fused.mhc.mhc_bwd import mhc_bwd, mhc_bwd_ref, sinkhorn_forward
+    from flag_gems.fused.mhc.mhc_post import mhc_post, mhc_post_ref
+    from flag_gems.fused.mhc.mhc_pre import mhc_pre, mhc_pre_ref
+except ModuleNotFoundError as exc:
+    pytest.skip(f"mHC fused benchmarks are unavailable: {exc}", allow_module_level=True)
 
 from .performance_utils import Benchmark
 
