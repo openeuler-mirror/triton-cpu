@@ -48,10 +48,11 @@ log_softmax:
     BLOCK_N: 128
   num_warps: 4
 mm:
+# SME minimum should be M=SVL, N=Vscalex16 K whatev to represent SME microK, take SVL16bits=vscalex8 for safety
 - META:
-    BLOCK_M: 4
-    BLOCK_N: 4
-    BLOCK_K: 4
+    BLOCK_M: 256
+    BLOCK_N: 256
+    BLOCK_K: 256
   num_stages: 4
   num_warps: 4
 - META:
