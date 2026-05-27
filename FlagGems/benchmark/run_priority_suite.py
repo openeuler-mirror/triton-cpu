@@ -83,6 +83,18 @@ MARK_ALIASES = {
     "scatter_": "scatter_src_",
 }
 
+PYTEST_META_MARKERS = {
+    "parametrize",
+    "skip",
+    "skipif",
+    "xfail",
+    "usefixtures",
+    "filterwarnings",
+    "timeout",
+    "tryfirst",
+    "trylast",
+}
+
 PRINT_LOCK = threading.Lock()
 ACTIVE_PROCESSES_LOCK = threading.Lock()
 ACTIVE_PROCESSES: dict[int, tuple[str, subprocess.Popen[str]]] = {}
@@ -120,6 +132,12 @@ class CommandResult:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the high-priority FlagGems benchmark suite."
+    )
+    parser.add_argument(
+        "-all",
+        "--all",
+        action="store_true",
+        help="Run all operator benchmarks discovered from benchmark markers.",
     )
     parser.add_argument(
         "--ops",
@@ -169,7 +187,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Run directory name. If it exists, it will be overwritten.",
     )
-    return parser.parse_args()
+    parsed = parser.parse_args()
+    if parsed.all and parsed.ops:
+        parser.error("-all/--all cannot be used together with --ops")
+    return parsed
 
 
 def resolve_requested_ops(requested_ops: list[str] | None) -> list[str]:
@@ -195,6 +216,8 @@ def discover_marked_tests() -> dict[str, str]:
             if not stripped.startswith("@pytest.mark."):
                 continue
             marker = stripped[len("@pytest.mark.") :].split("(", 1)[0].strip()
+            if marker in PYTEST_META_MARKERS:
+                continue
             if marker and marker not in discovered:
                 discovered[marker] = path.name
     return discovered
@@ -706,15 +729,19 @@ def main() -> int:
     args = parse_args()
     previous_sigint_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, handle_interrupt)
-    requested_ops = resolve_requested_ops(args.ops)
     discovered = discover_marked_tests()
+    requested_ops = (
+        sorted(discovered.keys())
+        if args.all
+        else resolve_requested_ops(args.ops)
+    )
     run_dir = build_run_dir(args)
     bootstrap_dir = write_sitecustomize(run_dir)
 
     unavailable_ops = []
     runnable_ops = []
     for op_name in requested_ops:
-        marker = MARK_ALIASES.get(op_name, op_name)
+        marker = op_name if args.all else MARK_ALIASES.get(op_name, op_name)
         test_file = discovered.get(marker)
         if test_file is None:
             unavailable_ops.append(
