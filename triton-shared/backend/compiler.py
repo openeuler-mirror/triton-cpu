@@ -19,9 +19,6 @@ from mlir.dialects import pdl
 from mlir.dialects.transform import pdl as transform_pdl
 from mlir.dialects.transform import structured, loop, vector, bufferization, tensor
 
-## Use SME/SVE even if the CPU does not support it. Will result in a crash but will generate the binary
-FORCE_SME = False
-FORCE_SVE = False
 ENABLE_FALLBACK = False
 
 def _get_triton_shared_opt_path() -> str:
@@ -1043,56 +1040,179 @@ class CPUBackend(BaseBackend):
             return src + "\n" + str(mod)
 
 
-    def _sme_transform(self, src: str) -> str:
+    def _sme_transform(self, src: str) -> str:    
+        def make_matmul_matcher(bitwidth):
+            """Creates a matcher named sequence to match matmuls with a given bitwidth.
+            """
+            any_op = transform.AnyOpType.get()
+            any_value = transform.AnyValueType.get()
+            name = f'matmul_f{bitwidth}_matcher'
+            seq = transform.NamedSequenceOp(
+                name,
+                [any_op],
+                [any_op],
+                arg_attrs=[{"transform.readonly": UnitAttr.get()}],
+            )
+            i64_type = IntegerType.get_signless(64)
+            param_i64_type = transform.ParamType.get(i64_type)
+            with InsertionPoint(seq.body):
+                candidate = seq.body.arguments[0]
+                match_op = Operation.create(
+                    "transform.match.structured",
+                    results=[any_op], operands=[candidate],
+                    attributes={
+                        "failure_propagation_mode": IntegerAttr.get(
+                            IntegerType.get_signless(32),
+                            int(transform.FailurePropagationMode.Propagate),
+                        ),
+                    },
+                    regions=1,
+                )
+                body = match_op.regions[0].blocks.append(any_op)
+                struct = body.arguments[0]
+                with InsertionPoint(body):
+                    transform.match_operation_name(
+                        candidate,
+                        [
+                            "linalg.matmul_transpose_a",
+                            "linalg.batch_matmul_transpose_a",
+                        ],
+                    )
+                    attrs = {"raw_position_list": DenseI64ArrayAttr.get([0])}
+                    init = Operation.create(
+                        "transform.match.structured.init",
+                        results=[any_value], operands=[struct], attributes=attrs,
+                    ).results[0]
+                    op_bw = Operation.create(
+                        "transform.match.structured.elemental_bitwidth",
+                        results=[param_i64_type], operands=[init],
+                    ).results[0]
+                    bw_ref = transform.ParamConstantOp(
+                        param_i64_type, IntegerAttr.get(i64_type, bitwidth),
+                    ).param
+                    transform.MatchParamCmpIOp(
+                        op_bw, bw_ref, transform.MatchCmpIPredicate.eq,
+                    )
+                    Operation.create(
+                        "transform.match.structured.yield",
+                        operands=[struct],
+                    )
 
-        def step1():
+                transform.YieldOp([match_op.results[0]])
+            return name
+
+        def make_tile_matmul_for_bitwidth_action(bitwidth):
+            VL = 128 // bitwidth
+            any_op_type = transform.AnyOpType.get()
+            for_op_type = transform.OperationType.get("scf.for")
+            name = f"__tile_matmul_{bitwidth}bit"
+            """Create a tiling sequence for a specific bitwidth."""
             sequence = transform.NamedSequenceOp(
-                "__step1",
+                name,
+                [any_op_type],
+                [],
+                arg_attrs=[{"transform.consumed": UnitAttr.get()}],
+            )
+            with InsertionPoint(sequence.body):
+                # Apply SVL-aware tiling. The constant [16] allows the usage of all
+                # available zaTiles for a given element type. Tiling by SVLxSVLxnbTiles=
+                # [vscale x VL] x [vscale x 128 / bitwidth x bitwidth / 8] = [VL] x [16]
+                tiled = structured.TileUsingForOp(
+                    sequence.bodyTarget,
+                    sizes=[[VL], [16], 1],
+                    interchange=[0, 1, 2]
+                )
+                # Peel each loop from innermost to outermost
+                loops = tiled.results[1:-1]  # Skip the first result (tiled linalg) and the last (tiled by 1)
+                for l in reversed(loops):
+                    castedLoop = transform.CastOp(for_op_type, l)
+                    outermost_peeled, remainder = loop.LoopPeelOp(for_op_type, for_op_type, castedLoop.result).results
+                # After peeling, matmuls in both the peeled loop and the remainder 
+                m_peeled = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    outermost_peeled,
+                    [
+                        "linalg.matmul_transpose_a",
+                        "linalg.batch_matmul_transpose_a",
+                    ],
+                )
+                structured.VectorizeOp(m_peeled.result, [[VL], [16], 1])
+                m_remainder = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    remainder,
+                    [
+                        "linalg.matmul_transpose_a",
+                        "linalg.batch_matmul_transpose_a",
+                    ],
+                )
+                structured.VectorizeOp(m_remainder.result, [[VL], [16], 1])
+                transform.YieldOp([])
+            return name
+
+        def tile_matmul_sme():
+            any_op = transform.AnyOpType.get()
+            matcher_list = []
+            action_list = []
+            for bitwidth in [16, 32, 64]:
+                matmul_matcher_name = make_matmul_matcher(bitwidth)
+                tile_action = make_tile_matmul_for_bitwidth_action(bitwidth)
+                matcher_list.append(FlatSymbolRefAttr.get(matmul_matcher_name))
+                action_list.append(FlatSymbolRefAttr.get(tile_action))
+
+            seq = transform.NamedSequenceOp(
+                "__tile_and_vec_sme", [any_op], [any_op],
+                arg_attrs=[{"transform.readonly": UnitAttr.get()}],
+            )
+            with InsertionPoint(seq.body):
+                matmuls = structured.MatchOp.match_op_names(
+                    seq.bodyTarget,
+                    ["linalg.matmul", "linalg.batch_matmul"]
+                )
+                transposed_mm = structured.TransposeMatmulOp(any_op, matmuls)
+                # ForeachMatchOp iterates over elements strictly IN the target handle.
+                matmul_parents = transform.GetParentOp(any_op, transposed_mm, deduplicate=True)
+                transform.ForeachMatchOp(
+                    any_op, [], matmul_parents, [],
+                    ArrayAttr.get(matcher_list),
+                    ArrayAttr.get(action_list),
+                )
+                # cleaned = apply_cleanup(module.updated, run_vector_hoists=True)
+                transform.YieldOp([seq.bodyTarget])
+
+        def bufferize_schedule():
+            sequence = transform.NamedSequenceOp(
+                "__bufferize_schedule",
                 [transform.AnyOpType.get()],
                 [transform.AnyOpType.get()],
                 arg_attrs = [{"transform.consumed": UnitAttr.get()}],
             )
                 
             with InsertionPoint(sequence.body):
-
-                ## get matmul
-                matmuls = structured.MatchOp.match_op_names(
-                    sequence.bodyTarget,
-                    ["linalg.matmul"]
-                )
-                
-                # Step 1: Tile for size [4] x [4], which corresponds to SVLs x SVLs, where
-                # SVLs is the number of 32-bit elements in a vector of SVL bits.
-                tiled = structured.TileUsingForOp(matmuls.result, sizes=[[4],[4],1])
-                # Step 2: Vectorize.
-                structured.VectorizeOp(tiled.results[0], [[4], [4], 1])
-                # Step 3: Bufferize ahead of TransferReadDropUnitDimsPattern, which
-                # currently only supports memrefs.
                 buff = bufferization.OneShotBufferizeOp(
                     sequence.bodyTarget, bufferize_function_boundaries=True)
-                ## get the funcs
+
                 funcs = structured.MatchOp.match_op_names(
                     transform.AnyOpType.get(),
                     buff.result,
-                    ["func.func"]
+                    ["func.func"],
                 )
 
-                l = transform.ApplyRegisteredPassOp(
+                linalg2loops = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
                     funcs.result,
                     "convert-linalg-to-loops",
                 )
 
-                # Step 4: Lower vector.multi_reduction to vector.contract (+ some helpful patterns).
-                with InsertionPoint(transform.ApplyPatternsOp(l).patterns):
+                # Lower vector.multi_reduction to vector.contract (+ some helpful patterns).
+                with InsertionPoint(transform.ApplyPatternsOp(linalg2loops).patterns):
                     vector.ApplyLowerMaskedTransfersPatternsOp()
                     vector.ApplyTransferPermutationPatternsOp()
                     vector.ApplyVectorReductionToContractPatternsOp()
 
-                # Step 5: Lower vector.contract to vector.outerproduct. Also drop unit
+                # Lower vector.contract to vector.outerproduct. Also drop unit
                 # dims, specifically to prevent vector.transfer_read of vector<[4]x1xf32>,
                 # which can't be lowered in generic path.
-                with InsertionPoint(transform.ApplyPatternsOp(l).patterns):
+                with InsertionPoint(transform.ApplyPatternsOp(linalg2loops).patterns):
                     vector.ApplyCastAwayVectorLeadingOneDimPatternsOp()
                     tensor.ApplyFoldTensorSubsetOpsIntoVectorTransfersPatternsOp()
                     vector.ApplyLowerContractionPatternsOp(lowering_strategy=vector.VectorContractLowering.OuterProduct)
@@ -1113,6 +1233,16 @@ class CPUBackend(BaseBackend):
                     all_loops.result,
                 )
 
+                dealloced = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    linalg2loops,
+                    "buffer-deallocation-pipeline",
+                )
+                transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    dealloced.result,
+                    "convert-bufferization-to-memref",
+                )
                 transform.YieldOp([buff.result])
  
         def arm_sme_lowering_schedule():
@@ -1120,103 +1250,113 @@ class CPUBackend(BaseBackend):
                 "__arm_sme_lowering_schedule",
                 [transform.AnyOpType.get()],
                 [transform.AnyOpType.get()],
-                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
+                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
             )
             with InsertionPoint(sequence.body):
-                result = transform.lower_to_arm_sme(
+                transform.lower_to_arm_sme(
                     sequence.bodyTarget,
                 )
-                transform.YieldOp([sequence.bodyTarget])
+                res = cleanup_schedule(sequence.bodyTarget)
+                transform.YieldOp([res])
 
         def lower_to_llvm():
             sequence = transform.NamedSequenceOp(
-                "__lower_to_llvm",
+                "__lower_to_llvm_schedule",
                 [transform.AnyOpType.get()],
                 [transform.AnyOpType.get()],
-                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
+                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
             )
             with InsertionPoint(sequence.body):
-                result = transform.lower_to_llvm_new(
+                transform.lower_to_llvm_new(
                     sequence.bodyTarget,
                     enable_arm_sve=True,
                     enable_index_optimizations=True,
                     vscale_range=0,
                 )
-                transform.YieldOp([sequence.bodyTarget])
-                    
-        def step2(include, name):
-            sequence = transform.NamedSequenceOp(
-                "__step2_" + name,
-                [transform.AnyOpType.get()],
-                [],
-                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
+                res = cleanup_schedule(sequence.bodyTarget)
+                transform.YieldOp([res])
+
+        def cleanup_schedule(target):
+            cse = transform.ApplyRegisteredPassOp(
+                transform.AnyOpType.get(),
+                target,
+                "cse",
             )
+
+            with InsertionPoint(transform.ApplyPatternsOp(cse).patterns):
+                structured.apply_patterns_linalg_tiling_canonicalization()
+                loop.apply_patterns_scf_for_loop_canonicalization()
+
+            looplike = structured.MatchOp.__base__(
+                transform.AnyOpType.get(),
+                cse.result,
+                interface=structured.MatchInterfaceEnum.LoopLikeInterface
+            )
+
+            transform.apply_licm(
+                looplike.result,
+            )
+
+            funcs = structured.MatchOp.match_op_names(
+                transform.AnyOpType.get(),
+                cse.result,
+                ["func.func"]
+            )
+
+            a = transform.structured.HoistRedundantVectorTransfersOp(
+                transform.AnyOpType.get(),
+                funcs.result,
+            )
+
+            b = transform.structured.HoistRedundantVectorBroadcastsOp(
+                transform.AnyOpType.get(),
+                a.result,
+            )
+
+            transform.ApplyRegisteredPassOp(
+                transform.AnyOpType.get(),
+                b.result,
+                "canonicalize",
+            )
+            return cse.result
+
+        def vector_lowering():
+            sequence = transform.NamedSequenceOp(
+                "__vector_lowering_schedule",
+                [transform.AnyOpType.get()],
+                [transform.AnyOpType.get()],
+                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
+            )
+
             with InsertionPoint(sequence.body):
-                ## get all funcs
                 funcs = structured.MatchOp.match_op_names(
-                    transform.AnyOpType.get(),
                     sequence.bodyTarget,
-                    ["func.func"]
+                    ["func.func"],
                 )
-                ## get parent op
-                p = transform.get_parent_op(
-                    transform.AnyOpType.get(),
-                    funcs.result, 
-                    deduplicate=True,
-                )
-                ## include
-                sme = transform.IncludeOp(
-                    [transform.AnyOpType.get()],
-                    include,
-                    transform.FailurePropagationMode.Propagate,
-                    [p],
-                )
-                
-                ## cse
+                with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
+                    # Lower potention multireduction before contration patters to avoid missing lowering opportunities after vector reduction to contract patterns.
+                    vector.ApplyLowerMultiReductionPatternsOp(lowering_strategy=vector.VectorMultiReductionLowering.InnerReduction)
+                    vector.ApplyLowerContractionPatternsOp(lowering_strategy=vector.VectorContractLowering.OuterProduct)
+                    vector.ApplyTransferPermutationPatternsOp()
+                    # Repeat lowerMultiReduction in case lowerContraction generated some multi reductions.
+                    vector.ApplyLowerMultiReductionPatternsOp(lowering_strategy=vector.VectorMultiReductionLowering.InnerReduction)
+                    vector.ApplySplitTransferFullPartialPatternsOp(split_transfer_strategy=vector.VectorTransferSplit.VectorTransfer)
+                    vector.ApplyLowerTransferPatternsOp()
+                    # TODO: Check if full unroll false is still necessary with tiling.
+                    vector.ApplyTransferToScfPatternsOp(full_unroll=True)
+                    vector.ApplyLowerShapeCastPatternsOp()
+                    # TODO: CHECK if we still need that lowering strategy once we have auto tiling.
+                    vector.ApplyLowerTransposePatternsOp()
+
+                res_pass = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(), sequence.bodyTarget, "scf-for-to-while")
+                # Cleanup after scf-for-to-while to eliminate any
+                # bufferization.clone/redundant ops before LLVM lowering.
                 cse = transform.ApplyRegisteredPassOp(
-                    transform.AnyOpType.get(),
-                    sme.result,
-                    "cse",
-                )
-
-                with InsertionPoint(transform.ApplyPatternsOp(cse).patterns):
-                    structured.apply_patterns_linalg_tiling_canonicalization()
-                    loop.apply_patterns_scf_for_loop_canonicalization()
-                
-                ## match looplike
-                looplike = structured.MatchOp.__base__(
-                    transform.AnyOpType.get(),
-                    cse.result,
-                    interface=structured.MatchInterfaceEnum.LoopLikeInterface
-                )
-                ## apply licm
-                transform.apply_licm(
-                    looplike.result,
-                )
-                ## match func from cse
-                funcs = structured.MatchOp.match_op_names(
-                    transform.AnyOpType.get(),
-                    cse.result,
-                    ["func.func"]
-                )
-                ## hoist redudant vector transfers
-                a = transform.structured.HoistRedundantVectorTransfersOp(
-                    transform.AnyOpType.get(),
-                    funcs.result,
-                )
-                ## hoist redundant vector broadcasts
-                b = transform.structured.HoistRedundantVectorBroadcastsOp(
-                    transform.AnyOpType.get(),
-                    a.result,
-                )
-                ## canonicalize
-                transform.ApplyRegisteredPassOp(
-                    transform.AnyOpType.get(),
-                    b.result,
-                    "canonicalize",
-                )
-
-                transform.YieldOp([])
+                    transform.AnyOpType.get(), res_pass.result, "cse")
+                can = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(), cse.result, "canonicalize")
+                transform.YieldOp([can])
 
         def opt():
             sequence = transform.NamedSequenceOp(
@@ -1288,36 +1428,52 @@ class CPUBackend(BaseBackend):
                 "__transform_main",
                 [transform.AnyOpType.get()],
                 [],
-                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
+                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
             )
             with InsertionPoint(sequence.body):
-                ## include step 1
-                first = transform.IncludeOp(
-                    [transform.AnyOpType.get()],
-                    FlatSymbolRefAttr.get("__step1"),
-                    transform.FailurePropagationMode.Propagate,
-                    [sequence.bodyTarget],
-                )
-                ## include step 2 sme
-                transform.IncludeOp(
-                    [],
-                    FlatSymbolRefAttr.get("__step2_sme"),
-                    transform.FailurePropagationMode.Propagate,
-                    [first],
-                )
-
                 funcs = structured.MatchOp.match_op_names(
-                    transform.OperationType.get("func.func"),
-                    first,
+                    transform.AnyOpType.get(),
+                    sequence.bodyTarget,
                     ["func.func"]
                 )
- 
-                ## for each
+                module = transform.get_parent_op(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                    deduplicate=True,
+                )
+                vectorized = transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    FlatSymbolRefAttr.get("__tile_and_vec_sme"),
+                    transform.FailurePropagationMode.Propagate,
+                    [module],
+                )
+                bufferized = transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    FlatSymbolRefAttr.get("__bufferize_schedule"),
+                    transform.FailurePropagationMode.Propagate,
+                    [vectorized],
+                )
+                sme = transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    FlatSymbolRefAttr.get("__arm_sme_lowering_schedule"),
+                    transform.FailurePropagationMode.Propagate,
+                    [bufferized],
+                )
+                lowvec = transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    FlatSymbolRefAttr.get("__vector_lowering_schedule"),
+                    transform.FailurePropagationMode.Propagate,
+                    [sme],
+                )
+                funcs = structured.MatchOp.match_op_names(
+                    transform.OperationType.get("func.func"),
+                    lowvec,
+                    ["func.func"]
+                )
                 foreach = transform.ForeachOp(
                     [],
                     funcs,
                 )
-                    
                 foreachBody = foreach.body.blocks.append(transform.OperationType.get("func.func"))
                     
                 with InsertionPoint(foreachBody):
@@ -1330,12 +1486,11 @@ class CPUBackend(BaseBackend):
                     )
                     transform.YieldOp([])
  
-                ## include step 2 llvm
                 transform.IncludeOp(
-                    [],
-                    FlatSymbolRefAttr.get("__step2_llvm"),
+                    [transform.AnyOpType.get()],
+                    FlatSymbolRefAttr.get("__lower_to_llvm_schedule"),
                     transform.FailurePropagationMode.Propagate,
-                    [first],
+                    [lowvec],
                 )
 
                 transform.YieldOp([])
@@ -1343,28 +1498,27 @@ class CPUBackend(BaseBackend):
         
         with Context() as ctx, Location.unknown():
             mod = Module.create()
-            ## add attributes to the module
             mod.operation.attributes["transform.with_named_sequence"] = UnitAttr.get()
             
             with InsertionPoint(mod.body):
-                step1()
+                tile_matmul_sme()
+                bufferize_schedule()
                 arm_sme_lowering_schedule()
-                lower_to_llvm()
-                step2(FlatSymbolRefAttr.get("__arm_sme_lowering_schedule"), "sme")
+                vector_lowering()
                 opt()
-                step2(FlatSymbolRefAttr.get("__lower_to_llvm"), "llvm")
+                lower_to_llvm()
                 transform_main()
 
             ## Append our transform to the original source
             return src + "\n" + str(mod)
 
-       
-
     @timer
     def _optimize_ttsharedir(self, src: str):
-        if(FORCE_SME or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features)):
+        if(os.environ.get("TRITON_SHARED_FORCE_SME_PIPELINE", "0") == "1" or \
+          (self.cpu_arch == "aarch64" and "sme" in self.cpu_features)):
             return self._sme_transform(src)
-        elif (FORCE_SVE or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features)):
+        elif (os.environ.get("TRITON_SHARED_FORCE_SVE_PIPELINE", "0") == "1" or \
+              (self.cpu_arch == "aarch64" and "sve" in self.cpu_features)):
             return self._sve_transform(src)
 
 
@@ -1445,7 +1599,9 @@ class CPUBackend(BaseBackend):
             pm.enable_debug()
 
 
-            if FORCE_SME or FORCE_SVE or (self.cpu_arch == "aarch64" and {"sme", "sve"} & set(self.cpu_features)):
+            if os.environ.get("TRITON_SHARED_FORCE_SME_PIPELINE", "0") == "1" or \
+               os.environ.get("TRITON_SHARED_FORCE_SVE_PIPELINE", "0") == "1" or \
+               (self.cpu_arch == "aarch64" and {"sme", "sve"} & set(self.cpu_features)):
                 # DEBUG: run passes one at a time and dump IR between each
                 if kernel_debug_dir:
                     os.makedirs(kernel_debug_dir, exist_ok=True)
@@ -1557,13 +1713,15 @@ class CPUBackend(BaseBackend):
             Path(src_path).write_text(llir)
             llc_path = _get_llvm_bin_path("llc")
             flags = ""
-            if FORCE_SME or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
+            if os.environ.get("TRITON_SHARED_FORCE_SME_PIPELINE", "0") == "1" \
+                or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
                 flags = (
                     "-mtriple=aarch64-linux-gnu",
                     "-mattr=+sme,+dotprod,+v9a,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+sve,+sve2",
                     "-disable-interleaved-load-combine=true",
                 )
-            elif FORCE_SVE or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
+            elif os.environ.get("TRITON_SHARED_FORCE_SVE_PIPELINE", "0") == "1" \
+                or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
                 flags = (
                     "-mtriple=aarch64-linux-gnu",
                     "-mattr=+sve,+dotprod,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+spe",
