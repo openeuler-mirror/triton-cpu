@@ -1133,8 +1133,8 @@ def get_diagonal_backward_shape_and_dims():
     for s in shapes:
         dim_pairs = get_dim1_dim2(len(s))
         if dim_pairs:
-            dim1, dim2 = random.choice(dim_pairs)
-            result.append((s, dim1, dim2))
+            for dim1, dim2 in dim_pairs:
+                result.append((s, dim1, dim2))
 
     return result
 
