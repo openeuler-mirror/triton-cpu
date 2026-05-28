@@ -28,6 +28,7 @@ from .attri_util import (
     model_shapes,
 )
 from .conftest import Config, emit_record_logger
+from .utils import SkipVersion
 
 torch_backend_device = flag_gems.runtime.torch_backend_device
 torch_device_fn = flag_gems.runtime.torch_device_fn

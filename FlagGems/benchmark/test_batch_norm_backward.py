@@ -3,8 +3,14 @@ import torch
 
 import flag_gems
 
-from . import attr_util as attr_utils
+from . import attri_util as attr_utils
 from . import performance_utils as utils
+
+
+def _saved_stat_dtype(dtype):
+    # CPU torch.ops.aten.native_batch_norm_backward expects saved stats to match
+    # the tensor dtype for fp16/bf16 inputs, while GPU uses fp32 stats.
+    return dtype if flag_gems.device == "cpu" else torch.float32
 
 
 # TODO(Qiming): Consolidate this to a base package
@@ -66,8 +72,9 @@ def test_batch_norm_backward():
             if running_var is None:
                 running_var = torch.ones(channels, dtype=dtype, device=device)
 
-            save_mean = torch.randn(channels, dtype=torch.float32, device=device)
-            save_invstd = torch.randn(channels, dtype=torch.float32, device=device)
+            stat_dtype = _saved_stat_dtype(dtype)
+            save_mean = torch.randn(channels, dtype=stat_dtype, device=device)
+            save_invstd = torch.randn(channels, dtype=stat_dtype, device=device)
             output_mask = [True, weight is not None, bias is not None]
 
             yield (

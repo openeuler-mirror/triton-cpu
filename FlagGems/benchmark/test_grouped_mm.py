@@ -8,6 +8,9 @@ import flag_gems
 from . import performance_utils as base
 
 
+GEMS_OP = getattr(flag_gems, "group_mm", None)
+
+
 class GroupmmBenchmark(base.BlasBenchmark):
     def get_input_iter(self, dtype) -> Generator:
         for groups, n, k in self.shapes:
@@ -62,6 +65,8 @@ def _input_fn(groups, N, K, cur_dtype, device):
     base.SkipVersion("torch", "<2.8"),
     reason="torch._grouped_mm requires PyTorch >= 2.8.0.",
 )
+@pytest.mark.skipif(flag_gems.device == "cpu", reason="grouped_mm benchmark is CUDA-only")
+@pytest.mark.skipif(GEMS_OP is None, reason="'group_mm' not found in FlagGems")
 def test_grouped_mm(monkeypatch):
     if flag_gems.vendor_name == "mthreads":
         monkeypatch.setenv("MUSA_ENABLE_SQMMA", "1")
@@ -70,7 +75,7 @@ def test_grouped_mm(monkeypatch):
         op_name="grouped_mm",
         input_fn=_input_fn,
         torch_op=torch._grouped_mm,
-        gems_op=flag_gems.group_mm,
+        gems_op=GEMS_OP,
         dtypes=[torch.bfloat16],
     )
 
