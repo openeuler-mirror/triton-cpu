@@ -12,6 +12,7 @@ import subprocess
 import functools
 import textwrap
 import time
+import warnings
 from pathlib import Path
 from mlir.ir import *
 from mlir.dialects import transform
@@ -265,6 +266,54 @@ class CPUBackend(BaseBackend):
 
 
     def _sve_transform(self, src: str) -> str:
+        def linalg_opts():
+            """Apply linalg-level optimizations before tiling."""
+            any_op = transform.AnyOpType.get()
+            seq = transform.NamedSequenceOp(
+                "linalg_opts", [any_op], [],
+                arg_attrs=[{"transform.readonly": UnitAttr.get()}],
+            )
+            with InsertionPoint(seq.body):
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    seq.bodyTarget,
+                    ["func.func"]
+                )
+
+                # EW fusion needs to happen BEFORE `linalg_erase_unnecessary_inputs` to avoid correctness issues. e.g.
+                # FlagGems/tests/test_reduction_ops.py::test_accuracy_cross_entropy_loss_indices[dtype0-True-mean-1--100-shape2]
+                # TODO: Follow-up https://github.com/llvm/llvm-project/issues/154290
+                fused = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                    "linalg-fuse-elementwise-ops",
+                )
+
+                # linalg_fold_add_into_dest requires specialised linalg.add but linalg-fuse-ew dont
+                specialized = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    fused.result,
+                    "linalg-specialize-generic-ops",
+                )
+
+                with InsertionPoint(transform.ApplyPatternsOp(specialized).patterns):
+                    structured.apply_patterns_linalg_fold_add_into_dest()
+
+                # Flatten ew ops to 1D for more efficient tiling.
+                # TODO: requires LLVM change to support linalgs with broadcasted inputs
+                # e.g. FlagGems/tests/test_reduction_ops.py::test_accuracy_cross_entropy_loss_indices[dtype0-True-mean-1--100-shape2]
+                # linalgs = structured.MatchOp.__base__(
+                #     any_op,
+                #     fused,
+                #     interface=structured.MatchInterfaceEnum.LinalgOp,
+                # )
+                # structured.FlattenElementwiseLinalgOp(any_op, linalgs.result)
+                transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    specialized.result,
+                    "canonicalize",
+                )
+                transform.YieldOp()
 
         def main_type1(include, name):
             sequence = transform.NamedSequenceOp(
@@ -463,7 +512,7 @@ class CPUBackend(BaseBackend):
                     interchange=Attribute.parse("[0, 2, 1]"),
                 )
 
-                _tile = 4 * self.sve_vscale
+                _tile = 8 * self.sve_vscale
                 tiled2 = structured.TileUsingForOp(
                     tiled1.results[0],
                     sizes=[_tile, _tile, 1],
@@ -942,7 +991,14 @@ class CPUBackend(BaseBackend):
             )
                 
             with InsertionPoint(sequence.body):
-                    
+                # Apply pre-tiling linalg optimizations
+                opts = transform.IncludeOp(
+                    [],
+                    FlatSymbolRefAttr.get("linalg_opts"),
+                    transform.FailurePropagationMode.Suppress, # Flatten ew can emit failures for non-linalg ew ops, expected
+                    [sequence.bodyTarget],
+                )
+
                 include2 = transform.IncludeOp(
                     [],
                     FlatSymbolRefAttr.get("main_type1_contraction"),
@@ -1021,6 +1077,7 @@ class CPUBackend(BaseBackend):
             mod.operation.attributes["transform.with_named_sequence"] = UnitAttr.get()
             
             with InsertionPoint(mod.body):
+                linalg_opts()
                 contraction_schedule()
                 main_type1("contraction_schedule", "contraction")
                 vectorize_schedule()
@@ -1041,7 +1098,55 @@ class CPUBackend(BaseBackend):
             return src + "\n" + str(mod)
 
 
-    def _sme_transform(self, src: str) -> str:    
+    def _sme_transform(self, src: str) -> str:
+        # TODO: share with SVE transform.
+        def linalg_opts():
+            """Apply linalg-level optimizations before tiling."""
+            any_op = transform.AnyOpType.get()
+            seq = transform.NamedSequenceOp(
+                "linalg_opts", [any_op], [any_op],
+                arg_attrs=[{"transform.readonly": UnitAttr.get()}],
+            )
+            with InsertionPoint(seq.body):
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    seq.bodyTarget,
+                    ["func.func"]
+                )
+                # EW fusion needs to happen BEFORE `linalg_erase_unnecessary_inputs` to avoid correctness issues. e.g.
+                # FlagGems/tests/test_reduction_ops.py::test_accuracy_cross_entropy_loss_indices[dtype0-True-mean-1--100-shape2]
+                # TODO: Follow-up https://github.com/llvm/llvm-project/issues/154290
+                fused = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                    "linalg-fuse-elementwise-ops",
+                )
+
+                # linalg_fold_add_into_dest requires specialised linalg.add but linalg-fuse-ew dont
+                specialized = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    fused.result,
+                    "linalg-specialize-generic-ops",
+                )
+                with InsertionPoint(transform.ApplyPatternsOp(specialized).patterns):
+                    structured.apply_patterns_linalg_fold_add_into_dest()
+
+                # Flatten ew ops to 1D for more efficient tiling.
+                # TODO: requires LLVM change to support linalgs with broadcasted inputs
+                # e.g. FlagGems/tests/test_reduction_ops.py::test_accuracy_cross_entropy_loss_indices[dtype0-True-mean-1--100-shape2]
+                # linalgs = structured.MatchOp.__base__(
+                #     any_op,
+                #     fused,
+                #     interface=structured.MatchInterfaceEnum.LinalgOp,
+                # )
+                # structured.FlattenElementwiseLinalgOp(any_op, linalgs.result)
+                transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    specialized.result,
+                    "canonicalize",
+                )
+                transform.YieldOp([seq.bodyTarget])
+
         def make_matmul_matcher(bitwidth):
             """Creates a matcher named sequence to match matmuls with a given bitwidth.
             """
@@ -1442,11 +1547,17 @@ class CPUBackend(BaseBackend):
                     funcs.result,
                     deduplicate=True,
                 )
+                optimized_linalgs = transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    FlatSymbolRefAttr.get("linalg_opts"),
+                    transform.FailurePropagationMode.Suppress, # Flatten ew can emit failures for non-linalg ew ops, expected
+                    [module],
+                )
                 vectorized = transform.IncludeOp(
                     [transform.AnyOpType.get()],
                     FlatSymbolRefAttr.get("__tile_and_vec_sme"),
                     transform.FailurePropagationMode.Propagate,
-                    [module],
+                    [optimized_linalgs],
                 )
                 bufferized = transform.IncludeOp(
                     [transform.AnyOpType.get()],
@@ -1502,6 +1613,7 @@ class CPUBackend(BaseBackend):
             mod.operation.attributes["transform.with_named_sequence"] = UnitAttr.get()
             
             with InsertionPoint(mod.body):
+                linalg_opts()
                 tile_matmul_sme()
                 bufferize_schedule()
                 arm_sme_lowering_schedule()
@@ -1515,14 +1627,22 @@ class CPUBackend(BaseBackend):
 
     @timer
     def _optimize_ttsharedir(self, src: str):
-        if(os.environ.get("TRITON_SHARED_FORCE_SME_PIPELINE", "0") == "1" or \
-          (self.cpu_arch == "aarch64" and "sme" in self.cpu_features)):
+        has_matmul = "linalg.matmul" in src
+        if (os.environ.get("TRITON_SHARED_FORCE_SME_PIPELINE", "0") == "1"):
+            if not has_matmul:
+                warnings.warn("Running SME pipeline on payload without matmul.")
             return self._sme_transform(src)
-        elif (os.environ.get("TRITON_SHARED_FORCE_SVE_PIPELINE", "0") == "1" or \
-              (self.cpu_arch == "aarch64" and "sve" in self.cpu_features)):
+        if (os.environ.get("TRITON_SHARED_FORCE_SVE_PIPELINE", "0") == "1"):
+            return self._sve_transform(src)
+        if not self.cpu_arch == "aarch64":
+            return src
+
+        if ("sme" in self.cpu_features and has_matmul):
+            return self._sme_transform(src)
+        if ("sve" in self.cpu_features):
             return self._sve_transform(src)
 
-
+        warnings.warn("Neither SME or SVE detected/enabled, skipping transform.")
         return src
 
     def _extract_mlir_function(self, filepath: str) -> None:
