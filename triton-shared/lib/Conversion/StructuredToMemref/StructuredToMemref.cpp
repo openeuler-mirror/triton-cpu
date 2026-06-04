@@ -1131,12 +1131,37 @@ private:
     SmallVector<OpFoldResult> mixedDims = op.getMixedMaskDims();
     SmallVector<int64_t> staticMaskDims(op.getStaticMaskDims().begin(),
                                         op.getStaticMaskDims().end());
+
+    // Check whether the mask covers the full tensor statically (every static
+    // mask dim equals the corresponding tensor dim).  When true the `other`
+    // value can never be read, so we can ignore its presence and access the
+    // original buffer directly without an alloc+copy.
+    bool isMaskStaticallyFull = !staticMaskDims.empty();
+    for (size_t i = 0; i < staticMaskDims.size(); ++i) {
+      if (staticMaskDims[i] != tensorType.getShape()[i]) {
+        isMaskStaticallyFull = false;
+        break;
+      }
+    }
+
     bool canUseOriginalMemory =
-        !originalOrderAttr && !op.getOther() &&
+        !originalOrderAttr &&
+        (isMaskStaticallyFull || !op.getOther()) &&
         !ptr.getDefiningOp()->hasAttr(WRAP_SIDE_BY_SIDE) &&
         !ptr.getDefiningOp()->hasAttr(WRAP_STACKED) &&
         !ptr.getDefiningOp()->hasAttr(WRAP_1D);
     if (canUseOriginalMemory) {
+      // When the mask is statically full we know at compile time that every
+      // element is valid, so skip the runtime check entirely.
+      if (isMaskStaticallyFull) {
+        op.emitRemark("LoadConverter: rewriteMaskedLoad using raw memory "
+                      "directly (statically full mask).");
+        Value tensor = rewriter.create<bufferization::ToTensorOp>(
+            loc, tensorType, ptr, /*restrict=*/true, /*writable=*/false);
+        rewriter.replaceOp(op, tensor);
+        return success();
+      }
+
       Value isFullMask = createFullMaskCheck(loc, storageShape, mixedDims,
                                              staticMaskDims, rewriter);
       Value resultTensor =
