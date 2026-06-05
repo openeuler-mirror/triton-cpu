@@ -1295,7 +1295,9 @@ class CPUBackend(BaseBackend):
                 
             with InsertionPoint(sequence.body):
                 buff = bufferization.OneShotBufferizeOp(
-                    sequence.bodyTarget, bufferize_function_boundaries=True)
+                    sequence.bodyTarget, bufferize_function_boundaries=True,
+                    allow_return_allocs_from_loops=True,
+                    )
 
                 funcs = structured.MatchOp.match_op_names(
                     transform.AnyOpType.get(),
@@ -1341,15 +1343,15 @@ class CPUBackend(BaseBackend):
 
                 dealloced = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
-                    linalg2loops,
+                    buff.result,
                     "buffer-deallocation-pipeline",
                 )
-                transform.ApplyRegisteredPassOp(
+                converted = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
                     dealloced.result,
                     "convert-bufferization-to-memref",
                 )
-                transform.YieldOp([buff.result])
+                transform.YieldOp([converted.result])
  
         def arm_sme_lowering_schedule():
             sequence = transform.NamedSequenceOp(
