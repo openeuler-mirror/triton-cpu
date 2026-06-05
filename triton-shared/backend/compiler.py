@@ -1282,7 +1282,7 @@ class CPUBackend(BaseBackend):
                     ArrayAttr.get(matcher_list),
                     ArrayAttr.get(action_list),
                 )
-                # cleaned = apply_cleanup(module.updated, run_vector_hoists=True)
+                # Do not run any canonicalize until lower to arm SME
                 transform.YieldOp([seq.bodyTarget])
 
         def bufferize_schedule():
@@ -1392,8 +1392,8 @@ class CPUBackend(BaseBackend):
             )
 
             with InsertionPoint(transform.ApplyPatternsOp(cse).patterns):
-                structured.apply_patterns_linalg_tiling_canonicalization()
-                loop.apply_patterns_scf_for_loop_canonicalization()
+                    transform.ApplySetVscaleOp(vscale=self.sve_vscale)
+                    transform.ApplyCanonicalizationPatternsOp()
 
             looplike = structured.MatchOp.__base__(
                 transform.AnyOpType.get(),
