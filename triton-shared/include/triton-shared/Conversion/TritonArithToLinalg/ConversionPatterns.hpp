@@ -1174,16 +1174,27 @@ struct MatmulConverter : public OpConversionPattern<triton::DotOp> {
     bool integers = elementType.isInteger();
     bool skipC = isZeroTensor(opc, integers);
 
-    // Initialize result tensor with zeros
+    // Accumulate the matmul in (at least) f32 precision for narrow
+    // floating-point result types (f16/bf16). This matches tensor-core dot
+    // semantics, which accumulate in f32, and - crucially for the ArmSME
+    // backend - lets the outer products lower to base FEAT_SME widening FMOPA
+    // (f16/bf16 -> f32) instead of the non-widening f16f16 FMOPA, which
+    // requires the optional FEAT_SME_F16F16 extension. The wider accumulator is
+    // narrowed back to the requested element type after the matmul.
+    Type accType = elementType;
+    if (elementType.isF16() || elementType.isBF16())
+      accType = rewriter.getF32Type();
+
+    // Initialize result tensor with zeros (in the accumulator type)
     auto init =
-        rewriter.create<tensor::EmptyOp>(loc, dstType.getShape(), elementType);
+        rewriter.create<tensor::EmptyOp>(loc, dstType.getShape(), accType);
     TypedAttr constantAttr =
         integers
-            ? static_cast<TypedAttr>(rewriter.getIntegerAttr(elementType, 0))
-            : static_cast<TypedAttr>(rewriter.getFloatAttr(elementType, 0));
+            ? static_cast<TypedAttr>(rewriter.getIntegerAttr(accType, 0))
+            : static_cast<TypedAttr>(rewriter.getFloatAttr(accType, 0));
 
     auto zero = rewriter.create<mlir::arith::ConstantOp>(
-        op.getLoc(), elementType, constantAttr);
+        op.getLoc(), accType, constantAttr);
 
     auto zeroes =
         rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{init})
@@ -1207,6 +1218,11 @@ struct MatmulConverter : public OpConversionPattern<triton::DotOp> {
     } else {
       return rewriter.notifyMatchFailure(
           op, "Only 2D or 3D inputs supported for tt.dot lowering");
+    }
+
+    // Narrow the wider accumulator back to the requested result type.
+    if (accType != elementType) {
+      res = rewriter.create<arith::TruncFOp>(loc, dstType, res);
     }
 
     // Add C if it's not zero
