@@ -21,6 +21,12 @@ from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
 import shutil
 
+def _get_llvm_bin_path(bin_name: str) -> str:
+    path = os.getenv("LLVM_BINARY_DIR", "")
+    if path == "":
+        raise Exception("LLVM_BINARY_DIR is not set.")
+    return os.path.join(path, bin_name)
+
 # for locating libsleef
 try:
     _triton_C_dir = importlib.resources.files(triton).joinpath("_C")
@@ -344,7 +350,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
                     dump_path = os.environ["TRITON_SHARED_DUMP_PATH"]
                     shutil.copy(launcher_src_path, dump_path)
                   subprocess.check_call([
-                    "clang++", "-O3", "-g", "-std=c++17", launcher_src_path, obj_path,
+                    _get_llvm_bin_path("clang++"), "-O3", "-g", "-std=c++17", launcher_src_path, obj_path,
                     f"-I{py_include_dir}", f"-I{include_dir}", f"-L{py_lib_dir}",
                     "-shared", f"-l{py_lib}", "-fPIC", "-fopenmp",
                     f"-L{_triton_C_dir}", "-lsleef", f"-Wl,-rpath,{_triton_C_dir}",
