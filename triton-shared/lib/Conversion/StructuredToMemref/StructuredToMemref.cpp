@@ -970,7 +970,8 @@ private:
     bool canUseOriginalMemory =
         !originalOrderAttr && !other &&
         !ptr.getDefiningOp()->hasAttr(WRAP_SIDE_BY_SIDE) &&
-        !ptr.getDefiningOp()->hasAttr(WRAP_STACKED);
+        !ptr.getDefiningOp()->hasAttr(WRAP_STACKED) &&
+        !ptr.getDefiningOp()->hasAttr(WRAP_1D);
     if (canUseOriginalMemory) {
       // The vector.transfer_read is generated for dynamic dimensions.
       // As a result, the llir fails to be generated
@@ -1133,7 +1134,8 @@ private:
     bool canUseOriginalMemory =
         !originalOrderAttr && !op.getOther() &&
         !ptr.getDefiningOp()->hasAttr(WRAP_SIDE_BY_SIDE) &&
-        !ptr.getDefiningOp()->hasAttr(WRAP_STACKED);
+        !ptr.getDefiningOp()->hasAttr(WRAP_STACKED) &&
+        !ptr.getDefiningOp()->hasAttr(WRAP_1D);
     if (canUseOriginalMemory) {
       Value isFullMask = createFullMaskCheck(loc, storageShape, mixedDims,
                                              staticMaskDims, rewriter);
