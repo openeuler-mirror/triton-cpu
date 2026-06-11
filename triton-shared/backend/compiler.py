@@ -1100,6 +1100,8 @@ class CPUBackend(BaseBackend):
 
     def _sme_transform(self, src: str) -> str:
         # TODO: share with SVE transform.
+        has_batch_matmul = re.search(r"\blinalg\.batch_matmul\b", src) is not None
+
         def linalg_opts():
             """Apply linalg-level optimizations before tiling."""
             any_op = transform.AnyOpType.get()
@@ -1147,11 +1149,12 @@ class CPUBackend(BaseBackend):
                 )
                 transform.YieldOp([seq.bodyTarget])
 
-        def make_matmul_matcher(bitwidth, name, op_names):
+        def make_matmul_matcher(bitwidth):
             """Creates a matcher named sequence to match matmuls with a given bitwidth.
             """
             any_op = transform.AnyOpType.get()
             any_value = transform.AnyValueType.get()
+            name = f'matmul_f{bitwidth}_matcher'
             seq = transform.NamedSequenceOp(
                 name,
                 [any_op],
@@ -1178,7 +1181,7 @@ class CPUBackend(BaseBackend):
                 with InsertionPoint(body):
                     transform.match_operation_name(
                         candidate,
-                        op_names,
+                        ["linalg.matmul_transpose_a"],
                     )
                     attrs = {"raw_position_list": DenseI64ArrayAttr.get([0])}
                     init = Operation.create(
@@ -1245,61 +1248,44 @@ class CPUBackend(BaseBackend):
                 transform.YieldOp([])
             return name
 
-        def make_tile_batch_matmul_for_bitwidth_action(bitwidth):
-            VL = 128 // bitwidth
+        def tile_batch_matmul_sme():
             any_op_type = transform.AnyOpType.get()
             func_type = transform.OperationType.get("func.func")
-            name = f"__tile_batch_matmul_{bitwidth}bit"
             sequence = transform.NamedSequenceOp(
-                name,
+                "__tile_batch_matmul_sme",
                 [any_op_type],
-                [],
-                arg_attrs=[{"transform.consumed": UnitAttr.get()}],
+                [any_op_type],
+                arg_attrs=[{"transform.readonly": UnitAttr.get()}],
             )
             with InsertionPoint(sequence.body):
-                parent = transform.GetParentOp(any_op_type, sequence.bodyTarget, deduplicate=True)
+                batch_matmuls = structured.MatchOp.match_op_names(
+                    any_op_type,
+                    sequence.bodyTarget,
+                    ["linalg.batch_matmul"],
+                )
+                parent = transform.GetParentOp(any_op_type, batch_matmuls.result, deduplicate=True)
                 parent_func = transform.CastOp(func_type, parent)
                 structured.TileUsingForOp(
-                    sequence.bodyTarget,
-                    sizes=[1, [VL], [VL], 1],
+                    batch_matmuls.result,
+                    sizes=[1, 0, 0, 0],
                     interchange=[0, 1, 2, 3],
                 )
-                reduced = transform.ApplyRegisteredPassOp(
+                transform.ApplyRegisteredPassOp(
                     func_type,
                     parent_func.result,
                     "test-linalg-rank-reduce-contraction-ops",
                 )
-                matmuls = structured.MatchOp.match_op_names(
-                    any_op_type,
-                    reduced.result,
-                    ["linalg.matmul_transpose_a"],
-                )
-                structured.VectorizeOp(matmuls.result, [[VL], [VL], 1])
-                transform.YieldOp([])
-            return name
+                transform.YieldOp([sequence.bodyTarget])
 
         def tile_matmul_sme():
             any_op = transform.AnyOpType.get()
             matcher_list = []
             action_list = []
             for bitwidth in [16, 32, 64]:
-                matmul_matcher_name = make_matmul_matcher(
-                    bitwidth,
-                    f"matmul_f{bitwidth}_matcher",
-                    ["linalg.matmul_transpose_a"],
-                )
+                matmul_matcher_name = make_matmul_matcher(bitwidth)
                 tile_action = make_tile_matmul_for_bitwidth_action(bitwidth)
                 matcher_list.append(FlatSymbolRefAttr.get(matmul_matcher_name))
                 action_list.append(FlatSymbolRefAttr.get(tile_action))
-
-                batch_matcher_name = make_matmul_matcher(
-                    bitwidth,
-                    f"batch_matmul_f{bitwidth}_matcher",
-                    ["linalg.batch_matmul_transpose_a"],
-                )
-                batch_tile_action = make_tile_batch_matmul_for_bitwidth_action(bitwidth)
-                matcher_list.append(FlatSymbolRefAttr.get(batch_matcher_name))
-                action_list.append(FlatSymbolRefAttr.get(batch_tile_action))
 
             seq = transform.NamedSequenceOp(
                 "__tile_and_vec_sme", [any_op], [any_op],
@@ -1308,7 +1294,7 @@ class CPUBackend(BaseBackend):
             with InsertionPoint(seq.body):
                 matmuls = structured.MatchOp.match_op_names(
                     seq.bodyTarget,
-                    ["linalg.matmul", "linalg.batch_matmul"]
+                    ["linalg.matmul"]
                 )
                 transposed_mm = structured.TransposeMatmulOp(any_op, matmuls)
                 # ForeachMatchOp iterates over elements strictly IN the target handle.
@@ -1591,6 +1577,13 @@ class CPUBackend(BaseBackend):
                     transform.FailurePropagationMode.Suppress, # Flatten ew can emit failures for non-linalg ew ops, expected
                     [module],
                 )
+                if has_batch_matmul:
+                    optimized_linalgs = transform.IncludeOp(
+                        [transform.AnyOpType.get()],
+                        FlatSymbolRefAttr.get("__tile_batch_matmul_sme"),
+                        transform.FailurePropagationMode.Propagate,
+                        [optimized_linalgs],
+                    )
                 vectorized = transform.IncludeOp(
                     [transform.AnyOpType.get()],
                     FlatSymbolRefAttr.get("__tile_and_vec_sme"),
@@ -1652,6 +1645,8 @@ class CPUBackend(BaseBackend):
             
             with InsertionPoint(mod.body):
                 linalg_opts()
+                if has_batch_matmul:
+                    tile_batch_matmul_sme()
                 tile_matmul_sme()
                 bufferize_schedule()
                 arm_sme_lowering_schedule()
