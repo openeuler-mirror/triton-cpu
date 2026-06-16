@@ -23,6 +23,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Pass/PassManager.h"
@@ -247,6 +248,17 @@ struct GatherConverter : public OpConversionPattern<tts::GatherOp> {
             auto loadValue = getValueAtIndex(args[0], loc, rewriter);
             rewriter.create<linalg::YieldOp>(loc, loadValue);
           } else {
+            // If the mask is statically all-true we can skip the conditional
+            // branch entirely and always load from the base tensor.
+            DenseIntElementsAttr maskAttr;
+            bool maskAlwaysTrue =
+                matchPattern(gatherOp.getMask(), m_Constant(&maskAttr)) &&
+                maskAttr.isSplat() && maskAttr.getSplatValue<bool>();
+
+            if (maskAlwaysTrue) {
+              auto loadValue = getValueAtIndex(args[0], loc, rewriter);
+              rewriter.create<linalg::YieldOp>(loc, loadValue);
+            } else {
             // If the mask value is truthy, the current element is loaded from
             // the base tensor using its offset. Otherwise, if `other` is
             // present, yield `other`. If `other` is not present, a default
@@ -281,6 +293,7 @@ struct GatherConverter : public OpConversionPattern<tts::GatherOp> {
                 });
 
             rewriter.create<linalg::YieldOp>(loc, ifOp->getResult(0));
+            } // end else (mask not always-true)
           }
         });
 
