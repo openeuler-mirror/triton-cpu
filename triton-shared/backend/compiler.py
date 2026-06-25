@@ -1101,7 +1101,7 @@ class CPUBackend(BaseBackend):
     def _sme_transform(self, src: str) -> str:
         # TODO: share with SVE transform.
         has_bf16_matmul = re.search(
-            r"\blinalg\.(?:batch_)?matmul\b[^\n]*xbf16\b",
+            r"\blinalg\.(?:batch_)?matmul\b[\s\S]*?xbf16\b",
             src,
         ) is not None
 
@@ -1180,6 +1180,36 @@ class CPUBackend(BaseBackend):
             ).param
             transform.MatchParamCmpIOp(operand_bw, bw_ref, predicate)
 
+        def match_structured_contraction_body(struct, elem_op_name, reduction_op_name):
+            # The transform dialect contraction matcher requires both ops.
+            Operation.create(
+                "transform.match.structured.body",
+                operands=[struct],
+                attributes={
+                    "contraction": ArrayAttr.get(
+                        [
+                            StringAttr.get(elem_op_name),
+                            StringAttr.get(reduction_op_name),
+                        ]
+                    )
+                },
+            )
+
+        def add_matmul_precision_constraints(struct, input_bitwidth, init_bitwidth):
+            for position in [0, 1]:
+                match_structured_operand_bitwidth(
+                    struct,
+                    "transform.match.structured.input",
+                    position,
+                    input_bitwidth,
+                )
+            match_structured_operand_bitwidth(
+                struct,
+                "transform.match.structured.init",
+                0,
+                init_bitwidth,
+            )
+
         def make_matmul_matcher_sequence(name, add_constraints):
             any_op = transform.AnyOpType.get()
             seq = transform.NamedSequenceOp(
@@ -1218,16 +1248,8 @@ class CPUBackend(BaseBackend):
             return name
 
         def make_regular_matmul_matcher(bitwidth):
-            """Creates a matcher for regular SME matmuls with non-8-bit inputs."""
+            """Creates a matcher for regular SME matmuls by output bitwidth."""
             def add_constraints(struct):
-                for position in [0, 1]:
-                    match_structured_operand_bitwidth(
-                        struct,
-                        "transform.match.structured.input",
-                        position,
-                        8,
-                        transform.MatchCmpIPredicate.ne,
-                    )
                 match_structured_operand_bitwidth(
                     struct,
                     "transform.match.structured.init",
@@ -1240,82 +1262,72 @@ class CPUBackend(BaseBackend):
                 add_constraints,
             )
 
-        def make_i8_matmul_matcher():
+        def make_i8_to_i32_matmul_matcher():
             """Creates the int8-to-int32 matcher for SME widening MOPA."""
             def add_i8_constraints(struct):
-                Operation.create(
-                    "transform.match.structured.body",
-                    operands=[struct],
-                    attributes={
-                        "contraction": ArrayAttr.get(
-                            [
-                                StringAttr.get("arith.muli"),
-                                StringAttr.get("arith.addi"),
-                            ]
-                        )
-                    },
-                )
-                for position in [0, 1]:
-                    match_structured_operand_bitwidth(
-                        struct,
-                        "transform.match.structured.input",
-                        position,
-                        8,
-                    )
-                match_structured_operand_bitwidth(
+                match_structured_contraction_body(
                     struct,
-                    "transform.match.structured.init",
-                    0,
-                    32,
+                    "arith.muli",
+                    "arith.addi",
                 )
+                add_matmul_precision_constraints(struct, 8, 32)
 
             return make_matmul_matcher_sequence(
                 "matmul_i8_to_i32_matcher",
                 add_i8_constraints,
             )
 
-        def make_f16_matmul_matcher():
+        def make_f16_to_f32_matmul_matcher():
             """Creates the f16-to-f32 matcher for SME widening MOPA."""
             def add_f16_constraints(struct):
-                Operation.create(
-                    "transform.match.structured.body",
-                    operands=[struct],
-                    attributes={
-                        "contraction": ArrayAttr.get(
-                            [
-                                StringAttr.get("arith.mulf"),
-                                StringAttr.get("arith.addf"),
-                            ]
-                        )
-                    },
-                )
-                for position in [0, 1]:
-                    match_structured_operand_bitwidth(
-                        struct,
-                        "transform.match.structured.input",
-                        position,
-                        16,
-                    )
-                match_structured_operand_bitwidth(
+                match_structured_contraction_body(
                     struct,
-                    "transform.match.structured.init",
-                    0,
-                    32,
+                    "arith.mulf",
+                    "arith.addf",
                 )
+                add_matmul_precision_constraints(struct, 16, 32)
 
             return make_matmul_matcher_sequence(
                 "matmul_f16_to_f32_matcher",
                 add_f16_constraints,
             )
 
+        def make_f8_to_f32_matmul_matcher():
+            """Creates the f8-to-f32 matcher for the unsupported SME path."""
+            def add_f8_constraints(struct):
+                match_structured_contraction_body(
+                    struct,
+                    "arith.mulf",
+                    "arith.addf",
+                )
+                add_matmul_precision_constraints(struct, 8, 32)
+
+            return make_matmul_matcher_sequence(
+                "matmul_f8_to_f32_matcher",
+                add_f8_constraints,
+            )
+
+        def make_skip_matmul_action():
+            """Create a no-op action for matmuls that must avoid SME tiling."""
+            any_op_type = transform.AnyOpType.get()
+            sequence = transform.NamedSequenceOp(
+                "__skip_matmul",
+                [any_op_type],
+                [],
+                arg_attrs=[{"transform.consumed": UnitAttr.get()}],
+            )
+            with InsertionPoint(sequence.body):
+                transform.YieldOp([])
+            return "__skip_matmul"
+
         def make_tile_matmul_for_bitwidth_action(bitwidth, reduction_tile_size=1):
+            """Create a tiling sequence for a specific bitwidth."""
             VL = 128 // bitwidth
             any_op_type = transform.AnyOpType.get()
             for_op_type = transform.OperationType.get("scf.for")
             name = f"__tile_matmul_{bitwidth}bit"
             if reduction_tile_size != 1:
                 name = f"{name}_k{reduction_tile_size}"
-            """Create a tiling sequence for a specific bitwidth."""
             sequence = transform.NamedSequenceOp(
                 name,
                 [any_op_type],
@@ -1332,7 +1344,8 @@ class CPUBackend(BaseBackend):
                     interchange=[0, 1, 2]
                 )
                 # Peel each loop from innermost to outermost
-                loops = tiled.results[1:-1]  # Skip the first result (tiled linalg) and the last (tiled by 1)
+                # TODO: Consider peeling the K loop to avoid unnecessary masking.
+                loops = tiled.results[1:-1]  # Skip the tiled op and the innermost/K loop.
                 for l in reversed(loops):
                     castedLoop = transform.CastOp(for_op_type, l)
                     outermost_peeled, remainder = loop.LoopPeelOp(for_op_type, for_op_type, castedLoop.result).results
@@ -1409,7 +1422,7 @@ class CPUBackend(BaseBackend):
             any_op = transform.AnyOpType.get()
             matcher_list = []
             action_list = []
-            int8_matmul_matcher_name = make_i8_matmul_matcher()
+            int8_matmul_matcher_name = make_i8_to_i32_matmul_matcher()
             int8_tile_action = make_tile_matmul_for_bitwidth_action(
                 32,
                 reduction_tile_size=4,
@@ -1421,13 +1434,18 @@ class CPUBackend(BaseBackend):
             # not f16 from bf16. Keep bf16 on the regular path until LLVM can
             # select the bf16 interleave generated by BFMOPA lowering.
             if not has_bf16_matmul:
-                f16_matmul_matcher_name = make_f16_matmul_matcher()
+                f16_matmul_matcher_name = make_f16_to_f32_matmul_matcher()
                 f16_tile_action = make_tile_matmul_for_bitwidth_action(
                     32,
                     reduction_tile_size=2,
                 )
                 matcher_list.append(FlatSymbolRefAttr.get(f16_matmul_matcher_name))
                 action_list.append(FlatSymbolRefAttr.get(f16_tile_action))
+
+            f8_matmul_matcher_name = make_f8_to_f32_matmul_matcher()
+            skip_matmul_action = make_skip_matmul_action()
+            matcher_list.append(FlatSymbolRefAttr.get(f8_matmul_matcher_name))
+            action_list.append(FlatSymbolRefAttr.get(skip_matmul_action))
 
             for bitwidth in [16, 32, 64]:
                 matmul_matcher_name = make_regular_matmul_matcher(bitwidth)
