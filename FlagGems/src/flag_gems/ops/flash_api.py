@@ -742,9 +742,12 @@ def mha_fwd(
 
         # Do kernel dispatching
         def dispatch(B, H, Q, K, D, params):
-            num_sms = torch_device_fn.get_device_properties(
-                "cuda"
-            ).multi_processor_count
+            if str(torch_device_fn.__name__).endswith("cpu"):
+                num_sms = torch.get_num_threads()
+            else:
+                num_sms = torch_device_fn.get_device_properties(
+                    "cuda"
+                ).multi_processor_count
 
             # Try bh parallel
             # if B * H > 0.8 * num_sms:
