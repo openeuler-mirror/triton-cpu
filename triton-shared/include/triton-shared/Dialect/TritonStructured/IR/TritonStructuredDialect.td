@@ -351,4 +351,68 @@ def TTS_StoreOp : TTS_Op<"store", [
   //let hasVerifier = 1;
 }
 
+//===----------------------------------------------------------------------===//
+// ArmPL BLAS operations
+//===----------------------------------------------------------------------===//
+
+def TTS_ArmPLMatmulOp : TTS_Op<"armpl_matmul", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "ArmPL GEMM operation";
+  let description = [{
+    Computes C = alpha * op(A) * op(B) + beta * C using ArmPL cblas_sgemm/dgemm.
+    A, B, C are tensors. Returns the result tensor.
+    Lowered to a func.call in ArmPLToFunc pass.
+  }];
+
+  let arguments = (ins
+    AnyRankedTensor:$a,
+    AnyRankedTensor:$b,
+    AnyRankedTensor:$c,
+    I32Attr:$transA,
+    I32Attr:$transB,
+    F64Attr:$alpha,
+    F64Attr:$beta
+  );
+
+  let results = (outs AnyRankedTensor:$result);
+
+  let assemblyFormat = [{
+    $a `,` $b `,` $c
+    `transA` `=` $transA `transB` `=` $transB
+    `alpha` `=` $alpha `beta` `=` $beta
+    attr-dict `:` type($a) `,` type($b) `,` type($c) `->` type($result)
+  }];
+
+  let hasVerifier = 1;
+}
+
+def TTS_ArmPLGemvOp : TTS_Op<"armpl_gemv", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "ArmPL GEMV operation";
+  let description = [{
+    Computes y = alpha * op(A) * x + beta * y using ArmPL cblas_sgemv/dgemv.
+    A is a 2D tensor (matrix), x and y are 1D tensors (vectors).
+    Returns the result tensor.
+    Lowered to a func.call in ArmPLToFunc pass.
+  }];
+
+  let arguments = (ins
+    AnyRankedTensor:$a,
+    AnyRankedTensor:$x,
+    AnyRankedTensor:$y,
+    I32Attr:$transA,
+    F64Attr:$alpha,
+    F64Attr:$beta
+  );
+
+  let results = (outs AnyRankedTensor:$result);
+
+  let assemblyFormat = [{
+    $a `,` $x `,` $y
+    `transA` `=` $transA
+    `alpha` `=` $alpha `beta` `=` $beta
+    attr-dict `:` type($a) `,` type($x) `,` type($y) `->` type($result)
+  }];
+
+  let hasVerifier = 1;
+}
+
 #endif // TRITON_STRUCTURED_DIALECT

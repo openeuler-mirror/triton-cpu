@@ -18,6 +18,8 @@ def TritonToLinalgExperimental : Pass<"triton-to-linalg-experimental", "mlir::Mo
              "Enable make_gather_scatter_tptr support">,
       Option<"enableCollapseShape", "enable-collapse-shape", "bool", /*default*/"false",
              "Enable collapse shape pass">,
+      Option<"enableArmPL", "enable-armpl", "bool", /*default*/"false",
+             "Enable ArmPL BLAS path for tt.dot operations">,
   ];
 }
 

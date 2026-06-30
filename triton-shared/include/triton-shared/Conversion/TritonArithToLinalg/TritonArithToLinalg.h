@@ -23,7 +23,6 @@ void populateTritonArithToLinalgConversionPatterns(bool pidsToFuncArgs,
 void populateTritonTensorPtrConversionPatterns(RewritePatternSet &patterns);
 
 
-
 std::unique_ptr<OperationPass<ModuleOp>>
 createTritonArithToLinalgPass(bool tensorPtrToLinalg = false);
 

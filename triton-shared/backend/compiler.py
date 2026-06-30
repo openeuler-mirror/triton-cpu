@@ -22,6 +22,24 @@ from mlir.dialects.transform import structured, loop, vector, bufferization, ten
 
 ENABLE_FALLBACK = False
 
+def _armpl_is_available() -> bool:
+    """Return True if ArmPL is available on this system."""
+    try:
+        import ctypes
+        candidates = ["libarmpl_lp64.so", "libarmpl.so", "libarmpl_lp64_mp.so"]
+        armpl_dir = os.environ.get("ARMPL_DIR", "")
+        if armpl_dir:
+            candidates = [os.path.join(armpl_dir, "lib", n) for n in candidates] + candidates
+        for name in candidates:
+            try:
+                ctypes.CDLL(name)
+                return True
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return False
+
 def _get_triton_shared_opt_path() -> str:
     path = os.getenv("TRITON_SHARED_OPT_PATH", "")
     if path == "":
@@ -249,11 +267,14 @@ class CPUBackend(BaseBackend):
             _dump_ir_if_needed(kernel_debug_dir, [src_path])
             triton_shared_opt_path = _get_triton_shared_opt_path()
             try:
+                cmd = [triton_shared_opt_path, src_path, "--triton-to-linalg-experimental"]
+                if _armpl_is_available():
+                    cmd.append("--triton-to-linalg-experimental=enable-armpl=true")
                 # If mlir dump is enabled, pass option --mlir-print-ir-after-all to triton-shared
                 if os.environ.get("MLIR_ENABLE_DUMP", "0") == "1":
-                    subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "--mlir-print-ir-after-all", "-o", dst_path])
-                else:
-                    subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "-o", dst_path])
+                    cmd.append("--mlir-print-ir-after-all")
+                cmd.extend(["-o", dst_path])
+                subprocess.check_call(cmd)
                 return Path(dst_path).read_text()
             except subprocess.CalledProcessError as e:
                 if ENABLE_FALLBACK:

@@ -2,6 +2,7 @@
 #include "triton/Dialect/Triton/IR/Types.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -275,6 +276,58 @@ GetStructuredStateOp::getOffsetAndStrideSegmentSizes(Type type) {
   }
 
   return std::make_pair(offsetSegmentSize, strideSegmentSize);
+}
+
+//===----------------------------------------------------------------------===//
+// ArmPLMatmulOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult ArmPLMatmulOp::verify() {
+  auto aType = dyn_cast<RankedTensorType>(getA().getType());
+  auto bType = dyn_cast<RankedTensorType>(getB().getType());
+  auto cType = dyn_cast<RankedTensorType>(getC().getType());
+  if (!aType || !bType || !cType)
+    return emitOpError("all operands must be ranked tensors");
+
+  if (aType.getElementType() != bType.getElementType() ||
+      aType.getElementType() != cType.getElementType())
+    return emitOpError("all operands must have the same element type");
+
+  auto elemType = aType.getElementType();
+  if (!elemType.isF32() && !elemType.isF64())
+    return emitOpError("element type must be f32 or f64");
+
+  if (aType.getRank() != 2 || bType.getRank() != 2 || cType.getRank() != 2)
+    return emitOpError("all operands must be 2D tensors");
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ArmPLGemvOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult ArmPLGemvOp::verify() {
+  auto aType = dyn_cast<RankedTensorType>(getA().getType());
+  auto xType = dyn_cast<RankedTensorType>(getX().getType());
+  auto yType = dyn_cast<RankedTensorType>(getY().getType());
+  if (!aType || !xType || !yType)
+    return emitOpError("all operands must be ranked tensors");
+
+  if (aType.getElementType() != xType.getElementType() ||
+      aType.getElementType() != yType.getElementType())
+    return emitOpError("all operands must have the same element type");
+
+  auto elemType = aType.getElementType();
+  if (!elemType.isF32() && !elemType.isF64())
+    return emitOpError("element type must be f32 or f64");
+
+  if (aType.getRank() != 2)
+    return emitOpError("A operand must be a 2D tensor");
+  if (xType.getRank() != 1 || yType.getRank() != 1)
+    return emitOpError("x and y operands must be 1D tensors");
+
+  return success();
 }
 
 } // namespace tts

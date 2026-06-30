@@ -60,6 +60,7 @@
 #include "mlir/Transforms/Passes.h"
 
 // Triton and other third-party dialects
+#include "triton-shared/Conversion/TritonToArmPL/ArmPLOpToFunctionPass.h"
 #include "triton-shared/Conversion/StructuredToMemref/Passes.h"
 #include "triton-shared/Conversion/TPtrToLLVM/Passes.h"
 #include "triton-shared/Conversion/TPtrToLLVM/TPtrToLLVM.h"
@@ -472,6 +473,10 @@ void init_to_llvm(py::module &&m) {
                      LLVM::createLegalizeFloat8TypesPass);
   ADD_PASS_WRAPPER_0("add_convert_to_llvm", createConvertToLLVMPass);
   ADD_PASS_WRAPPER_0("add_promote_i1_to_i8", LLVM::createPromoteI1ToI8Pass);
+  ADD_PASS_WRAPPER_0("add_triton_dot_to_armpl_op",
+                     mlir::triton::createTritonDotToArmPLOpPass);
+  ADD_PASS_WRAPPER_0("add_armpl_op_to_function",
+                     mlir::triton::createArmPLOpToFunctionPass);
 }
 
 // Loading passes is necessary when using the transform schedule, however, they
