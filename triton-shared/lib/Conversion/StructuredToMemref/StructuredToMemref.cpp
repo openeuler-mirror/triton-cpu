@@ -966,42 +966,6 @@ private:
     auto tensorType = cast<RankedTensorType>(op.getType());
     auto elemType = tensorType.getElementType();
     auto originalOrderAttr = getOriginalOrderAttr(ptr);
-
-    bool canUseOriginalMemory =
-        !originalOrderAttr && !other &&
-        !ptr.getDefiningOp()->hasAttr(WRAP_SIDE_BY_SIDE) &&
-        !ptr.getDefiningOp()->hasAttr(WRAP_STACKED) &&
-        !ptr.getDefiningOp()->hasAttr(WRAP_1D);
-    if (canUseOriginalMemory) {
-      // The vector.transfer_read is generated for dynamic dimensions.
-      // As a result, the llir fails to be generated
-      // because the vector.transfer_read cannot be converted.
-      bool hasDynamicStride = false;
-      if (auto memrefType = dyn_cast<MemRefType>(ptr.getType())) {
-        SmallVector<int64_t> strides;
-        int64_t offset;
-
-        if (failed(memrefType.getStridesAndOffset(strides, offset))) {
-          hasDynamicStride = true;
-        } else {
-          for (auto stride : strides) {
-            if (stride == ShapedType::kDynamic) {
-              hasDynamicStride = true;
-              break;
-            }
-          }
-        }
-      }
-      if (!hasDynamicStride) {
-        op.emitRemark("LoadConverter: rewriteStructuredLoad use the raw memory "
-                      "directly.");
-        Value tensor = rewriter.create<bufferization::ToTensorOp>(
-            loc, tensorType, ptr, /*restrict=*/true, /*writable=*/false);
-        rewriter.replaceOp(op, tensor);
-        return success();
-      }
-    }
-
     SmallVector<int64_t> storageShape(tensorType.getShape().begin(),
                                       tensorType.getShape().end());
     if (originalOrderAttr) {
@@ -1060,61 +1024,6 @@ private:
     return success();
   }
 
-  Value createFullMaskCheck(Location loc, ArrayRef<int64_t> shape,
-                            SmallVector<OpFoldResult> &mixedDims,
-                            ArrayRef<int64_t> staticMaskDims,
-                            ConversionPatternRewriter &rewriter) const {
-    Value isFull =
-        rewriter.create<arith::ConstantOp>(loc, rewriter.getBoolAttr(true))
-            .getResult();
-    for (size_t i = 0; i < shape.size(); i++) {
-      Value shapeVal =
-          rewriter
-              .create<arith::ConstantOp>(loc, rewriter.getIndexAttr(shape[i]))
-              .getResult();
-      Value maskDimVal;
-      if (mixedDims[i].is<Value>()) {
-        maskDimVal = mixedDims[i].get<Value>();
-      } else {
-        maskDimVal = rewriter
-                         .create<arith::ConstantOp>(
-                             loc, rewriter.getIndexAttr(staticMaskDims[i]))
-                         .getResult();
-      }
-
-      Value cmp = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
-                                                 maskDimVal, shapeVal);
-
-      isFull = rewriter.create<arith::AndIOp>(loc, isFull, cmp);
-    }
-    return isFull;
-  }
-
-  Value rewriteGeneralMaskedLoad(tts::LoadOp op, OpAdaptor adaptor,
-                                 OpBuilder &builder) const {
-    auto loc = op->getLoc();
-    auto ptr = adaptor.getPtr();
-    auto tensorType = cast<RankedTensorType>(op.getType());
-    auto elemType = tensorType.getElementType();
-
-    SmallVector<OpFoldResult> mixedDims = op.getMixedMaskDims();
-    SmallVector<int64_t> staticMaskDims(op.getStaticMaskDims().begin(),
-                                        op.getStaticMaskDims().end());
-
-    auto alloc = builder.create<memref::AllocOp>(
-        loc, MemRefType::get(tensorType.getShape(), elemType));
-
-    memref::SubViewOp srcSubview =
-        getSubview(tensorType.getRank(), mixedDims, ptr, loc, builder);
-    memref::SubViewOp dstSubview =
-        getSubview(tensorType.getRank(), mixedDims, alloc, loc, builder);
-    builder.create<memref::CopyOp>(loc, srcSubview, dstSubview);
-
-    return builder.create<bufferization::ToTensorOp>(loc, tensorType,
-                                                   alloc, true /* restrict */,
-                                                   true /* writable */);
-  }
-
   LogicalResult rewriteMaskedLoad(tts::LoadOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const {
     assert(op.hasMask());
@@ -1125,39 +1034,11 @@ private:
     auto tensorType = cast<RankedTensorType>(op.getType());
     auto elemType = tensorType.getElementType();
     auto originalOrderAttr = getOriginalOrderAttr(ptr);
-
     SmallVector<int64_t> storageShape(tensorType.getShape().begin(),
                                       tensorType.getShape().end());
     SmallVector<OpFoldResult> mixedDims = op.getMixedMaskDims();
     SmallVector<int64_t> staticMaskDims(op.getStaticMaskDims().begin(),
                                         op.getStaticMaskDims().end());
-    bool canUseOriginalMemory =
-        !originalOrderAttr && !op.getOther() &&
-        !ptr.getDefiningOp()->hasAttr(WRAP_SIDE_BY_SIDE) &&
-        !ptr.getDefiningOp()->hasAttr(WRAP_STACKED) &&
-        !ptr.getDefiningOp()->hasAttr(WRAP_1D);
-    if (canUseOriginalMemory) {
-      Value isFullMask = createFullMaskCheck(loc, storageShape, mixedDims,
-                                             staticMaskDims, rewriter);
-      Value resultTensor =
-          rewriter
-              .create<scf::IfOp>(
-                  loc, isFullMask,
-                  [&](OpBuilder &thenBuilder, Location thenLoc) {
-                    Value tensor = rewriter.create<bufferization::ToTensorOp>(
-                        loc, tensorType, ptr, /*restrict=*/true,
-                        /*writable=*/false);
-                    thenBuilder.create<scf::YieldOp>(thenLoc, tensor);
-                  },
-                  [&](OpBuilder &elseBuilder, Location elseLoc) {
-                    Value tensor =
-                        rewriteGeneralMaskedLoad(op, adaptor, elseBuilder);
-                    elseBuilder.create<scf::YieldOp>(elseLoc, tensor);
-                  })
-              .getResult(0);
-      rewriter.replaceOp(op, resultTensor);
-      return success();
-    }
     if (originalOrderAttr) {
       auto transposePermutation = getTransposePermutation(originalOrderAttr);
       storageShape = applyPermutation<int64_t>(tensorType.getShape(),
