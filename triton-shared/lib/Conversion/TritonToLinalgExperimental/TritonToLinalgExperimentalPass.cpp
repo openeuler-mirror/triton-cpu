@@ -9,6 +9,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton-shared/Conversion/StructuredToMemref/StructuredToMemref.h"
 #include "triton-shared/Conversion/TritonArithToLinalg/TritonArithToLinalg.h"
+#include "triton-shared/Conversion/TritonToArmPL/ArmPLOpToFunctionPass.h"
 #include "triton-shared/Conversion/TritonPtrToMemref/TritonPtrToMemref.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/CollapseShape.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/ReconcilePtrCasts.h"
@@ -135,7 +136,20 @@ public:
     pm.addPass(createFoldAlwaysTrueMasksPass());
 
     pm.addPass(createTritonToUnstructuredPass());
+
+    // If ArmPL is enabled, convert tt.dot to tts.armpl_matmul/gemv BEFORE
+    // TritonArithToLinalg so that the default MatmulConverter never sees
+    // tt.dot ops that should go through ArmPL.
+    if (enableArmPL)
+      pm.addPass(createTritonDotToArmPLOpPass());
+
     pm.addPass(createTritonArithToLinalgPass(/*tensorPtrToLinalg=*/true));
+
+    // Lower ArmPL matmul/gemv ops to func.call @cblas_* if ArmPL is enabled.
+    // Must run BEFORE StructuredToMemref because the ArmPL ops have
+    // tensor operands, and ArmPLOpToFunction does its own bufferization.
+    if (enableArmPL)
+      pm.addPass(createArmPLOpToFunctionPass());
 
     pm.addPass(createStructuredToMemrefPass());
     pm.addPass(createUnstructuredToMemrefPass());

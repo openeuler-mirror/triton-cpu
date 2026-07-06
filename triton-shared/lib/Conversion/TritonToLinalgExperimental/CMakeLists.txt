@@ -28,6 +28,11 @@ add_triton_library(TritonToLinalgExperimental
   TritonIR
   TritonTransforms
   TritonSharedAnalysis
+  TritonArithToLinalg
+  StructuredToMemref
+  UnstructuredToMemref
+  TritonPtrToMemref
+  TritonToArmPL
   TritonSharedUtils
 
   TritonArithToLinalg
