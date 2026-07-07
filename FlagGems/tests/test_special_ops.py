@@ -1509,12 +1509,12 @@ def test_accuracy_moe_align_block_size(
 ):
     # ------------ parameters ------------
     dtype = torch.int32
-    topk_ids = torch.randint(0, num_experts, (3, 4), dtype=dtype, device="cuda")
+    topk_ids = torch.randint(0, num_experts, (3, 4), dtype=dtype, device=flag_gems.device)
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=dtype, device="cuda")
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=dtype, device=flag_gems.device)
     max_num_m_blocks = max_num_tokens_padded // block_size
-    expert_ids = torch.empty((max_num_m_blocks,), dtype=dtype, device="cuda")
-    num_tokens_post_pad = torch.empty(1, dtype=dtype, device="cuda")
+    expert_ids = torch.empty((max_num_m_blocks,), dtype=dtype, device=flag_gems.device)
+    num_tokens_post_pad = torch.empty(1, dtype=dtype, device=flag_gems.device)
 
     topk_ids_vllm = topk_ids.clone()
     sorted_ids_vllm = sorted_ids.clone()
@@ -1539,7 +1539,8 @@ def test_accuracy_moe_align_block_size(
         num_tokens_post_pad=num_tokens_post_pad_vllm,
     )
 
-    torch.cuda.synchronize()
+    if flag_gems.device == "cuda":
+        torch.cuda.synchronize()
     gems_assert_close(sorted_ids, sorted_ids_vllm, dtype=dtype)
     gems_assert_close(expert_ids, expert_ids_vllm, dtype=dtype)
     gems_assert_close(num_tokens_post_pad, num_tokens_post_pad_vllm, dtype=dtype)
