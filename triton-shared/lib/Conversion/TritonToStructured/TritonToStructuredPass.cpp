@@ -23,9 +23,10 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/OneToNTypeConversion.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Types.h"
@@ -54,6 +55,196 @@ namespace triton {
 } // namespace mlir
 
 namespace {
+
+template <typename OpTy>
+static bool hasDefaultOverflowFlags(OpTy op) {
+  return op.getOverflowFlags() == arith::IntegerOverflowFlags::none;
+}
+
+// Collect the leaf operands of a (possibly nested) integer add tree.
+static bool collectAddends(Value v, SmallVectorImpl<Value> &addends) {
+  if (auto add = v.getDefiningOp<arith::AddIOp>()) {
+    if (!hasDefaultOverflowFlags(add))
+      return false;
+    return collectAddends(add.getLhs(), addends) &&
+           collectAddends(add.getRhs(), addends);
+  } else {
+    addends.push_back(v);
+  }
+  return true;
+}
+
+// Collect the leaf operands of a (possibly nested) integer mul tree.
+static bool collectMulFactors(Value v, SmallVectorImpl<Value> &factors) {
+  if (auto mul = v.getDefiningOp<arith::MulIOp>()) {
+    if (!hasDefaultOverflowFlags(mul))
+      return false;
+    return collectMulFactors(mul.getLhs(), factors) &&
+           collectMulFactors(mul.getRhs(), factors);
+  } else {
+    factors.push_back(v);
+  }
+  return true;
+}
+
+// One addend of the identity `(x / c) * c + (x % c) == x`, possibly scaled by a
+// shared factor `k`: the "div leg" `k * (x / c) * c` or the "rem leg"
+// `k * (x % c)`.
+struct DivRemLeg {
+  bool isDiv;                 // div leg vs rem leg
+  Value x;                    // dividend
+  Value c;                    // divisor
+  SmallVector<Value> factors; // remaining shared factors `k`, sorted
+  Type innerType;             // type before an optional sign extension
+  Type addendType;            // type of the addend in the root add tree
+  bool isExtended;            // whether the addend was wrapped by arith.extsi
+};
+
+static void sortByPointer(SmallVectorImpl<Value> &vals) {
+  llvm::sort(vals, [](Value a, Value b) {
+    return a.getAsOpaquePointer() < b.getAsOpaquePointer();
+  });
+}
+
+// Try to classify `addend` as a div/rem leg. The addend may be wrapped in an
+// arith.extsi; the narrow operand is analyzed while `addendType` records the
+// type that must be produced for the root add tree.
+static std::optional<DivRemLeg> classifyLeg(Value addend) {
+  Type addendType = addend.getType();
+  Value inner = addend;
+  bool isExtended = false;
+  if (auto ext = addend.getDefiningOp<arith::ExtSIOp>()) {
+    inner = ext.getIn();
+    isExtended = true;
+  }
+  Type innerType = inner.getType();
+
+  SmallVector<Value> factors;
+  if (!collectMulFactors(inner, factors))
+    return std::nullopt;
+
+  // Require exactly one divsi/remsi among the multiplicative factors.
+  int coreIdx = -1;
+  bool isDiv = false;
+  for (size_t i = 0; i < factors.size(); ++i) {
+    bool d = factors[i].getDefiningOp<arith::DivSIOp>() != nullptr;
+    bool r = factors[i].getDefiningOp<arith::RemSIOp>() != nullptr;
+    if (d || r) {
+      if (coreIdx != -1)
+        return std::nullopt;
+      coreIdx = i;
+      isDiv = d;
+    }
+  }
+  if (coreIdx == -1)
+    return std::nullopt;
+
+  Value core = factors[coreIdx];
+  Value x, c;
+  if (isDiv) {
+    auto divOp = core.getDefiningOp<arith::DivSIOp>();
+    x = divOp.getLhs();
+    c = divOp.getRhs();
+  } else {
+    auto remOp = core.getDefiningOp<arith::RemSIOp>();
+    x = remOp.getLhs();
+    c = remOp.getRhs();
+  }
+
+  SmallVector<Value> rest;
+  for (size_t i = 0; i < factors.size(); ++i)
+    if ((int)i != coreIdx)
+      rest.push_back(factors[i]);
+
+  // The div leg must carry an explicit `* c`; remove one occurrence of it.
+  if (isDiv) {
+    auto *it = llvm::find(rest, c);
+    if (it == rest.end())
+      return std::nullopt;
+    rest.erase(it);
+  }
+
+  sortByPointer(rest);
+  return DivRemLeg{isDiv, x, c, std::move(rest), innerType, addendType,
+                   isExtended};
+}
+
+static bool legsMatch(const DivRemLeg &a, const DivRemLeg &b) {
+  return a.x == b.x && a.c == b.c && a.innerType == b.innerType &&
+         a.addendType == b.addendType && a.isExtended == b.isExtended &&
+         a.factors.size() == b.factors.size() &&
+         std::equal(a.factors.begin(), a.factors.end(), b.factors.begin());
+}
+
+static Value rebuildDivRemLeg(const DivRemLeg &leg, Location loc,
+                              OpBuilder &builder) {
+  // The unextended shared-factor form is safe in the original integer type:
+  // `(k * (x / c) * c + k * (x % c)) mod 2^n == (k * x) mod 2^n`.
+  //
+  // If each leg has already been sign-extended, however, the source computes
+  // two separate narrow products and then adds them in the wider type. Rebuilding
+  // `k * x` in the wider type (or as one narrow product followed by one extsi)
+  // is not equivalent when the narrow products wrap, so require an unscaled
+  // extended pair unless a stronger no-overflow proof is added.
+  if (leg.isExtended && !leg.factors.empty())
+    return {};
+
+  Value rebuilt = leg.x;
+  if (rebuilt.getType() != leg.innerType)
+    return {};
+
+  for (Value factor : leg.factors) {
+    if (factor.getType() != leg.innerType)
+      return {};
+    rebuilt = builder.create<arith::MulIOp>(loc, rebuilt, factor);
+  }
+
+  if (rebuilt.getType() != leg.addendType)
+    rebuilt = builder.create<arith::ExtSIOp>(loc, leg.addendType, rebuilt);
+  return rebuilt;
+}
+
+// Reassociate an add-root offset of the form `(x / c) * c + (x % c)` into `x`,
+// including the unextended shared-factor form `k*(x / c)*c + k*(x % c)` into
+// `k*x`. This is intentionally a pointer-address canonicalization helper rather
+// than a module-wide arith combine.
+static Value foldDivRemReconstruct(Value root, Location loc, OpBuilder &builder) {
+  SmallVector<Value> addends;
+  if (!collectAddends(root, addends))
+    return {};
+  if (addends.size() < 2)
+    return {};
+
+  SmallVector<std::optional<DivRemLeg>> legs;
+  legs.reserve(addends.size());
+  for (Value addend : addends)
+    legs.push_back(classifyLeg(addend));
+
+  for (size_t i = 0; i < addends.size(); ++i) {
+    if (!legs[i] || !legs[i]->isDiv)
+      continue;
+    for (size_t j = 0; j < addends.size(); ++j) {
+      if (i == j || !legs[j] || legs[j]->isDiv)
+        continue;
+      if (!legsMatch(*legs[i], *legs[j]))
+        continue;
+
+      Value rebuilt = rebuildDivRemLeg(*legs[i], loc, builder);
+      if (!rebuilt)
+        continue;
+
+      Value sum = rebuilt;
+      for (size_t k = 0; k < addends.size(); ++k) {
+        if (k == i || k == j)
+          continue;
+        sum = builder.create<arith::AddIOp>(loc, sum, addends[k]);
+      }
+
+      return sum;
+    }
+  }
+  return {};
+}
 
 class TritonToStructuredPass
     : public triton::impl::TritonToStructuredBase<TritonToStructuredPass> {
@@ -320,6 +511,39 @@ public:
     return decomposePointerTuple();
   }
 
+  // Canonicalize reshape-style pointer offsets immediately before PtrAnalysis.
+  // The transform is scoped to `tt.addptr` offsets: it builds a folded value for
+  // the pointer operation without replacing the original arithmetic tree, so
+  // ordinary integer users keep their exact source semantics.
+  bool canonicalizePointerArithmeticBeforePtrAnalysis(ModuleOp moduleOp) {
+    bool changed = false;
+    OpBuilder builder(&getContext());
+
+    moduleOp.walk([&](triton::AddPtrOp addPtrOp) {
+      Value offset = addPtrOp.getOffset();
+      bool localChanged = false;
+
+      while (offset.getDefiningOp<arith::AddIOp>()) {
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(addPtrOp);
+        Value folded =
+            foldDivRemReconstruct(offset, addPtrOp.getLoc(), builder);
+        if (!folded)
+          break;
+        offset = folded;
+        localChanged = true;
+      }
+
+      if (!localChanged)
+        return;
+
+      addPtrOp->setOperand(1, offset);
+      changed = true;
+    });
+
+    return changed;
+  }
+
   void runOnOperation() override {
     if (!skipPrepass && failed(runTritonToStructuredPrepass())) {
       signalPassFailure();
@@ -331,6 +555,8 @@ public:
     }
 
     auto moduleOp = getOperation();
+    (void)canonicalizePointerArithmeticBeforePtrAnalysis(moduleOp);
+
     mlir::tts::PtrAnalysis ptrAnalysis(enableMakeGatherScatterTensorPtr);
     ptrAnalysis.initializeMaybeStructuredArgs(moduleOp);
 
