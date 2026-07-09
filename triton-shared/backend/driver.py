@@ -34,6 +34,14 @@ except AttributeError:
     # resources.files() doesn't exist for Python < 3.9
     _triton_C_dir = importlib.resources.path(triton, "_C").__enter__()
 
+# Detect whether libarmpl_lp64.so was shipped under _triton_C_dir at build
+# time (see copy_armpl_to_extdir in setup.py).  When present, the launcher
+# links -larmpl_lp64 and embeds the rpath so no user-side LD_LIBRARY_PATH is
+# needed.  When absent (non-Arm or non-ArmPL builds) the flag is omitted to
+# avoid a link error.
+_armpl_lib_path = os.path.join(str(_triton_C_dir), "libarmpl_lp64.so")
+_has_armpl = os.path.exists(_armpl_lib_path)
+
 # -------------------- Launcher ----------------------------
 def _ty_to_cpp(ty):
     if ty[0] == '*':
@@ -353,7 +361,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
                     _get_llvm_bin_path("clang++"), "-O3", "-g", "-std=c++17", launcher_src_path, obj_path,
                     f"-I{py_include_dir}", f"-I{include_dir}", f"-L{py_lib_dir}",
                     "-shared", f"-l{py_lib}", "-fPIC", "-fopenmp",
-                    f"-L{_triton_C_dir}", "-lsleef", f"-Wl,-rpath,{_triton_C_dir}",
+                    f"-L{_triton_C_dir}", "-lsleef", *(["-larmpl_lp64"] if _has_armpl else []), f"-Wl,-rpath,{_triton_C_dir}",
                     "-o", so_path, "-rtlib=compiler-rt"
                   ])
 
