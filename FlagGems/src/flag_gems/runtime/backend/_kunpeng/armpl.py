@@ -5,6 +5,16 @@ _armpl_lib = None
 _armpl_load_error = None
 
 
+def _get_triton_C_dir():
+    """Return the path to triton/_C/ where libarmpl_lp64.so is shipped."""
+    try:
+        import triton
+        import importlib.resources
+        return str(importlib.resources.files(triton).joinpath("_C"))
+    except Exception:
+        return None
+
+
 def load_armpl():
     """Return cached ArmPL handle configured for cblas_sgemv/cblas_dgemv."""
     global _armpl_lib, _armpl_load_error
@@ -14,9 +24,13 @@ def load_armpl():
         raise RuntimeError(_armpl_load_error)
 
     candidates = ["libarmpl_lp64.so", "libarmpl.so", "libarmpl_lp64_mp.so"]
-    armpl_dir = os.environ.get("ARMPL_DIR", "")
-    if armpl_dir:
-        candidates = [os.path.join(armpl_dir, "lib", n) for n in candidates] + candidates
+
+    # Look in triton/_C/ where libarmpl_lp64.so is shipped at build time
+    # (see copy_armpl_to_extdir in setup.py).  This allows the library to be
+    # found without setting LD_LIBRARY_PATH.
+    triton_c_dir = _get_triton_C_dir()
+    if triton_c_dir:
+        candidates = [os.path.join(triton_c_dir, n) for n in candidates] + candidates
 
     for name in candidates:
         try:
@@ -57,8 +71,9 @@ def load_armpl():
             continue
 
     _armpl_load_error = (
-        "Could not load ArmPL. Install ArmPL and either set ARMPL_DIR or "
-        "ensure libarmpl_lp64.so is on LD_LIBRARY_PATH."
+        "Could not load ArmPL. Ensure libarmpl_lp64.so is shipped under "
+        "triton/_C/ (see copy_armpl_to_extdir in setup.py) or is on "
+        "LD_LIBRARY_PATH."
     )
     raise RuntimeError(_armpl_load_error)
 
