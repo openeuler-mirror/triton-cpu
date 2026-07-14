@@ -255,6 +255,10 @@ def is_even_mn_spec_args(args):
 
 
 def keep(cfg, must_keep=None):
+    from flag_gems.runtime import torch_device_fn
+
+    if str(torch_device_fn.__name__).endswith("cpu"):
+        return True
     BM = cfg.kwargs["BLOCK_M"]
     BN = cfg.kwargs["BLOCK_N"]
     w = cfg.num_warps
@@ -704,7 +708,7 @@ def flash_fwd_kernel(
     # the effect of rowmax and outputs lse only.
     lse = tl.where(
         rowsum_ == 0 | (rowsum_ != rowsum_),
-        float("inf"),
+        float("-inf"),
         rowmax_ * scale_softmax + tl.log(rowsum_),
     )
     inv_sum = tl.where(rowsum_ == 0 | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
@@ -1544,7 +1548,7 @@ def flash_varlen_fwd_kernel(
     # LSE
     lse = tl.where(
         rowsum_ == 0 | (rowsum_ != rowsum_),
-        float("inf"),
+        float("-inf"),
         rowmax_ * scale_softmax + tl.log(rowsum_),
     )
     inv_sum = tl.where(rowsum_ == 0 | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
