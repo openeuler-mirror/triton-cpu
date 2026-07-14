@@ -286,12 +286,165 @@ def flash_attn_varlen_legacy(*args, **kwargs):
     return result
 
 
+# Following attn_bias_from_alibi_slopes and ref_paged_attn are copied from
+# triton-cpu/FlagGems/tests/test_attention_ops.py
+
+
+def attn_bias_from_alibi_slopes(slopes, seqlen_q, seqlen_k, causal=False):
+    batch, nheads = slopes.shape
+    device = slopes.device
+    slopes = slopes.unsqueeze(-1).unsqueeze(-1)
+    if causal:
+        return (
+            torch.arange(-seqlen_k + 1, 1, device=device, dtype=torch.float32) * slopes
+        )
+
+    row_idx = torch.arange(seqlen_q, device=device, dtype=torch.long).unsqueeze(-1)
+    col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
+    relative_pos = torch.abs(row_idx + seqlen_k - seqlen_q - col_idx)
+    return -slopes * relative_pos.to(dtype=slopes.dtype)
+
+
+def ref_paged_attn(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    query_lens: List[int],
+    kv_lens: List[int],
+    block_tables: torch.Tensor,
+    scale: float,
+    attn_bias: torch.Tensor = None,
+    sliding_window: Optional[int] = None,
+    soft_cap: Optional[float] = None,
+) -> torch.Tensor:
+    num_seqs = len(query_lens)
+    block_tables = block_tables.cpu().numpy()
+    _, block_size, num_kv_heads, head_size = key_cache.shape
+
+    outputs: List[torch.Tensor] = []
+    start_idx = 0
+    for i in range(num_seqs):
+        query_len = query_lens[i]
+        kv_len = kv_lens[i]
+        # clone to avoid clobbering the query tensor
+        q = query[start_idx : start_idx + query_len].clone()
+        q *= scale
+
+        num_kv_blocks = (kv_len + block_size - 1) // block_size
+        block_indices = block_tables[i, :num_kv_blocks]
+
+        k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
+        k = k[:kv_len]
+        v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
+        v = v[:kv_len]
+
+        if q.shape[1] != k.shape[1]:
+            k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
+            v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
+
+        attn = torch.einsum("qhd,khd->hqk", q, k)
+        empty_mask = torch.ones(query_len, kv_len)
+        mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
+        if sliding_window is not None:
+            sliding_window_mask = (
+                torch.triu(
+                    empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
+                )
+                .bool()
+                .logical_not()
+            )
+            mask |= sliding_window_mask
+        if soft_cap is not None:
+            attn = soft_cap * torch.tanh(attn / soft_cap)
+        attn.masked_fill_(mask, float("-inf"))
+
+        if attn_bias is not None:
+            attn = attn + attn_bias[i, :, :query_len, :kv_len]
+
+        attn = torch.softmax(attn, dim=-1).to(v.dtype)
+        out = torch.einsum("hqk,khd->qhd", attn, v)
+
+        outputs.append(out)
+        start_idx += query_len
+
+    return torch.cat(outputs, dim=0)
+
+
+def torch_flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    max_seqlen_q,
+    cu_seqlens_q,
+    max_seqlen_k,
+    cu_seqlens_k=None,
+    seqused_k=None,
+    q_v=None,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=None,
+    softcap=0.0,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None,
+    return_softmax_lse=False,
+    out=None,
+    scheduler_metadata=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    s_aux=None,
+    num_splits: int = 0,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
+    cp_tot_seqused_k=None,
+    fa_version: int = 2,
+):
+    """Adapt flash_attn_varlen_func arguments for the PyTorch paged-attention ref."""
+    query_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
+    kv_lens = seqused_k.tolist()
+
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    window_size = (-1, -1) if window_size is None else window_size
+    sliding_window = None if window_size == (-1, -1) else window_size[0]
+
+    if alibi_slopes is None:
+        attn_bias = None
+    else:
+        if alibi_slopes.ndim == 1:
+            alibi_slopes = alibi_slopes.unsqueeze(0).expand(len(query_lens), -1)
+        attn_bias = attn_bias_from_alibi_slopes(
+            alibi_slopes, max_seqlen_q, max_seqlen_k, causal=causal
+        )
+
+    result = ref_paged_attn(
+        query=q,
+        key_cache=k,
+        value_cache=v,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_table,
+        scale=softmax_scale,
+        attn_bias=attn_bias,
+        sliding_window=sliding_window,
+        soft_cap=softcap if softcap > 0 else None,
+    )
+    if out is not None:
+        out.copy_(result)
+        result = out
+    return result
+
+
 @pytest.mark.skipif(
-    utils.SkipVersion("vllm", "<0.9"),
+    flag_gems.device != "cpu" and utils.SkipVersion("vllm", "<0.9"),
     reason="vLLM version prior to 0.9 does not include the flash_attn_varlen_func API.",
 )
 @pytest.mark.skipif(
-    utils.SkipVersion("torch", "<2.7"),
+    flag_gems.device != "cpu" and utils.SkipVersion("torch", "<2.7"),
     reason="Torch version prior to 2.7 is not compatible with VLLM.",
 )
 @pytest.mark.skipif(vendor_name == "hygon", reason="RuntimeError")
@@ -301,7 +454,9 @@ def flash_attn_varlen_legacy(*args, **kwargs):
 def test_flash_attn_varlen_func(monkeypatch):
     monkeypatch.setenv("VLLM_CONFIGURE_LOGGING", "0")
 
-    if vendor_name == "iluvatar":
+    if flag_gems.device == "cpu":
+        flash_attn_varlen_func = torch_flash_attn_varlen_func
+    elif vendor_name == "iluvatar":
         # iluvatar does not have updated vllm_flash_attn, use conversion wrapper
         flash_attn_varlen_func = flash_attn_varlen_legacy
     else:
