@@ -30,7 +30,7 @@ recordLogger.propagate = False
 def emit_record_logger(message: str) -> None:
     if recordLogger.handlers:
         handler = recordLogger.handlers[0]
-        if getattr(handler, "stream", None) is None:
+        if getattr(handler, "stream", None) is None and hasattr(handler, '_open'):
             handler.acquire()
             try:
                 handler.stream = handler._open()

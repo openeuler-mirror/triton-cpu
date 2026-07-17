@@ -954,6 +954,201 @@ private:
     return {sv1, sv2};
   }
 
+  // Safety check: Determine whether the pointer of the load operation and any store operation in the function point to
+  // the same underlying memory.
+  // If the pointer of the store operation and the pointer of the current load operation trace back to the same base
+  // value, (whether it is a BlockArgument or AllocOp), the original memory view cannot be used.
+  // This is because subsequent store operations (even if they write to different offsets) may be expanded into
+  // element-wise writes during low-level code generation, which could tamper with the original memory content that
+  // has already been "loaded". For example, in duplicate_keys_shuffle_kernel of randperm.
+  static Value getMemRefBase(Value ptr) {
+    while (true) {
+      if (auto castOp = ptr.getDefiningOp<memref::ReinterpretCastOp>()) {
+        ptr = castOp.getSource();
+      } else if (auto subviewOp = ptr.getDefiningOp<memref::SubViewOp>()) {
+        ptr = subviewOp.getSource();
+      } else {
+        break;
+      }
+    }
+    return ptr;
+  }
+
+  static bool isOriginalMemorySafe(Value ptr, Operation *loadOp) {
+    Value loadBase = getMemRefBase(ptr);
+    // The original memory is used only when BlockArgument(function parameter) is traced back.
+    if (!isa<BlockArgument>(loadBase)) {
+      return false;
+    }
+    // Check whether the current function has any store operation that uses the same BlockArgument as the base.
+    auto funcOp = loadOp->getParentOfType<mlir::func::FuncOp>();
+    if (!funcOp) {
+      return false;
+    }
+    BlockArgument targetArg = cast<BlockArgument>(loadBase);
+    WalkResult result = funcOp->walk([&](tts::StoreOp storeOp) {
+      Value storeBase = getMemRefBase(storeOp.getPtr());
+      if (storeBase == targetArg) {
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    // If the value is not interrupted, no store uses the same base. -> Safe.
+    return !result.wasInterrupted();
+  }
+
+  Value createFullMaskCheck(Location loc, ArrayRef<int64_t> shape,
+                            SmallVector<OpFoldResult> &mixedDims,
+                            ArrayRef<int64_t> staticMaskDims,
+                            ConversionPatternRewriter &rewriter) const {
+    Value isFull = rewriter.create<arith::ConstantOp>(loc, rewriter.getBoolAttr(true)).getResult();
+    for (size_t i = 0; i < shape.size(); i++) {
+      Value shapeVal = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(shape[i])).getResult();
+      Value maskDimVal;
+      if (mixedDims[i].is<Value>()) {
+        maskDimVal = mixedDims[i].get<Value>();
+      } else {
+        maskDimVal = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(staticMaskDims[i])).getResult();
+      }
+      Value cmp = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, maskDimVal, shapeVal);
+      isFull = rewriter.create<arith::AndIOp>(loc, isFull, cmp);
+    }
+    return isFull;
+  }
+
+  Value rewriteGeneralMaskedLoad(tts::LoadOp op, Value ptr, OpBuilder &builder) const {
+    auto loc = op->getLoc();
+    auto tensorType = cast<RankedTensorType>(op.getType());
+    auto elemType = tensorType.getElementType();
+
+    SmallVector<OpFoldResult> mixedDims = op.getMixedMaskDims();
+    SmallVector<int64_t> staticMaskDims(op.getStaticMaskDims().begin(),
+                                        op.getStaticMaskDims().end());
+
+    auto alloc = builder.create<memref::AllocOp>(
+      loc, MemRefType::get(tensorType.getShape(), elemType));
+
+    memref::SubViewOp srcSubview = getSubview(tensorType.getRank(), mixedDims, ptr, loc, builder);
+    memref::SubViewOp dstSubview = getSubview(tensorType.getRank(), mixedDims, alloc, loc, builder);
+    builder.create<memref::CopyOp>(loc, srcSubview, dstSubview);
+
+    return builder.create<bufferization::ToTensorOp>(loc, tensorType,
+                                                     alloc, true /* restrict */,
+                                                     true /* writable */);
+  }
+
+  bool useStructuredOriginMemory(tts::LoadOp op, Value ptr, ConversionPatternRewriter &rewriter) const {
+    // The vector.transfer_read is generated for dynamic dimensions.
+    // As a result, the llir fails to be generated
+    // because the vector.transfer_read cannot be converted.
+    bool hasDynamicStride = false;
+    if (auto memrefType = dyn_cast<MemRefType>(ptr.getType())) {
+      SmallVector<int64_t> strides;
+      int64_t offset;
+
+      if (failed(memrefType.getStridesAndOffset(strides, offset))) {
+        hasDynamicStride = true;
+      } else {
+        for (auto stride: strides) {
+          if (stride == ShapedType::kDynamic) {
+            hasDynamicStride = true;
+            break;
+          }
+        }
+      }
+    }
+    if (hasDynamicStride) {
+      return false;
+    }
+
+    op.emitRemark("LoadConverter: rewriteStructuredLoad use the raw memory directly.");
+    auto loc = op->getLoc();
+    auto tensorType = cast<RankedTensorType>(op.getType());
+    Value tensor = rewriter.create<bufferization::ToTensorOp>(
+      loc, tensorType, ptr, /*restrict=*/true, /*writable=*/false);
+    rewriter.replaceOp(op, tensor);
+    return true;
+  }
+
+  bool useMaskedOriginMemory(tts::LoadOp op, Value ptr, ConversionPatternRewriter &rewriter) const {
+    auto loc = op->getLoc();
+    auto other = op.getOther();
+    auto tensorType = cast<RankedTensorType>(op.getType());
+
+    SmallVector<int64_t> staticMaskDims(op.getStaticMaskDims().begin(),
+                                        op.getStaticMaskDims().end());
+    // Check whether the mask covers the full tensor statically (every static
+    // mask dim equals the corresponding tensor dim).  When true the `other`
+    // value can never be read, so we can ignore its presence and access the
+    // original buffer directly without an alloc+copy.
+    bool isMaskStaticallyFull = !staticMaskDims.empty();
+    for (size_t i = 0; i < staticMaskDims.size(); ++i) {
+      if (staticMaskDims[i] != tensorType.getShape()[i]) {
+        isMaskStaticallyFull = false;
+        break;
+      }
+    }
+    if (!isMaskStaticallyFull && other) {
+      return false;
+    }
+    if (isMaskStaticallyFull) {
+      op.emitRemark("LoadConverter: rewriteMaskedLoad using raw memory directly (statically full mask).");
+      Value tensor = rewriter.create<bufferization::ToTensorOp>(
+        loc, tensorType, ptr, /*restrict=*/true, /*writable=*/false);
+      rewriter.replaceOp(op, tensor);
+      return true;
+    }
+    op.emitRemark("LoadConverter: rewriteMaskedLoad using raw memory directly.");
+    SmallVector<int64_t> storageShape(tensorType.getShape().begin(),
+                                      tensorType.getShape().end());
+    SmallVector<OpFoldResult> mixedDims = op.getMixedMaskDims();
+
+    Value isFullMask = createFullMaskCheck(loc, storageShape, mixedDims,
+                                           staticMaskDims, rewriter);
+    Value resultTensor =
+        rewriter.create<scf::IfOp>(
+          loc, isFullMask,
+          [&](OpBuilder &thenBuilder, Location thenLoc) {
+            Value tensor = rewriter.create<bufferization::ToTensorOp>(
+              loc, tensorType, ptr, /*restrict=*/true,
+              /*writable=*/false);
+            thenBuilder.create<scf::YieldOp>(thenLoc, tensor);
+          },
+          [&](OpBuilder &elseBuilder, Location elseLoc) {
+            Value tensor = rewriteGeneralMaskedLoad(op, ptr, elseBuilder);
+            elseBuilder.create<scf::YieldOp>(elseLoc, tensor);
+          })
+        .getResult(0);
+    rewriter.replaceOp(op, resultTensor);
+    return true;
+  }
+
+  bool useOriginMemory(tts::LoadOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const {
+    auto ptr = adaptor.getPtr();
+    if (!isOriginalMemorySafe(ptr, op.getOperation())) {
+      return false;
+    }
+
+    auto originalOrderAttr = getOriginalOrderAttr(ptr);
+    auto ptrDefiningOp = ptr.getDefiningOp();
+    auto hasWrapAttr = originalOrderAttr ||
+                       ptrDefiningOp->hasAttr(WRAP_SIDE_BY_SIDE) ||
+                       ptrDefiningOp->hasAttr(WRAP_STACKED) ||
+                       ptrDefiningOp->hasAttr(WRAP_1D);
+    if (hasWrapAttr) {
+      return false;
+    }
+
+    auto other = op.getOther();
+    if (!op.hasMask()) {
+      if (other) {
+        return false;
+      }
+      return useStructuredOriginMemory(op, ptr, rewriter);
+    }
+    return useMaskedOriginMemory(op, ptr, rewriter);
+  }
+
   LogicalResult
   rewriteStructuredLoad(tts::LoadOp op, OpAdaptor adaptor,
                         ConversionPatternRewriter &rewriter) const {
@@ -1258,6 +1453,13 @@ public:
     if (auto gatherScatterPtr =
             ptr.getDefiningOp<tts::MakeGatherScatterTensorPtrOp>()) {
       return rewriteGather(gatherScatterPtr, op, adaptor.getPtr(), rewriter);
+    }
+
+    // The fast processing of using the original memory is performed here.
+    // If the path is changed and the processing is incorrect, we can directly delete the invoking here.
+    // Or should we make this an independent optimization option for triton-shared?
+    if (useOriginMemory(op, adaptor, rewriter)) {
+      return success();
     }
 
     if (op.hasMask()) {
