@@ -18,10 +18,14 @@ def _armpl_available():
     """Check if ArmPL is available on this system."""
     try:
         import ctypes
+        import importlib.resources
         candidates = ["libarmpl_lp64.so", "libarmpl.so", "libarmpl_lp64_mp.so"]
-        armpl_dir = os.environ.get("ARMPL_DIR", "")
-        if armpl_dir:
-            candidates = [os.path.join(armpl_dir, "lib", n) for n in candidates] + candidates
+        # Look in triton/_C/ where libarmpl_lp64.so is shipped at build time.
+        try:
+            triton_c_dir = str(importlib.resources.files(triton).joinpath("_C"))
+            candidates = [os.path.join(triton_c_dir, n) for n in candidates] + candidates
+        except Exception:
+            pass
         for name in candidates:
             try:
                 ctypes.CDLL(name)

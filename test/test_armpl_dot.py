@@ -1,9 +1,8 @@
 """Test that tt.dot lowers through the ArmPL path and produces correct results.
 
-Requires ArmPL to be installed. Set ARMPL_DIR to point to the ArmPL
-installation, e.g.:
+Requires ArmPL to be installed (libarmpl_lp64.so shipped under triton/_C/).
 
-    ARMPL_DIR=/opt/arm/armpl_26.01.1_gcc pytest test/test_armpl_dot.py -v
+    pytest test/test_armpl_dot.py -v
 """
 
 import os
@@ -15,11 +14,15 @@ import triton.language as tl
 
 def _armpl_available():
     """Check if ArmPL is loadable."""
-    candidates = ["libarmpl_lp64.so", "libarmpl.so", "libarmpl_lp64_mp.so"]
-    armpl_dir = os.environ.get("ARMPL_DIR", "")
-    if armpl_dir:
-        candidates = [os.path.join(armpl_dir, "lib", n) for n in candidates] + candidates
     import ctypes
+    import importlib.resources
+    candidates = ["libarmpl_lp64.so", "libarmpl.so", "libarmpl_lp64_mp.so"]
+    # Look in triton/_C/ where libarmpl_lp64.so is shipped at build time.
+    try:
+        triton_c_dir = str(importlib.resources.files(triton).joinpath("_C"))
+        candidates = [os.path.join(triton_c_dir, n) for n in candidates] + candidates
+    except Exception:
+        pass
     for name in candidates:
         try:
             ctypes.CDLL(name)
@@ -31,7 +34,7 @@ def _armpl_available():
 
 requires_armpl = pytest.mark.skipif(
     not _armpl_available(),
-    reason="ArmPL not available (set ARMPL_DIR or install libarmpl_lp64.so)",
+    reason="ArmPL not available (libarmpl_lp64.so not found under triton/_C/ or LD_LIBRARY_PATH)",
 )
 
 

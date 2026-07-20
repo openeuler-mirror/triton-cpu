@@ -315,6 +315,25 @@ def get_base_dir():
     return os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 
 
+def copy_armpl_to_extdir(extdir: str):
+    """Copy libarmpl_lp64.so into the triton/_C output directory.
+
+    The launcher driver links with -larmpl_lp64 and sets -Wl,-rpath to
+    triton/_C, so the library must live next to libtriton.so.  We look for
+    the library under third_party/armpl/lib (mirroring the nvidia/amd
+    backend layout).  If it cannot be found we silently skip the copy so
+    builds on non-Arm systems are unaffected.
+    """
+    armpl_lib_dir = os.path.join(get_base_dir(), "third_party", "armpl", "lib")
+    src = os.path.join(armpl_lib_dir, "libarmpl_lp64.so")
+    if os.path.exists(src):
+        dst = os.path.join(extdir, "libarmpl_lp64.so")
+        print(f"copy {src} to {dst} ...")
+        shutil.copy(src, dst)
+    else:
+        print("libarmpl_lp64.so not found; skipping copy (ArmPL kernels will not be available)")
+
+
 def get_cmake_dir():
     plat_name = sysconfig.get_platform()
     python_version = sysconfig.get_python_version()
@@ -485,6 +504,10 @@ class CMakeBuild(build_ext):
         subprocess.check_call(["cmake", self.base_dir] + cmake_args, cwd=cmake_dir, env=env)
         subprocess.check_call(["cmake", "--build", "."] + build_args, cwd=cmake_dir)
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
+        # Copy libarmpl_lp64.so next to libtriton.so so the launcher can link
+        # against it via -larmpl_lp64 + -Wl,-rpath at runtime without requiring
+        # users to set LD_LIBRARY_PATH.
+        copy_armpl_to_extdir(extdir)
 
 
 nvidia_version_path = os.path.join(get_base_dir(), "cmake", "nvidia-toolchain-version.json")
