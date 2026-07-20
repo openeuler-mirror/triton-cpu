@@ -1746,19 +1746,242 @@ def test_flash_mla(seqlen, dtype):
         del os.environ["MUSA_ENABLE_SQMMA"]
 
 
+def cpu_get_scheduler_metadata(
+    batch_size: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    num_heads: int,
+    num_heads_k: int,
+    headdim: int,
+    headdim_v: int,
+    qkv_dtype: torch.dtype,
+    seqused_k: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
+    max_seqlen_k_new: int = 0,
+    is_causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    has_softcap: bool = False,
+    num_splits: int = 0,
+    pack_gqa: Optional[bool] = None,
+    sm_margin: int = 0,
+) -> torch.Tensor:
+    from flag_gems.ops.get_scheduler_metadata import (
+        get_num_splits,
+        get_optimal_block_mn,
+        get_pack_gqa,
+        get_pagedkv_tma,
+        round_up_headdim,
+        round_up_headdimv,
+    )
+
+    device = seqused_k.device
+    if device.type != "cpu":
+        raise ValueError("cpu_get_scheduler_metadata only supports CPU tensors")
+    dtype = torch.int32
+
+    supported_dtypes = (torch.half, torch.bfloat16)
+    assert (
+        qkv_dtype in supported_dtypes
+    ), "FlashAttention only supports fp16 and bf16 data type"
+    assert (
+        num_heads % num_heads_k == 0
+    ), "Number of heads in key/value must divide number of heads in query"
+
+    effective_is_causal = is_causal
+    effective_window_left = window_size_left if window_size_left >= 0 else -1
+    effective_window_right = window_size_right
+
+    if effective_window_left >= max_seqlen_k - 1:
+        effective_window_left = -1
+    if effective_window_right >= max_seqlen_q - 1:
+        effective_window_right = -1
+
+    if (
+        max_seqlen_q == 1
+        and effective_window_left == -1
+        and effective_window_right == -1
+    ):
+        if (headdim <= 64 or headdim > 128) or page_size is None:
+            effective_is_causal = False
+
+    if effective_is_causal:
+        effective_window_right = 0
+
+    final_is_causal = effective_window_left < 0 and effective_window_right == 0
+    final_is_local = (
+        effective_window_left >= 0 or effective_window_right >= 0
+    ) and not final_is_causal
+
+    arch = 0
+    num_sm = torch.get_num_threads() - sm_margin
+
+    softcap = 1.0 if has_softcap else 0.0
+    element_size = qkv_dtype.itemsize
+    has_page_table = page_size is not None
+    d_rounded = round_up_headdim(headdim)
+    dv_rounded = round_up_headdimv(headdim_v)
+
+    pagedkv_tma = get_pagedkv_tma(
+        arch=arch,
+        page_size=page_size if page_size is not None else 1,
+        has_page_table=has_page_table,
+        leftpad_k=leftpad_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k_new=max_seqlen_k_new,
+        num_heads=num_heads,
+        num_heads_k=num_heads_k,
+        d_rounded=d_rounded,
+        dv_rounded=dv_rounded,
+        is_causal=final_is_causal,
+        is_local=final_is_local,
+        element_size=element_size,
+        softcap=has_softcap,
+    )
+
+    varlen_q_flag = cu_seqlens_q is not None or seqused_q is not None
+    pack_gqa = (
+        pack_gqa
+        if pack_gqa is not None
+        else get_pack_gqa(
+            arch=arch,
+            has_page_table=has_page_table,
+            pagedkv_tma=pagedkv_tma,
+            num_splits=num_splits,
+            num_heads=num_heads,
+            num_heads_k=num_heads_k,
+            varlen_q=varlen_q_flag,
+            seqlen_q=max_seqlen_q,
+            d_rounded=d_rounded,
+            dv_rounded=dv_rounded,
+            is_causal=final_is_causal,
+            is_local=final_is_local,
+            element_size=element_size,
+            softcap=has_softcap,
+        )
+    )
+
+    use_dynamic_split = batch_size <= 992
+
+    if num_splits <= 0:
+        eff_num_splits = get_num_splits(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            num_heads_k=num_heads_k,
+            headdim=headdim,
+            headdim_v=headdim_v,
+            d_rounded=d_rounded,
+            dv_rounded=dv_rounded,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            max_seqlen_k_new=max_seqlen_k_new,
+            arch=arch,
+            num_sm=num_sm,
+            is_causal=final_is_causal,
+            is_local=final_is_local,
+            has_softcap=softcap,
+            is_varlen=True,
+            has_page_table=has_page_table,
+            pack_gqa=pack_gqa,
+            window_size_left=effective_window_left,
+            window_size_right=effective_window_right,
+            element_size=element_size,
+            use_dynamic_split=use_dynamic_split,
+        )
+    else:
+        eff_num_splits = num_splits
+
+    eff_num_splits = min(eff_num_splits, 256, num_sm)
+
+    pack_gqa = True if eff_num_splits > 1 else pack_gqa
+
+    qhead_per_khead = (
+        1 if not pack_gqa else (num_heads + num_heads_k - 1) // num_heads_k
+    )
+    num_head_k = num_heads_k if pack_gqa else num_heads
+
+    blockM, blockN = get_optimal_block_mn(
+        device=device,
+        headdim=headdim,
+        headdim_v=headdim_v,
+        is_causal=final_is_causal,
+        is_local=final_is_local,
+        has_softcap=has_softcap,
+        element_size=element_size,
+        paged_kv=has_page_table,
+        pagedkv_tma=pagedkv_tma,
+        varlen_and_split=eff_num_splits > 1,
+        append_kv=max_seqlen_k_new > 0,
+    )
+
+    if seqused_q is not None:
+        seqlen_q = seqused_q[:batch_size]
+    elif cu_seqlens_q is not None:
+        seqlen_q = cu_seqlens_q[1 : batch_size + 1] - cu_seqlens_q[:batch_size]
+    else:
+        seqlen_q = torch.full(
+            (batch_size,), max_seqlen_q, dtype=dtype, device=device
+        )
+
+    num_m_blocks = (seqlen_q * qhead_per_khead + blockM - 1) // blockM
+
+    seqlen_k = seqused_k[:batch_size]
+    if max_seqlen_k_new > 0:
+        if cu_seqlens_k_new is not None:
+            seqlen_k = seqlen_k + (
+                cu_seqlens_k_new[1 : batch_size + 1]
+                - cu_seqlens_k_new[:batch_size]
+            )
+        else:
+            seqlen_k = seqlen_k + max_seqlen_k_new
+    if leftpad_k is not None:
+        seqlen_k = seqlen_k - leftpad_k[:batch_size]
+
+    num_n_blocks = (seqlen_k + blockN - 1) // blockN
+    if use_dynamic_split:
+        total_blocks = (num_m_blocks * num_n_blocks).sum().item()
+        blocks_per_sm = max(
+            1,
+            math.ceil(total_blocks * 1.1 * num_head_k / num_sm),
+        )
+        num_splits_dynamic = (
+            (num_n_blocks + blocks_per_sm - 1) // blocks_per_sm
+        ).clamp_max_(eff_num_splits)
+        num_splits_dynamic.clamp_min_(1)
+
+    scheduler_needs_semaphore = eff_num_splits > 1
+    alloc_size = int(scheduler_needs_semaphore) + int(use_dynamic_split) * batch_size
+    scheduler_metadata = torch.empty(alloc_size, dtype=dtype, device=device)
+    offset = 0
+    if scheduler_needs_semaphore:
+        scheduler_metadata[0] = 0
+        offset = 1
+    if use_dynamic_split:
+        scheduler_metadata[offset:] = num_splits_dynamic
+    return scheduler_metadata
+
+
 @pytest.mark.get_scheduler_metadata
 @pytest.mark.parametrize("batch_size", [1, 8, 256, 512])
 @pytest.mark.parametrize("max_seqlen_k", [512, 2048])
 @pytest.mark.parametrize("headdim", [64, 128])
 @pytest.mark.parametrize("num_splits_static", [0, 4])
 @pytest.mark.parametrize("seed", [42])
-@pytest.mark.skipif(not HAS_VLLM, reason="vllm not installed")
+@pytest.mark.skipif(
+    flag_gems.device != "cpu" and not HAS_VLLM, reason="vllm not installed"
+)
 def test_scheduler_metadata_correctness(
     batch_size, max_seqlen_k, headdim, num_splits_static, seed
 ):
-    if TO_CPU:
-        pytest.skip("Skipping correctness test in CPU mode.")
-    device = torch_device_fn.current_device()
+    if flag_gems.device == "cpu":
+        device = "cpu"
+    else:
+        device = torch_device_fn.current_device()
     init_seed(seed)
 
     seqused_k = torch.randint(
@@ -1767,10 +1990,14 @@ def test_scheduler_metadata_correctness(
     num_heads, num_heads_k = 32, 8
     headdim_v = headdim
     qkv_dtype = torch.float16
-    # num_sm = torch.cuda.get_device_properties(device).multi_processor_count
-    import vllm.vllm_flash_attn.flash_attn_interface as vllm_ops  # noqa: F401
+    if flag_gems.device == "cpu":
+        get_scheduler_metadata = cpu_get_scheduler_metadata
+    else:
+        # num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+        import vllm.vllm_flash_attn.flash_attn_interface as vllm_ops  # noqa: F401
+        get_scheduler_metadata = torch.ops._vllm_fa3_C.get_scheduler_metadata
 
-    ref_metadata = torch.ops._vllm_fa3_C.get_scheduler_metadata(
+    ref_metadata = get_scheduler_metadata(
         batch_size=batch_size,
         max_seqlen_q=1,
         max_seqlen_k=max_seqlen_k,
