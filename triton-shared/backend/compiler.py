@@ -291,7 +291,8 @@ class CPUBackend(BaseBackend):
                     print("TritonShared-MLIR optimization failed, falling back to CPU backend")
                     os.environ["TRITON_USE_SHARED_BACKEND"] = "0"
                     raise CPUFallbackException
-            
+                raise
+
             return Path(dst_path).read_text()
 
 
