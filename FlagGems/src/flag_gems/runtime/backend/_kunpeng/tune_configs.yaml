@@ -48,17 +48,25 @@ log_softmax:
     BLOCK_N: 128
   num_warps: 4
 mm:
+# small tiles: minimum valid tl.dot tile on CPU, needed for tiny shapes
+- META:
+    BLOCK_M: 16
+    BLOCK_N: 16
+    BLOCK_K: 16
+  num_stages: 4
+  num_warps: 4
+# medium tiles: balanced option for larger shapes
+- META:
+    BLOCK_M: 32
+    BLOCK_N: 32
+    BLOCK_K: 16
+  num_stages: 4
+  num_warps: 4
 # SME minimum should be M=SVL, N=Vscalex16 K whatev to represent SME microK, take SVL16bits=vscalex8 for safety
 - META:
     BLOCK_M: 256
     BLOCK_N: 256
     BLOCK_K: 256
-  num_stages: 4
-  num_warps: 4
-- META:
-    BLOCK_M: 8
-    BLOCK_N: 8
-    BLOCK_K: 8
   num_stages: 4
   num_warps: 4
 softmax_non_inner:
