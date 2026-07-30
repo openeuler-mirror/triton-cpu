@@ -82,12 +82,17 @@ struct ArmPLOpPattern : public OpRewritePattern<triton::DotOp> {
     // (f16/bf16 are upcast to f32 before the call).  Integer dot products
     // (e.g. int8 x int8 -> int32), float8 dot products, and batched/3D dot
     // operations are left to the standard TritonArithToLinalg lowering.
+    // bf16 is also left to the standard lowering because the
+    // bf16→f32 upcast generates excessive conversion IR that inflates
+    // llc compile time.
     auto aType = cast<RankedTensorType>(op.getA().getType());
     if (aType.getRank() != 2)
       return rewriter.notifyMatchFailure(op, "non-2D tensor");
     auto aElemType = aType.getElementType();
     if (!aElemType.isa<FloatType>() || type::isFloat8(aElemType))
       return rewriter.notifyMatchFailure(op, "unsupported element type");
+    if (aElemType.isBF16())
+      return rewriter.notifyMatchFailure(op, "bf16 not supported by ArmPL");
 
     Value aSrc = op.getA();
     Value bSrc = op.getB();
