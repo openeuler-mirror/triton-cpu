@@ -37,18 +37,25 @@ namespace triton {
 
 namespace {
 
-/// Emit a function declaration for the ArmPL BLAS function.
-static func::FuncOp getOrCreateBLASFunc(ModuleOp module, const char *name,
-                                        Type returnType,
-                                        ArrayRef<Type> argTypes,
-                                        OpBuilder &builder) {
-  if (auto existing = module.lookupSymbol<func::FuncOp>(name))
+/// Emit an LLVM function declaration for the ArmPL BLAS function.
+///
+/// We create an llvm.func (not func.func) because the argument types already
+/// use LLVM pointer types (!llvm.ptr).  The ConvertFuncToLLVM pass skips
+/// func.func declarations whose signatures are already in LLVM types, leaving
+/// them as func.func — which mlir-translate cannot lower.  By emitting
+/// llvm.func / llvm.call directly we avoid that gap entirely.
+static LLVM::LLVMFuncOp getOrCreateBLASFunc(ModuleOp module, const char *name,
+                                            Type returnType,
+                                            ArrayRef<Type> argTypes,
+                                            OpBuilder &builder) {
+  if (auto existing = module.lookupSymbol<LLVM::LLVMFuncOp>(name))
     return existing;
-  auto funcType = builder.getFunctionType(argTypes, returnType);
-  auto funcOp = builder.create<func::FuncOp>(module.getLoc(), name, funcType);
+  auto funcType = LLVM::LLVMFunctionType::get(returnType, argTypes);
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(module.getBody());
+  auto funcOp = builder.create<LLVM::LLVMFuncOp>(
+      module.getLoc(), name, funcType);
   funcOp.setPrivate();
-  module.getBody()->getOperations().insert(
-      module.getBody()->getOperations().begin(), funcOp);
   return funcOp;
 }
 
@@ -159,8 +166,9 @@ struct ArmPLMatmulLowering : public OpRewritePattern<tts::ArmPLMatmulOp> {
     // Create cblas_sgemm / cblas_dgemm call
     const char *funcName = isDouble ? "cblas_dgemm" : "cblas_sgemm";
     auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+    auto voidType = LLVM::LLVMVoidType::get(rewriter.getContext());
     auto funcOp = getOrCreateBLASFunc(
-        module, funcName, rewriter.getNoneType(),
+        module, funcName, voidType,
         {i32Type, i32Type, i32Type, i32Type, i32Type, i32Type,
          scalarType, ptrType, i32Type, ptrType, i32Type,
          scalarType, ptrType, i32Type},
@@ -171,7 +179,10 @@ struct ArmPLMatmulLowering : public OpRewritePattern<tts::ArmPLMatmulOp> {
                                alphaVal, aPtr, lda,
                                bPtr, ldb,
                                betaVal, cPtr, ldc};
-    rewriter.create<func::CallOp>(loc, funcOp, args);
+    rewriter.create<LLVM::CallOp>(
+        loc, funcOp.getFunctionType(),
+        SymbolRefAttr::get(rewriter.getContext(), funcName),
+        args);
 
     // Convert c memref back to tensor
     Value result = memrefToTensor(cMem, loc, rewriter);
@@ -228,8 +239,9 @@ struct ArmPLGemvLowering : public OpRewritePattern<tts::ArmPLGemvOp> {
     // Create cblas_sgemv / cblas_dgemv call
     const char *funcName = isDouble ? "cblas_dgemv" : "cblas_sgemv";
     auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+    auto voidType = LLVM::LLVMVoidType::get(rewriter.getContext());
     auto funcOp = getOrCreateBLASFunc(
-        module, funcName, rewriter.getNoneType(),
+        module, funcName, voidType,
         {i32Type, i32Type, i32Type, i32Type,
          scalarType, ptrType, i32Type, ptrType, i32Type,
          scalarType, ptrType, i32Type},
@@ -239,7 +251,10 @@ struct ArmPLGemvLowering : public OpRewritePattern<tts::ArmPLGemvOp> {
                                alphaVal, aPtr, lda,
                                xPtr, incx,
                                betaVal, yPtr, incy};
-    rewriter.create<func::CallOp>(loc, funcOp, args);
+    rewriter.create<LLVM::CallOp>(
+        loc, funcOp.getFunctionType(),
+        SymbolRefAttr::get(rewriter.getContext(), funcName),
+        args);
 
     // Convert y memref back to tensor
     Value result = memrefToTensor(yMem, loc, rewriter);

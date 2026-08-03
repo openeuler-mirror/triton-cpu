@@ -273,21 +273,26 @@ class CPUBackend(BaseBackend):
             _dump_ir_if_needed(kernel_debug_dir, [src_path])
             triton_shared_opt_path = _get_triton_shared_opt_path()
             try:
-                cmd = [triton_shared_opt_path, src_path, "--triton-to-linalg-experimental"]
                 if _armpl_is_available():
-                    cmd.append("--triton-to-linalg-experimental=enable-armpl=true")
+                    cmd = [triton_shared_opt_path, src_path,
+                           "--triton-to-linalg-experimental=enable-armpl=true"]
+                else:
+                    cmd = [triton_shared_opt_path, src_path,
+                           "--triton-to-linalg-experimental"]
                 # If mlir dump is enabled, pass option --mlir-print-ir-after-all to triton-shared
                 if os.environ.get("MLIR_ENABLE_DUMP", "0") == "1":
                     cmd.append("--mlir-print-ir-after-all")
                 cmd.extend(["-o", dst_path])
                 subprocess.check_call(cmd)
+                _dump_ir_if_needed(kernel_debug_dir, [dst_path])
                 return Path(dst_path).read_text()
             except subprocess.CalledProcessError as e:
                 if ENABLE_FALLBACK:
                     print("TritonShared-MLIR optimization failed, falling back to CPU backend")
                     os.environ["TRITON_USE_SHARED_BACKEND"] = "0"
                     raise CPUFallbackException
-            
+                raise
+
             return Path(dst_path).read_text()
 
 
