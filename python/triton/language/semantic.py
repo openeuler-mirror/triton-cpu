@@ -1691,6 +1691,10 @@ def debug_barrier(builder: ir.builder) -> tl.tensor:
     return tl.tensor(builder.create_barrier(), tl.void)
 
 
+def device_timestamp(builder: ir.builder) -> tl.tensor:
+    return tl.tensor(builder.create_timestamp(), tl.int64)
+
+
 def device_print(prefix: str, args: List[tl.tensor], hex: bool, builder: ir.builder) -> tl.tensor:
     # It makes sense visually for prefix to end in ": "; make it so.  Also,
     # non-empty prefixes should start with " ".
