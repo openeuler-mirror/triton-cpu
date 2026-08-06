@@ -66,13 +66,13 @@ extern "C" void printNewline() { fputc('\n', stdout); }
 extern "C" void println_i64(int64_t pid, char const *prefix, int64_t val) {
   char buf[256];
   int n = snprintf(buf, sizeof(buf), "%" PRId64 " %s %" PRId64 "\n", pid, prefix, val);
-  if (n > 0) 
+  if (n > 0)
     write(STDOUT_FILENO, buf, (size_t)(n < (int)sizeof(buf) ? n : sizeof(buf)));
 }
 extern "C" void println_f64(int64_t pid, char const *prefix, double val) {
   char buf[256];
   int n = snprintf(buf, sizeof(buf), "%" PRId64 " %s %lg\n", pid, prefix, val);
-  if (n > 0) 
+  if (n > 0)
     write(STDOUT_FILENO, buf, (size_t)(n < (int)sizeof(buf) ? n : sizeof(buf)));
 }
 #else
@@ -163,11 +163,11 @@ extern "C" double rtclock() {
 /// Returns the number of nanoseconds since Epoch 1970-01-01 00:00:00 +0000 (UTC).
 extern "C" int64_t rtclock_ns() {
 #ifndef _WIN32
-  struct timespec tp;
+  struct timespec tp = {0};
   int stat = clock_gettime(CLOCK_REALTIME, &tp);
   if (stat != 0)
     fprintf(stderr, "Error returning time from clock_gettime: %d\n", stat);
-  return (int64_t)(tp.tv_sec * 1.0e9 + tp.tv_nsec);
+  return (int64_t)tp.tv_sec * 1000000000LL + (int64_t)tp.tv_nsec;
 #else
   fprintf(stderr, "Timing utility not implemented on Windows\n");
   return 0;

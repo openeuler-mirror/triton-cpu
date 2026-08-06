@@ -12,6 +12,8 @@
 #include <functional>
 #ifndef _WIN32
 #include <unistd.h>
+#else
+#define STDOUT_FILENO 1
 #endif
 
 #include "triton-shared/Analysis/MaskAnalysis.h"
@@ -807,9 +809,21 @@ struct PrintOpConverter : public OpConversionPattern<triton::PrintOp> {
     auto funcOp = op->getParentOfType<triton::FuncOp>();
     auto numArgs = funcOp.getNumArguments();
     auto launchGridRank = getMaxEnumValForProgramIDDim() + 1;
-    Value pid = rewriter.create<arith::ExtSIOp>(
-        loc, rewriter.getI64Type(),
-        funcOp.getArgument(numArgs - launchGridRank));
+    Value pid;
+    if (numArgs >= launchGridRank) {
+      auto argTy = funcOp.getArgument(numArgs - launchGridRank).getType();
+      if (isa<IntegerType>(argTy)) {
+        pid = rewriter.create<arith::ExtSIOp>(
+            loc, rewriter.getI64Type(),
+            funcOp.getArgument(numArgs - launchGridRank));
+      } else {
+        pid = rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(-1));
+      }
+    } else {
+      pid = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64Type(),
+                                               rewriter.getI64IntegerAttr(-1));
+    }
 
     for (size_t i = 0; i < op.getNumOperands(); i++) {
       auto operand = adaptor.getArgs()[i];
