@@ -631,7 +631,7 @@ class InterpreterBuilder:
 
     def create_timestamp(self):
         import time
-        return time.time_ns()
+        return TensorHandle(np.array([time.time_ns()], dtype=np.int64), tl.int64)
 
     def create_print(self, prefix, hex, values, isSigned):
         # NOTE: the `isSigned` variable is not really used here; because Signness is already known
