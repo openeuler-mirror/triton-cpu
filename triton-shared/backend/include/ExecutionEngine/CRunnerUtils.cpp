@@ -33,6 +33,9 @@
 #include <cstdlib>
 #include <random>
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #ifdef MLIR_CRUNNERUTILS_DEFINE_FUNCTIONS
 
@@ -57,6 +60,29 @@ extern "C" void printOpen() { fputs("( ", stdout); }
 extern "C" void printClose() { fputs(" )", stdout); }
 extern "C" void printComma() { fputs(", ", stdout); }
 extern "C" void printNewline() { fputc('\n', stdout); }
+
+// Thread-safe line printing: format entire line and write atomically.
+#ifndef _WIN32
+extern "C" void println_i64(int64_t pid, char const *prefix, int64_t val) {
+  char buf[256];
+  int n = snprintf(buf, sizeof(buf), "%" PRId64 " %s %" PRId64 "\n", pid, prefix, val);
+  if (n > 0) 
+    write(STDOUT_FILENO, buf, (size_t)(n < (int)sizeof(buf) ? n : sizeof(buf)));
+}
+extern "C" void println_f64(int64_t pid, char const *prefix, double val) {
+  char buf[256];
+  int n = snprintf(buf, sizeof(buf), "%" PRId64 " %s %lg\n", pid, prefix, val);
+  if (n > 0) 
+    write(STDOUT_FILENO, buf, (size_t)(n < (int)sizeof(buf) ? n : sizeof(buf)));
+}
+#else
+extern "C" void println_i64(int64_t pid, char const *prefix, int64_t val) {
+  fprintf(stdout, "%" PRId64 " %s %" PRId64 "\n", pid, prefix, val);
+}
+extern "C" void println_f64(int64_t pid, char const *prefix, double val) {
+  fprintf(stdout, "%" PRId64 " %s %lg\n", pid, prefix, val);
+}
+#endif
 
 extern "C" void memrefCopy(int64_t elemSize, UnrankedMemRefType<char> *srcArg,
                            UnrankedMemRefType<char> *dstArg) {
@@ -131,6 +157,20 @@ extern "C" double rtclock() {
 #else
   fprintf(stderr, "Timing utility not implemented on Windows\n");
   return 0.0;
+#endif // _WIN32
+}
+
+/// Returns the number of nanoseconds since Epoch 1970-01-01 00:00:00 +0000 (UTC).
+extern "C" int64_t rtclock_ns() {
+#ifndef _WIN32
+  struct timespec tp;
+  int stat = clock_gettime(CLOCK_REALTIME, &tp);
+  if (stat != 0)
+    fprintf(stderr, "Error returning time from clock_gettime: %d\n", stat);
+  return (int64_t)(tp.tv_sec * 1.0e9 + tp.tv_nsec);
+#else
+  fprintf(stderr, "Timing utility not implemented on Windows\n");
+  return 0;
 #endif // _WIN32
 }
 

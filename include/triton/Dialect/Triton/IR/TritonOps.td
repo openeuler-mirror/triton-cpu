@@ -890,6 +890,23 @@ def TT_PrintOp : TT_Op<"print", [SameVariadicOperandSize, MemoryEffects<[MemWrit
 }
 
 //
+// Timestamp Op
+//
+def TT_TimestampOp : TT_Op<"timestamp", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {
+  let summary = "Get the current timestamp in nanoseconds";
+  let description = [{
+    `tt.timestamp` returns the current timestamp (nanoseconds since epoch) as an i64.
+  }];
+  let results = (outs I64:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
+  let builders = [
+    OpBuilder<(ins), [{
+      build($_builder, $_state, $_builder.getI64Type());
+    }]>
+  ];
+}
+
+//
 // Assert Op
 //
 def TT_AssertOp : TT_Op<"assert", [MemoryEffects<[MemWrite<GlobalMemory>]>]> {

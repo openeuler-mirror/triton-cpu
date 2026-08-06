@@ -8,6 +8,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <cinttypes>
+#include <functional>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 #include "triton-shared/Analysis/MaskAnalysis.h"
 #include "triton-shared/Analysis/OpFoldResultUtils.h"
 #include "triton-shared/Analysis/PtrAnalysis.h"
@@ -17,6 +23,7 @@
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -784,6 +791,217 @@ struct MakeRangeConverter : public OpConversionPattern<triton::MakeRangeOp> {
 
     rewriter.replaceOp(op, linalgOp->getResults());
     return success();
+  }
+};
+
+struct PrintOpConverter : public OpConversionPattern<triton::PrintOp> {
+  using OpConversionPattern<triton::PrintOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::PrintOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto prefix = op.getPrefix();
+    auto ctx = rewriter.getContext();
+
+    auto funcOp = op->getParentOfType<triton::FuncOp>();
+    auto numArgs = funcOp.getNumArguments();
+    auto launchGridRank = getMaxEnumValForProgramIDDim() + 1;
+    Value pid = rewriter.create<arith::ExtSIOp>(
+        loc, rewriter.getI64Type(),
+        funcOp.getArgument(numArgs - launchGridRank));
+
+    for (size_t i = 0; i < op.getNumOperands(); i++) {
+      auto operand = adaptor.getArgs()[i];
+      auto type = operand.getType();
+
+      Value val;
+      if (isa<RankedTensorType>(type)) {
+        auto rankedTy = cast<RankedTensorType>(type);
+        SmallVector<Value> indices(
+            rankedTy.getRank(),
+            rewriter.create<arith::ConstantIndexOp>(loc, 0));
+        val = rewriter.create<tensor::ExtractOp>(loc, operand, indices);
+      } else {
+        val = operand;
+      }
+
+      auto scalarType = val.getType();
+      bool isFloatType = isa<FloatType>(scalarType);
+      StringAttr fnAttr =
+          getOrCreatePrintfLine(rewriter, loc, prefix, isFloatType);
+
+      if (!isFloatType) {
+        if (auto intTy = dyn_cast<IntegerType>(scalarType)) {
+          if (intTy.getWidth() < 64) {
+            val = rewriter.create<arith::ExtSIOp>(loc, rewriter.getI64Type(),
+                                                  val);
+          }
+        }
+      }
+      rewriter.create<func::CallOp>(loc, fnAttr.getValue(), TypeRange{},
+                                    ValueRange{pid, val});
+    }
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  StringAttr getOrCreatePrintfLine(OpBuilder &b, Location loc, StringRef prefix,
+                                   bool isFloat) const {
+    auto moduleOp = b.getBlock()->getParentOp()->getParentOfType<ModuleOp>();
+
+    // Build a unique function name based on prefix and type
+    std::hash<std::string> hasher;
+    auto hashVal = hasher(prefix.str());
+    std::string fnName =
+        "printLine_" + std::to_string(hashVal) + (isFloat ? "_f64" : "_i64");
+
+    // Intern the name in MLIR context to ensure StringRef stay valid
+    StringAttr nameAttr = StringAttr::get(b.getContext(), fnName);
+    if (moduleOp.lookupSymbol<func::FuncOp>(nameAttr))
+      return nameAttr;
+
+    // Build format string
+    std::string fmt = (std::string("pid: %") + PRId64 + " " + prefix + "%" +
+                       (isFloat ? "lg" : PRId64) + "\n")
+                          .str();
+
+    auto ctx = b.getContext();
+    auto i8Ty = IntegerType::get(ctx, 8);
+    auto i8PtrTy = LLVM::LLVMPointerType::get(ctx);
+
+    // Create helper function at module level
+    auto funcType = FunctionType::get(
+        ctx,
+        {b.getI64Type(), isFloat ? Type(b.getF64Type()) : Type(b.getI64Type())},
+        {});
+    OpBuilder modBuilder(moduleOp.getBody(), moduleOp.getBody()->end());
+    auto fn = modBuilder.create<func::FuncOp>(loc, nameAttr, funcType);
+    fn.setPrivate();
+
+    auto *entryBlock = fn.addEntryBlock();
+    OpBuilder fnBuilder(entryBlock, entryBlock->begin());
+
+    auto fnArgs = entryBlock->getArguments();
+    Value pidVal = fnArgs[0];
+    Value valVal = fnArgs[1];
+
+    // alloca buffer for formatted output
+    auto bufSize = fnBuilder.create<arith::ConstantOp>(
+        loc, fnBuilder.getI64Type(), fnBuilder.getI64IntegerAttr(256));
+    auto alloca = fnBuilder.create<LLVM::AllocaOp>(loc, i8PtrTy, i8Ty, bufSize,
+                                                  /*alignment=*/ 0);
+
+    // Build format string constant on stack
+    size_t fmtLen = fmt.size();
+    auto fmtBufSize = fnBuilder.create<arith::ConstantOp>(
+        loc, fnBuilder.getI64Type(), fnBuilder.getI64IntegerAttr(fmtLen + 1));
+    auto fmtBuf = fnBuilder.create<LLVM::AllocaOp>(loc, i8PtrTy, i8Ty,
+                                                  fmtBufSize, /*alignment=*/ 0);
+
+    for (size_t i = 0; i < fmtLen; i++) {
+      Value idx = fnBuilder.create<arith::ConstantOp>(
+          loc, fnBuilder.getI64Type(), fnBuilder.getI64IntegerAttr(i));
+      auto gep = fnBuilder.create<LLVM::GEPOp>(
+          loc, i8PtrTy, i8Ty, fmtBuf, ArrayRef<LLVM::GEPArg>(idx), /*inbounds=*/ true);
+      Value ch = fnBuilder.create<arith::ConstantOp>(
+          loc, i8Ty, fnBuilder.getI8IntegerAttr((uint8_t)fmt[i]));
+      fnBuilder.create<LLVM::StoreOp>(loc, ch, gep);
+    }
+    // null terminator
+    Value nullIdx = fnBuilder.create<arith::ConstantOp>(
+        loc, fnBuilder.getI64Type(), fnBuilder.getI64IntegerAttr(fmtLen));
+    auto nullGep = fnBuilder.create<LLVM::GEPOp>(
+        loc, i8PtrTy, i8Ty, fmtBuf, ArrayRef<LLVM::GEPArg>(nullIdx),
+        /*inbounds=*/ true);
+    fnBuilder.create<LLVM::StoreOp>(
+        loc,
+        fnBuilder.create<arith::ConstantOp>(loc, i8Ty,
+                                            fnBuilder.getI8IntegerAttr(0)),
+        nullGep);
+
+    // snprintf(buf, 256, fmtBuf, pid, val)
+    lookupOrCreateFunc(
+        fnBuilder, loc, "snprintf",
+        {i8PtrTy, fnBuilder.getI64Type(), i8PtrTy, fnBuilder.getI64Type(),
+         isFloat ? Type(fnBuilder.getF64Type()) : Type(fnBuilder.getI64Type())},
+        fnBuilder.getI32Type());
+
+    fnBuilder.create<func::CallOp>(
+        loc, "snprintf", TypeRange{fnBuilder.getIntegerType(32)},
+        ValueRange{alloca, bufSize, fmtBuf, pidVal, valVal});
+
+    // write(1, buf, strlen(buf))
+    lookupOrCreateFunc(fnBuilder, loc, "strlen", {i8PtrTy},
+                       fnBuilder.getI64Type());
+    auto len = fnBuilder
+                   .create<func::CallOp>(loc, "strlen",
+                                         TypeRange{fnBuilder.getI64Type()},
+                                         ValueRange{alloca})
+                   .getResult(0);
+
+    lookupOrCreateFunc(
+        fnBuilder, loc, "write",
+        {fnBuilder.getI32Type(), i8PtrTy, fnBuilder.getI64Type()},
+        fnBuilder.getI64Type());
+
+    auto fd = fnBuilder.create<arith::ConstantOp>(
+        loc, fnBuilder.getI32Type(),
+        fnBuilder.getI32IntegerAttr(STDOUT_FILENO));
+
+    fnBuilder.create<func::CallOp>(loc, "write",
+                                   TypeRange{fnBuilder.getI64Type()},
+                                   ValueRange{fd, alloca, len});
+    fnBuilder.create<func::ReturnOp>(loc);
+    return nameAttr;
+  }
+
+  void lookupOrCreateFunc(OpBuilder &b, Location loc, StringRef name,
+                          TypeRange inputs, TypeRange results) const {
+    auto moduleOp = b.getBlock()->getParentOp()->getParentOfType<ModuleOp>();
+    if (moduleOp.lookupSymbol<func::FuncOp>(name))
+      return;
+    RewriterBase::InsertionGuard guard(b);
+    b.setInsertionPointToStart(moduleOp.getBody());
+    auto fn = b.create<func::FuncOp>(
+        loc, name, FunctionType::get(b.getContext(), inputs, results));
+    fn.setPrivate();
+  }
+};
+
+struct TimestampOpConverter : public OpConversionPattern<triton::TimestampOp> {
+  using OpConversionPattern<triton::TimestampOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::TimestampOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+
+    lookupOrCreateFunc(rewriter, loc, "rtclock_ns", {}, rewriter.getI64Type());
+
+    auto result = rewriter
+                      .create<func::CallOp>(loc, "rtclock_ns",
+                                            TypeRange{rewriter.getI64Type()},
+                                            ValueRange{})
+                      .getResult(0);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+
+private:
+  void lookupOrCreateFunc(OpBuilder &b, Location loc, StringRef name,
+                          TypeRange inputs, TypeRange results) const {
+    auto moduleOp = b.getBlock()->getParentOp()->getParentOfType<ModuleOp>();
+    if (moduleOp.lookupSymbol<func::FuncOp>(name))
+      return;
+    RewriterBase::InsertionGuard guard(b);
+    b.setInsertionPointToStart(moduleOp.getBody());
+    auto fn = b.create<func::FuncOp>(
+        loc, name, FunctionType::get(b.getContext(), inputs, results));
+    fn.setPrivate();
   }
 };
 

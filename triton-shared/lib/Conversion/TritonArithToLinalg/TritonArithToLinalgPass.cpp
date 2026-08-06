@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "triton-shared/Conversion/TritonArithToLinalg/TritonArithToLinalg.h"
 #include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
@@ -96,7 +97,7 @@ public:
                 linalg::LinalgDialect, affine::AffineDialect, scf::SCFDialect,
                 tensor::TensorDialect, bufferization::BufferizationDialect,
                 triton::TritonDialect, ttx::TritonTilingExtDialect,
-                tts::TritonStructuredDialect>();
+                tts::TritonStructuredDialect, LLVM::LLVMDialect>();
   }
 
   void runOnOperation() override {
@@ -118,7 +119,8 @@ public:
         linalg::LinalgDialect, affine::AffineDialect, scf::SCFDialect,
         cf::ControlFlowDialect, tensor::TensorDialect,
         bufferization::BufferizationDialect, ttx::TritonTilingExtDialect,
-        tts::TritonStructuredDialect, memref::MemRefDialect>();
+        tts::TritonStructuredDialect, memref::MemRefDialect, 
+        LLVM::LLVMDialect>();
 
     target.addLegalOp<ModuleOp>();
 
@@ -185,6 +187,8 @@ public:
     if (!assertToCf) {
       target.addLegalOp<triton::AssertOp>();
     }
+
+    target.addIllegalOp<triton::PrintOp, triton::TimestampOp>();
 
     triton::populateTritonArithToLinalgConversionPatterns(
         pidsToFuncArgs, addptrToLinalg, assertToCf, patterns);

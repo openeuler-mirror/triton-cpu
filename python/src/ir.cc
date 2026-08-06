@@ -1588,6 +1588,10 @@ void init_triton_ir(py::module &&m) {
              return self.create<ElementwiseInlineAsmOp>(
                  types, inlineAsm, constraints, isPure, pack, values);
            })
+      .def("create_timestamp",
+           [](TritonOpBuilder &self) -> Value {
+             return self.create<TimestampOp>();
+           })
       .def("create_print",
            [](TritonOpBuilder &self, const std::string &prefix, bool hex,
               const std::vector<Value> &values,

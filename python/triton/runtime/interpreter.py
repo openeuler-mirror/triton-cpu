@@ -629,6 +629,10 @@ class InterpreterBuilder:
     def create_inline_asm(self, inlineAsm, constraints, values, type, isPure, pack):
         raise NotImplementedError("inline_asm not supported in interpreter mode")
 
+    def create_timestamp(self):
+        import time
+        return time.time_ns()
+
     def create_print(self, prefix, hex, values, isSigned):
         # NOTE: the `isSigned` variable is not really used here; because Signness is already known
         # by `values` themselves in python interpreter, thus not really needed here;

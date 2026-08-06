@@ -2292,6 +2292,22 @@ def static_assert(cond, msg="", _builder=None):
 
 
 @builtin
+def device_timestamp(_builder=None):
+    '''
+    Get the current timestamp (nanoseconds since epoch) from the device.
+
+    .. highlight:: python
+    .. code-block:: python
+
+        ts = tl.device_timestamp()
+        tl.device_print("timestamp", ts)
+
+    On CPU, this calls ``rtclock_ns()`` which uses ``clock_gettime()``.
+    '''
+    return semantic.device_timestamp(_builder)
+
+
+@builtin
 def device_print(prefix, *args, hex=False, _builder=None):
     '''
     Print the values at runtime from the device.  String formatting does not work for runtime values, so you should
