@@ -707,11 +707,11 @@ def flash_fwd_kernel(
     # Note, rowsum = exp(-rowmax) * exp(lse), therefore rowmax + log(rowsum) cancels
     # the effect of rowmax and outputs lse only.
     lse = tl.where(
-        rowsum_ == 0 | (rowsum_ != rowsum_),
+        (rowsum_ == 0) | (rowsum_ != rowsum_),
         float("-inf"),
         rowmax_ * scale_softmax + tl.log(rowsum_),
     )
-    inv_sum = tl.where(rowsum_ == 0 | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
+    inv_sum = tl.where((rowsum_ == 0) | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
 
     if is_dropout:
         acc_ *= inv_sum[:, None] * rp_dropout
@@ -1049,11 +1049,11 @@ def flash_fwd_splitkv_kernel(
 
     # LSE
     lse = tl.where(
-        rowsum_ == 0 | (rowsum_ != rowsum_),
+        (rowsum_ == 0) | (rowsum_ != rowsum_),
         float("-inf"),
         rowmax_ * scale_softmax + tl.log(rowsum_),
     )
-    inv_sum = tl.where(rowsum_ == 0 | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
+    inv_sum = tl.where((rowsum_ == 0) | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
 
     # Rescale output
     acc_ *= inv_sum[:, None]
@@ -1547,11 +1547,11 @@ def flash_varlen_fwd_kernel(
 
     # LSE
     lse = tl.where(
-        rowsum_ == 0 | (rowsum_ != rowsum_),
+        (rowsum_ == 0) | (rowsum_ != rowsum_),
         float("-inf"),
         rowmax_ * scale_softmax + tl.log(rowsum_),
     )
-    inv_sum = tl.where(rowsum_ == 0 | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
+    inv_sum = tl.where((rowsum_ == 0) | (rowsum_ != rowsum_), 1.0, 1.0 / rowsum_)
 
     acc_ *= inv_sum[:, None]
 
