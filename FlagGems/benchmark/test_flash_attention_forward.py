@@ -359,12 +359,13 @@ def flash_attention_forward_input_fn(config, dtype, device):
 
 
 @pytest.mark.skipif(SkipVersion("torch", "<2.4"), reason="Low Pytorch Version.")
+@pytest.mark.skipif(flag_gems.device !="cpu" and not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.flash_attention_forward
 def test_flash_attention_forward():
     bench = FlashAttentionForwardBenchmark(
         op_name="flash_attention_forward",
         input_fn=flash_attention_forward_input_fn,
-        torch_op=torch_flash_attention_forward,
+        torch_op=(gems_flash_attention_forward if flag_gems.device != "cpu" else gems_flash_attention_forward),
         dtypes=[torch.float16, torch.bfloat16],
     )
     bench.set_gems(gems_flash_attention_forward)

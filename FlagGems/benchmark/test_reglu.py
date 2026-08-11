@@ -8,23 +8,24 @@ from benchmark.performance_utils import TexGluForwardBenchmark
 # configure the Root Logger (adding handlers). This may cause subsequent `logging.basicConfig`
 # calls (used by FlagGems benchmark) to be ignored/no-op, leading to missing result log files.
 # See: https://github.com/NVIDIA/TransformerEngine/issues/1065
+GEMS_OP = getattr(flag_gems, "reglu")
 try:
     from transformer_engine.pytorch import cpp_extensions as tex
 
     TE_OP = getattr(tex, "reglu")
     TE_AVAILABLE = True
-    GEMS_OP = getattr(flag_gems, "reglu")
 except ImportError:
     TE_AVAILABLE = False
     TE_OP = None
-    GEMS_OP = None
 
 
 @pytest.mark.reglu
-@pytest.mark.skipif(not TE_AVAILABLE, reason="TransformerEngine not installed")
-@pytest.mark.skipif(TE_OP is None, reason="'reglu' not found in TransformerEngine")
+@pytest.mark.skipif(flag_gems.device !="cpu" and not TE_AVAILABLE, reason="TransformerEngine not installed")
+@pytest.mark.skipif(flag_gems.device !="cpu" and TE_OP is None, reason="'reglu' not found in TransformerEngine")
 @pytest.mark.skipif(GEMS_OP is None, reason="'reglu' not found in FlagGems")
 def test_reglu():
+    if flag_gems.device == "cpu":
+        TE_OP = GEMS_OP
     bench = TexGluForwardBenchmark(
         op_name="reglu",
         torch_op=TE_OP,
