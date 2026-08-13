@@ -809,19 +809,20 @@ struct PrintOpConverter : public OpConversionPattern<triton::PrintOp> {
     auto funcOp = op->getParentOfType<triton::FuncOp>();
     auto numArgs = funcOp.getNumArguments();
     auto launchGridRank = getMaxEnumValForProgramIDDim() + 1;
+    auto i64Type = rewriter.getI64Type();
+    auto f64Type = rewriter.getF64Type();
     Value pid;
     if (numArgs >= launchGridRank) {
       auto argTy = funcOp.getArgument(numArgs - launchGridRank).getType();
       if (isa<IntegerType>(argTy)) {
         pid = rewriter.create<arith::ExtSIOp>(
-            loc, rewriter.getI64Type(),
-            funcOp.getArgument(numArgs - launchGridRank));
+            loc, i64Type, funcOp.getArgument(numArgs - launchGridRank));
       } else {
         pid = rewriter.create<arith::ConstantOp>(
-            loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(-1));
+            loc, i64Type, rewriter.getI64IntegerAttr(-1));
       }
     } else {
-      pid = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64Type(),
+      pid = rewriter.create<arith::ConstantOp>(loc, i64Type,
                                                rewriter.getI64IntegerAttr(-1));
     }
 
@@ -845,11 +846,21 @@ struct PrintOpConverter : public OpConversionPattern<triton::PrintOp> {
       StringAttr fnAttr =
           getOrCreatePrintfLine(rewriter, loc, prefix, isFloatType);
 
-      if (!isFloatType) {
-        if (auto intTy = dyn_cast<IntegerType>(scalarType)) {
-          if (intTy.getWidth() < 64) {
-            val = rewriter.create<arith::ExtSIOp>(loc, rewriter.getI64Type(),
-                                                  val);
+      if (isFloatType) {
+        auto fltTy = dyn_cast<FloatType>(scalarType);
+        if (fltTy && fltTy.getWidth() < 64) {
+          val = rewriter.create<arith::ExtFOp>(loc, f64Type, val);
+        }
+      } else {
+        auto intTy = dyn_cast<IntegerType>(scalarType);
+        if (intTy && intTy.getWidth() < 64) {
+          // The unsigned type must be zero-extended to avoid sign extension
+          // that interprets the uint8 value as a negative number.
+          bool isSigned = op.getIsSigned()[i];
+          if (isSigned) {
+            val = rewriter.create<arith::ExtSIOp>(loc, i64Type, val);
+          } else {
+            val = rewriter.create<arith::ExtUIOp>(loc, i64Type, val);
           }
         }
       }
@@ -878,9 +889,9 @@ private:
       return nameAttr;
 
     // Build format string
-    std::string fmt = (std::string("pid: %") + PRId64 + " " + prefix + "%" +
-                       (isFloat ? "lg" : PRId64) + "\n")
-                          .str();
+    // The runtime helpers (println_i64/println_f64) emit
+    // "<pid> <prefix> <value>" themselves, so we only need the prefix string.
+    std::string msg = prefix.str();
 
     auto ctx = b.getContext();
     auto i8Ty = IntegerType::get(ctx, 8);
@@ -902,26 +913,21 @@ private:
     Value pidVal = fnArgs[0];
     Value valVal = fnArgs[1];
 
-    // alloca buffer for formatted output
-    auto bufSize = fnBuilder.create<arith::ConstantOp>(
-        loc, fnBuilder.getI64Type(), fnBuilder.getI64IntegerAttr(256));
-    auto alloca = fnBuilder.create<LLVM::AllocaOp>(loc, i8PtrTy, i8Ty, bufSize,
-                                                  /*alignment=*/ 0);
-
-    // Build format string constant on stack
-    size_t fmtLen = fmt.size();
+    // Build the prefix string constant on stack (null-terminated)
+    size_t fmtLen = msg.size();
     auto fmtBufSize = fnBuilder.create<arith::ConstantOp>(
         loc, fnBuilder.getI64Type(), fnBuilder.getI64IntegerAttr(fmtLen + 1));
     auto fmtBuf = fnBuilder.create<LLVM::AllocaOp>(loc, i8PtrTy, i8Ty,
-                                                  fmtBufSize, /*alignment=*/ 0);
+                                                   fmtBufSize, /*alignment=*/0);
 
     for (size_t i = 0; i < fmtLen; i++) {
       Value idx = fnBuilder.create<arith::ConstantOp>(
           loc, fnBuilder.getI64Type(), fnBuilder.getI64IntegerAttr(i));
-      auto gep = fnBuilder.create<LLVM::GEPOp>(
-          loc, i8PtrTy, i8Ty, fmtBuf, ArrayRef<LLVM::GEPArg>(idx), /*inbounds=*/ true);
+      auto gep = fnBuilder.create<LLVM::GEPOp>(loc, i8PtrTy, i8Ty, fmtBuf,
+                                               ArrayRef<LLVM::GEPArg>(idx),
+                                               /*inbounds=*/true);
       Value ch = fnBuilder.create<arith::ConstantOp>(
-          loc, i8Ty, fnBuilder.getI8IntegerAttr((uint8_t)fmt[i]));
+          loc, i8Ty, fnBuilder.getI8IntegerAttr((uint8_t)msg[i]));
       fnBuilder.create<LLVM::StoreOp>(loc, ch, gep);
     }
     // null terminator
@@ -929,45 +935,26 @@ private:
         loc, fnBuilder.getI64Type(), fnBuilder.getI64IntegerAttr(fmtLen));
     auto nullGep = fnBuilder.create<LLVM::GEPOp>(
         loc, i8PtrTy, i8Ty, fmtBuf, ArrayRef<LLVM::GEPArg>(nullIdx),
-        /*inbounds=*/ true);
+        /*inbounds=*/true);
     fnBuilder.create<LLVM::StoreOp>(
         loc,
         fnBuilder.create<arith::ConstantOp>(loc, i8Ty,
                                             fnBuilder.getI8IntegerAttr(0)),
         nullGep);
 
-    // snprintf(buf, 256, fmtBuf, pid, val)
+    // Call the runtime helper, which formats the whole line and writes it
+    // atomically (see CRuntime.cpp):
+    //   println_i64(i64 pid, char const *prefix, i64 val)
+    //   println_f64(i64 pid, char const *prefix, double val)
+    std::string helper = isFloat ? "println_f64" : "println_i64";
     lookupOrCreateFunc(
-        fnBuilder, loc, "snprintf",
-        {i8PtrTy, fnBuilder.getI64Type(), i8PtrTy, fnBuilder.getI64Type(),
+        fnBuilder, loc, helper,
+        {fnBuilder.getI64Type(), i8PtrTy,
          isFloat ? Type(fnBuilder.getF64Type()) : Type(fnBuilder.getI64Type())},
-        fnBuilder.getI32Type());
+        {});
 
-    fnBuilder.create<func::CallOp>(
-        loc, "snprintf", TypeRange{fnBuilder.getIntegerType(32)},
-        ValueRange{alloca, bufSize, fmtBuf, pidVal, valVal});
-
-    // write(1, buf, strlen(buf))
-    lookupOrCreateFunc(fnBuilder, loc, "strlen", {i8PtrTy},
-                       fnBuilder.getI64Type());
-    auto len = fnBuilder
-                   .create<func::CallOp>(loc, "strlen",
-                                         TypeRange{fnBuilder.getI64Type()},
-                                         ValueRange{alloca})
-                   .getResult(0);
-
-    lookupOrCreateFunc(
-        fnBuilder, loc, "write",
-        {fnBuilder.getI32Type(), i8PtrTy, fnBuilder.getI64Type()},
-        fnBuilder.getI64Type());
-
-    auto fd = fnBuilder.create<arith::ConstantOp>(
-        loc, fnBuilder.getI32Type(),
-        fnBuilder.getI32IntegerAttr(STDOUT_FILENO));
-
-    fnBuilder.create<func::CallOp>(loc, "write",
-                                   TypeRange{fnBuilder.getI64Type()},
-                                   ValueRange{fd, alloca, len});
+    fnBuilder.create<func::CallOp>(loc, helper, TypeRange{},
+                                   ValueRange{pidVal, fmtBuf, valVal});
     fnBuilder.create<func::ReturnOp>(loc);
     return nameAttr;
   }
