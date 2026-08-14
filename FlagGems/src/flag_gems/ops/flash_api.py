@@ -431,7 +431,10 @@ def mha_varlan_fwd(
 
         if return_softmax:
             assert is_dropout, "Only supported with non-zero dropout."
-            p = torch.empty(
+            # The zeros must be used for initialization to avoid the pollution
+            # of statistics by the garbage values that are not written into
+            # the upper triangular part of causal.
+            p = torch.zeros(
                 (batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded),
                 device=q_device,
             )
@@ -615,10 +618,20 @@ def mha_fwd(
     assert (
         num_heads % num_heads_k == 0
     ), "Number of heads in key/value must divide number of heads in query"
-    if window_size_left >= seqlen_k:
-        window_size_left = -1
-    if window_size_right >= seqlen_k:
-        window_size_right = -1
+    # [SWA window reset fix] Only when there is no right window 
+    # (window_size_right <= 0, i.e., causal / full left context)
+    # window_size_left >= seqlen_k indicates that there is no left constraint, and can be reset to -1.
+    # For SWA (window_size_right > 0), the window has a positional offset of seqlen_k - seqlen_q.
+    # even if window_size covers all keys, it does not mean that each query can see all keys.
+    # (For example, when S_q=1024, S_k=128, W_L=W_R=128, 
+    # the window for q=768 is only [0,0], and the window for q<768 is empty.)
+    # if it is reset to -1, it will degrade to full attention and the SWA mask will be discarded,
+    # causing the high-order query rows (which should output 0) to be incorrectly filled with non-zero values.
+    if window_size_right <= 0:
+        if window_size_left >= seqlen_k:
+            window_size_left = -1
+        if window_size_right >= seqlen_k:
+            window_size_right = -1
     if seqlen_q == 1 and alibi_slopes is None:
         is_causal = False
     if is_causal:
@@ -701,7 +714,7 @@ def mha_fwd(
 
         if return_softmax:
             assert is_dropout, "Only supported with non-zero dropout."
-            p = torch.empty(
+            p = torch.zeros(
                 (batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded),
                 device=q_device,
             )
@@ -822,7 +835,7 @@ def mha_fwd(
             return kernel
 
         if _debug:
-            p = torch.empty(
+            p = torch.zeros(
                 (batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded),
                 dtype=torch.float32,
                 device=q_device,

@@ -397,7 +397,17 @@ def flash_fwd_kernel(
 
     col_max = seqlen_k
     if is_causal or is_local:
-        col_max += (m_block - num_m_blocks + 1) * BLOCK_M
+        # The right boundary of the frame should cover at least the maximum key position
+        # required by all query rows in the block unser causal/SWA.
+        # The col_rb of the last row (m_block+1)*BLOCK_M-1 in the block is calculated as follows:
+        # col_rb = (m_block+1)*BLOCK_M-1 + seqlen_k - seqlen_q,
+        # Therefore, the right boundary col_max is calculated as follows:
+        # col_max = (m_block + 1) * BLOCK_M + seqlen_k - seqlen_q (+ window_size_right)
+        # The original shrinking block (m_block - num_m_blocks + 1)*BLOCK_M
+        # is over-shrunk when seqlen_q % BLOCK_M != 0.
+        # As a result, high-score keys near the right boundary of the window are missed,
+        # and the LSE is smaller than expected(SWA/non-integer division scenario).
+        col_max = (m_block + 1) * BLOCK_M + seqlen_k - seqlen_q
         if is_local:
             col_max += window_size_right
         col_max = min(seqlen_k, col_max)
@@ -405,6 +415,18 @@ def flash_fwd_kernel(
     if not IS_EVEN_MN:
         # round right
         col_max = tl.cdiv(col_max, BLOCK_N) * BLOCK_N
+
+    # [Fix for the scenario where S_q > S_k] 
+    # When the entire SWA window of the current block falls before the key range 
+    # (for example, S_q is much greater than S_k, and the front query block is 
+    # completely masked), col_max will be less than col_min or even a negative number. 
+    # In this case, both masking_cols and the two tl.range boundaries will become negative numbers. 
+    # The CPU backend will dynamically iterate over the negative boundaries,
+    # and read negative indexes to access out-of-bounds dirty data of the key.
+    # As a result, the entire query block that should output 0 will produce non-zero values.
+    # Here, col_max is adjusted to not be less than col_min. When col_max is less than or equal
+    # to col_min, both key loops are empty, and the entire block outputs 0.
+    col_max = tl.maximum(col_max, col_min)
 
     if (not is_causal) and (not is_local):
         if IS_EVEN_MN:
@@ -440,7 +462,9 @@ def flash_fwd_kernel(
     if IS_EVEN_MN & d == BLOCK_K:
         Q = tl.load(q_ptr + q_off, cache_modifier=".cg")
     else:
-        Q = tl.load(q_ptr + q_off, mask=qmask, cache_modifier=".cg")
+        # Do not rely on implicit default values.
+        # Otherwise, padding values may read junk data from the memory.
+        Q = tl.load(q_ptr + q_off, mask=qmask, other=0.0, cache_modifier=".cg")
 
     if return_softmax:
         p_ptr += (
@@ -495,12 +519,14 @@ def flash_fwd_kernel(
                 K = tl.load(
                     p_bk0 + off,
                     mask=kvmask[None, :] & dmask[:, None],
+                    other=0.0,
                     cache_modifier=".cg",
                 )
                 if PRE_LOAD_V:
                     V = tl.load(
                         p_bv0 + off,
                         mask=kvmask[:, None] & dmask[None, :],
+                        other=0.0,
                         cache_modifier=".cg",
                     )
             S = tl.dot(Q, K, allow_tf32=False)
@@ -598,6 +624,7 @@ def flash_fwd_kernel(
                     V = tl.load(
                         p_bv0 + off,
                         mask=kvmask[:, None] & dmask[None, :],
+                        other=0.0,
                         cache_modifier=".cg",
                     )
             acc_ = tl.dot(P, V, acc_, allow_tf32=False)
@@ -612,9 +639,9 @@ def flash_fwd_kernel(
             if PRE_LOAD_V:
                 V = tl.load(p_bv0 + off, cache_modifier=".cg")
         else:
-            K = tl.load(p_bk0 + off, mask=dmask[:, None], cache_modifier=".cg")
+            K = tl.load(p_bk0 + off, mask=dmask[:, None], other=0.0, cache_modifier=".cg")
             if PRE_LOAD_V:
-                V = tl.load(p_bv0 + off, mask=dmask[None, :], cache_modifier=".cg")
+                V = tl.load(p_bv0 + off, mask=dmask[None, :], other=0.0, cache_modifier=".cg")
 
         S = tl.dot(Q, K)
         S = apply_softcap(S, softcap, is_softcap)
@@ -700,7 +727,7 @@ def flash_fwd_kernel(
             if d == BLOCK_K:
                 V = tl.load(p_bv0 + off, cache_modifier=".cg")
             else:
-                V = tl.load(p_bv0 + off, mask=dmask[None, :], cache_modifier=".cg")
+                V = tl.load(p_bv0 + off, mask=dmask[None, :], other=0.0, cache_modifier=".cg")
         acc_ = tl.dot(P, V, acc_)
 
     # LSE
@@ -885,7 +912,7 @@ def flash_fwd_splitkv_kernel(
     if IS_EVEN_MN & BLOCK_K == d:
         Q = tl.load(p_qm, cache_modifier=".cg")
     else:
-        Q = tl.load(p_qm, mask=qmask, cache_modifier=".cg")
+        Q = tl.load(p_qm, mask=qmask, other=0.0, cache_modifier=".cg")
 
     h_hk_ratio = h // hk
     k_ptr += bid * k_batch_stride
