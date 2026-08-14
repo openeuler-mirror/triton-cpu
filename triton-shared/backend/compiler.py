@@ -1857,9 +1857,13 @@ class CPUBackend(BaseBackend):
     @timer
     def _optimize_ttsharedir(self, src: str):
         has_matmul = re.search(r"\blinalg\.(?:batch_)?matmul\b", src) is not None
+        # Track whether the SME pipeline was used for this kernel so that
+        # _llir_to_bin can pass the correct -mattr flags to llc. Passing `+sme`
+        # to llc for IR generated specifically for SVE can cause ISel failures.
         if (os.environ.get("TRITON_SHARED_FORCE_SME_PIPELINE", "0") == "1"):
             if not has_matmul:
                 warnings.warn("Running SME pipeline on payload without matmul.")
+            self._used_sme = True
             return self._sme_transform(src)
         if (os.environ.get("TRITON_SHARED_FORCE_SVE_PIPELINE", "0") == "1"):
             return self._sve_transform(src)
@@ -1867,6 +1871,7 @@ class CPUBackend(BaseBackend):
             return src
 
         if ("sme" in self.cpu_features and has_matmul):
+            self._used_sme = True
             return self._sme_transform(src)
         if ("sve" in self.cpu_features):
             return self._sve_transform(src)
@@ -2064,7 +2069,8 @@ class CPUBackend(BaseBackend):
             llc_path = _get_llvm_bin_path("llc")
             flags = ""
             if os.environ.get("TRITON_SHARED_FORCE_SME_PIPELINE", "0") == "1" \
-                or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
+                or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features
+                    and getattr(self, "_used_sme", False)):
                 flags = (
                     "-mtriple=aarch64-linux-gnu",
                     "-mattr=+sme,+dotprod,+v9a,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+sve,+sve2",
