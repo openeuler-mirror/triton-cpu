@@ -811,19 +811,23 @@ struct PrintOpConverter : public OpConversionPattern<triton::PrintOp> {
     auto launchGridRank = getMaxEnumValForProgramIDDim() + 1;
     auto i64Type = rewriter.getI64Type();
     auto f64Type = rewriter.getF64Type();
-    Value pid;
-    if (numArgs >= launchGridRank) {
-      auto argTy = funcOp.getArgument(numArgs - launchGridRank).getType();
-      if (isa<IntegerType>(argTy)) {
-        pid = rewriter.create<arith::ExtSIOp>(
-            loc, i64Type, funcOp.getArgument(numArgs - launchGridRank));
-      } else {
-        pid = rewriter.create<arith::ConstantOp>(
-            loc, i64Type, rewriter.getI64IntegerAttr(-1));
+
+    // Collect the PIDs (pid0, pid1, pid2) of the three dimensions of the grid.
+    // The last launchGridRank parameters of the kernel function
+    // are program_id(0..launchGridRank-1). The launcher sends the PID 0 to a 
+    // non-existent dimension (grid size = 1).
+    SmallVector<Value> pids;
+    for (int d = 0; d < 3; d++) {
+      Value pid = rewriter.create<arith::ConstantOp>(
+          loc, i64Type, rewriter.getI64IntegerAttr(-1));
+      if (d < launchGridRank && numArgs >= launchGridRank) {
+        auto argTy = funcOp.getArgument(numArgs - launchGridRank + d).getType();
+        if (isa<IntegerType>(argTy)) {
+          pid = rewriter.create<arith::ExtSIOp>(
+              loc, i64Type, funcOp.getArgument(numArgs - launchGridRank + d));
+        }
       }
-    } else {
-      pid = rewriter.create<arith::ConstantOp>(loc, i64Type,
-                                               rewriter.getI64IntegerAttr(-1));
+      pids.push_back(pid);
     }
 
     for (size_t i = 0; i < op.getNumOperands(); i++) {
@@ -865,7 +869,7 @@ struct PrintOpConverter : public OpConversionPattern<triton::PrintOp> {
         }
       }
       rewriter.create<func::CallOp>(loc, fnAttr.getValue(), TypeRange{},
-                                    ValueRange{pid, val});
+                                    ValueRange{pids[0], pids[1], pids[2], val});
     }
 
     rewriter.eraseOp(op);
@@ -898,9 +902,11 @@ private:
     auto i8PtrTy = LLVM::LLVMPointerType::get(ctx);
 
     // Create helper function at module level
+    // The three PIDs are passed by the main function.
     auto funcType = FunctionType::get(
         ctx,
-        {b.getI64Type(), isFloat ? Type(b.getF64Type()) : Type(b.getI64Type())},
+        {b.getI64Type(), b.getI64Type(), b.getI64Type(),
+         isFloat ? Type(b.getF64Type()) : Type(b.getI64Type())},
         {});
     OpBuilder modBuilder(moduleOp.getBody(), moduleOp.getBody()->end());
     auto fn = modBuilder.create<func::FuncOp>(loc, nameAttr, funcType);
@@ -910,8 +916,10 @@ private:
     OpBuilder fnBuilder(entryBlock, entryBlock->begin());
 
     auto fnArgs = entryBlock->getArguments();
-    Value pidVal = fnArgs[0];
-    Value valVal = fnArgs[1];
+    Value pid0 = fnArgs[0];
+    Value pid1 = fnArgs[1];
+    Value pid2 = fnArgs[2];
+    Value valVal = fnArgs[3];
 
     // Build the prefix string constant on stack (null-terminated)
     size_t fmtLen = msg.size();
@@ -943,18 +951,19 @@ private:
         nullGep);
 
     // Call the runtime helper, which formats the whole line and writes it
-    // atomically (see CRuntime.cpp):
-    //   println_i64(i64 pid, char const *prefix, i64 val)
-    //   println_f64(i64 pid, char const *prefix, double val)
+    // atomically (see CRRunnerUtils.cpp):
+    //   println_i64(i64 pid0, i64 pid1, i64 pid2, char const *prefix, i64 val)
+    //   println_f64(i64 pid0, i64 pid1, i64 pid2, char const *prefix, double val)
     std::string helper = isFloat ? "println_f64" : "println_i64";
     lookupOrCreateFunc(
         fnBuilder, loc, helper,
-        {fnBuilder.getI64Type(), i8PtrTy,
+        {fnBuilder.getI64Type(), fnBuilder.getI64Type(), fnBuilder.getI64Type(),
+         i8PtrTy,
          isFloat ? Type(fnBuilder.getF64Type()) : Type(fnBuilder.getI64Type())},
         {});
 
     fnBuilder.create<func::CallOp>(loc, helper, TypeRange{},
-                                   ValueRange{pidVal, fmtBuf, valVal});
+                                   ValueRange{pid0, pid1, pid2, fmtBuf, valVal});
     fnBuilder.create<func::ReturnOp>(loc);
     return nameAttr;
   }

@@ -82,7 +82,7 @@ def _extract_number(out: str, marker: str):
     Locate the first numeric string after marker in the print output.
     Returns None if the marker is not found.
     """
-    idx = out.find(marker)
+    idx = out.splitlines()[0].rfind(marker)
     if idx == -1:
         return None
     tail = out[idx + len(marker):]

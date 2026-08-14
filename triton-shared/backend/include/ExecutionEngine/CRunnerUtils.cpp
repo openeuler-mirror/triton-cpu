@@ -62,25 +62,35 @@ extern "C" void printComma() { fputs(", ", stdout); }
 extern "C" void printNewline() { fputc('\n', stdout); }
 
 // Thread-safe line printing: format entire line and write atomically.
+// pid0, pid1, and pid2 correspond to the program numbers of each dimension
+// in the grid. Dimensions that do not exist are passed as 0 by the launcher.
 #ifndef _WIN32
-extern "C" void println_i64(int64_t pid, char const *prefix, int64_t val) {
+extern "C" void println_i64(int64_t pid0, int64_t pid1, int64_t pid2,
+                            char const *prefix, int64_t val) {
   char buf[256];
-  int n = snprintf(buf, sizeof(buf), "%" PRId64 " %s %" PRId64 "\n", pid, prefix, val);
+  const char *fmt = "(%" PRId64 ", %" PRId64 ", %" PRId64 ") %s %" PRId64 "\n";
+  int n = snprintf(buf, sizeof(buf), fmt, pid0, pid1, pid2, prefix, val);
   if (n > 0)
     write(STDOUT_FILENO, buf, (size_t)(n < (int)sizeof(buf) ? n : sizeof(buf)));
 }
-extern "C" void println_f64(int64_t pid, char const *prefix, double val) {
+extern "C" void println_f64(int64_t pid0, int64_t pid1, int64_t pid2,
+                            char const *prefix, double val) {
   char buf[256];
-  int n = snprintf(buf, sizeof(buf), "%" PRId64 " %s %lg\n", pid, prefix, val);
+  const char *fmt = "(%" PRId64 ", %" PRId64 ", %" PRId64 ") %s %lg\n";
+  int n = snprintf(buf, sizeof(buf), fmt, pid0, pid1, pid2, prefix, val);
   if (n > 0)
     write(STDOUT_FILENO, buf, (size_t)(n < (int)sizeof(buf) ? n : sizeof(buf)));
 }
 #else
-extern "C" void println_i64(int64_t pid, char const *prefix, int64_t val) {
-  fprintf(stdout, "%" PRId64 " %s %" PRId64 "\n", pid, prefix, val);
+extern "C" void println_i64(int64_t pid0, int64_t pid1, int64_t pid2,
+                            char const *prefix, int64_t val) {
+  fprintf(stdout, "(%" PRId64 ", %" PRId64 ", %" PRId64 ") %s %" PRId64 "\n",
+          pid0, pid1, pid2, prefix, val);
 }
-extern "C" void println_f64(int64_t pid, char const *prefix, double val) {
-  fprintf(stdout, "%" PRId64 " %s %lg\n", pid, prefix, val);
+extern "C" void println_f64(int64_t pid0, int64_t pid1, int64_t pid2,
+                            char const *prefix, double val) {
+  fprintf(stdout, "(%" PRId64 ", %" PRId64 ", %" PRId64 ") %s %lg\n", pid0,
+          pid1, pid2, prefix, val);
 }
 #endif
 
