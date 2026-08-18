@@ -9,10 +9,22 @@ from benchmark.performance_utils import GenericBenchmark
 
 
 class RopeBenchmark(GenericBenchmark):
+    DEFAULT_METRICS = GenericBenchmark.DEFAULT_METRICS[:] + ["gbps"]
+
     def set_more_shapes(self):
         # self.shapes is a list of tuples, each containing three elements:
         # (batch, num_heads, seq_len, head_size).
         return []
+
+    def get_gbps(self, args, latency):
+        query, key, cosine, sine = args[:4]
+        logical_bytes = (
+            2 * query.numel() * query.element_size()
+            + 2 * key.numel() * key.element_size()
+            + cosine.numel() * cosine.element_size()
+            + sine.numel() * sine.element_size()
+        )
+        return logical_bytes / latency / 1e6
 
 
 def get_rope_cos_sin(max_seq_len, dim, dtype, base=10000, device=flag_gems.device):

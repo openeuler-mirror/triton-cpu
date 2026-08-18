@@ -234,6 +234,8 @@ def cpu_get_scheduler_metadata(
 
 
 class GetSchedulerMetadataBenchmark(GenericBenchmark):
+    DEFAULT_METRICS = GenericBenchmark.DEFAULT_METRICS[:] + ["gbps"]
+
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
             (8, 8, 1024, 16, 4, 128, 128),
@@ -245,6 +247,14 @@ class GetSchedulerMetadataBenchmark(GenericBenchmark):
 
     def set_more_shapes(self):
         return None
+
+    def get_gbps(self, args, latency):
+        cache_sequence_lengths = args[6]
+        logical_bytes = (
+            cache_sequence_lengths.numel()
+            * cache_sequence_lengths.element_size()
+        )
+        return logical_bytes / latency / 1e6
 
 
 @pytest.mark.get_scheduler_metadata

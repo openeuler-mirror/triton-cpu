@@ -10,10 +10,32 @@ from .performance_utils import GenericBenchmark, vendor_name
 
 
 class FlashMLABenchmark(GenericBenchmark):
+    DEFAULT_METRICS = GenericBenchmark.DEFAULT_METRICS[:] + ["tflops"]
+
     def set_more_shapes(self):
         # self.shapes is a list of tuples, each containing three elements:
         # (batch, num_heads, seq_len, head_size).
         return None
+
+    def get_tflops(self, op, *args, **kwargs):
+        max_seqlen_pad = args[3]
+        batch_size = args[5]
+        query_length = args[6]
+        query_heads = args[8]
+        query_key_dim = args[10]
+        value_dim = args[11]
+        base_sequence_length = max_seqlen_pad - 256
+        sequence_sum = (
+            batch_size * base_sequence_length
+            + batch_size * (batch_size - 1)
+        )
+        return (
+            2
+            * query_length
+            * query_heads
+            * sequence_sum
+            * (query_key_dim + value_dim)
+        )
 
 
 @pytest.mark.skipif(vendor_name == "hygon", reason="RuntimeError")

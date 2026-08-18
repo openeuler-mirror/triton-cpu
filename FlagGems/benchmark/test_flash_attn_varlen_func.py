@@ -16,6 +16,45 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
     benchmark for flash_attn_varlen_func
     """
 
+    DEFAULT_METRICS = base.Benchmark.DEFAULT_METRICS[:] + ["tflops"]
+
+    @staticmethod
+    def _attention_pair_count(query_length, key_length, causal, left, right):
+        alignment = (
+            key_length - query_length
+            if causal or (left >= 0 and right >= 0)
+            else 0
+        )
+        pairs = 0
+        for query_index in range(query_length):
+            center = query_index + alignment
+            start = 0 if left < 0 else max(0, center - left)
+            end = min(key_length, center + 1) if causal else key_length
+            if right >= 0:
+                end = min(end, center + right + 1)
+            pairs += max(0, end - start)
+        return pairs
+
+    def get_tflops(self, op, *args, **kwargs):
+        query = args[0]
+        cumulative_query_lengths = args[4].tolist()
+        used_key_lengths = args[7].tolist()
+        causal = args[11]
+        window_size = args[12]
+        left, right = (-1, -1) if window_size is None else window_size
+        pairs = sum(
+            self._attention_pair_count(
+                cumulative_query_lengths[index + 1]
+                - cumulative_query_lengths[index],
+                used_key_lengths[index],
+                causal,
+                left,
+                right,
+            )
+            for index in range(len(used_key_lengths))
+        )
+        return 4 * query.shape[1] * query.shape[2] * pairs
+
     def set_shapes(self, shape_file_path: Optional[List[Any]] = None):
         # Collecting from qwen/Qwen3-1.7B
         # --random-input 512 --random-output 2048 --num-prompts 200 --request-rate inf

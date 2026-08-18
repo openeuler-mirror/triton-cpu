@@ -1,7 +1,7 @@
 import pytest
 
 import flag_gems
-from benchmark.attri_util import FLOAT_DTYPES
+from benchmark.attri_util import DEFAULT_METRICS, FLOAT_DTYPES
 from benchmark.performance_utils import TexGluBackwardBenchmark
 
 # Note: Importing transformer_engine (especially in some versions like py 3.10) may automatically
@@ -19,6 +19,18 @@ except ImportError:
     TE_OP = None
 
 
+class DregluBenchmark(TexGluBackwardBenchmark):
+    DEFAULT_METRICS = DEFAULT_METRICS[:] + ["gbps"]
+
+    def get_gbps(self, args, latency):
+        gradient, inp = args[:2]
+        logical_bytes = (
+            gradient.numel() * gradient.element_size()
+            + 2 * inp.numel() * inp.element_size()
+        )
+        return logical_bytes / latency / 1e6
+
+
 @pytest.mark.dreglu
 @pytest.mark.skipif(flag_gems.device !="cpu" and not TE_AVAILABLE, reason="TransformerEngine not installed")
 @pytest.mark.skipif(flag_gems.device !="cpu" and TE_OP is None, reason="'dreglu' not found in TransformerEngine")
@@ -26,7 +38,7 @@ except ImportError:
 def test_dreglu():
     if flag_gems.device == "cpu":
         TE_OP = GEMS_OP
-    bench = TexGluBackwardBenchmark(
+    bench = DregluBenchmark(
         op_name="dreglu",
         torch_op=TE_OP,
         gems_op=GEMS_OP,

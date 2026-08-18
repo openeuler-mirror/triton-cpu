@@ -11,6 +11,8 @@ vendor_name = flag_gems.vendor_name
 
 
 class RepetitionPenaltyBenchmark(base.Benchmark):
+    DEFAULT_METRICS = base.Benchmark.DEFAULT_METRICS[:] + ["gbps"]
+
     def __init__(self, op_name, torch_op, dtypes):
         super().__init__(op_name, torch_op, dtypes)
         self.gems_op = None
@@ -41,6 +43,16 @@ class RepetitionPenaltyBenchmark(base.Benchmark):
 
     def set_gems(self, gems_op):
         self.gems_op = gems_op
+
+    def get_gbps(self, args, latency):
+        logits, prompt_mask, output_mask, penalties = args
+        logical_bytes = (
+            2 * logits.numel() * logits.element_size()
+            + prompt_mask.numel() * prompt_mask.element_size()
+            + output_mask.numel() * output_mask.element_size()
+            + penalties.numel() * penalties.element_size()
+        )
+        return logical_bytes / latency / 1e6
 
 
 UNSUPPORTED_VENDORS = {

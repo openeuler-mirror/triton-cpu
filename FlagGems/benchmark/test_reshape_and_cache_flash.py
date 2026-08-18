@@ -35,8 +35,21 @@ class ReshapeAndCacheFlashBenchmark(GenericBenchmark):
     benchmark for reshape_and_cache_flash
     """
 
+    DEFAULT_METRICS = GenericBenchmark.DEFAULT_METRICS[:] + ["gbps"]
+
     def set_more_shapes(self):
         return None
+
+    def get_gbps(self, args, latency):
+        key, value, key_cache, value_cache, slot_mapping = args[:5]
+        logical_bytes = (
+            key.numel() * key.element_size()
+            + value.numel() * value.element_size()
+            + key.numel() * key_cache.element_size()
+            + value.numel() * value_cache.element_size()
+            + slot_mapping.numel() * slot_mapping.element_size()
+        )
+        return logical_bytes / latency / 1e6
 
 
 @pytest.mark.reshape_and_cache_flash

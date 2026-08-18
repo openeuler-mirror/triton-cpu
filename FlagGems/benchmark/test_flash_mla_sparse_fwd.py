@@ -42,6 +42,8 @@ _flashmla_sparse_counter = 0
 
 
 class FlashmlaSparseBenchmark(base.Benchmark):
+    DEFAULT_METRICS = base.Benchmark.DEFAULT_METRICS[:] + ["tflops"]
+
     def __init__(self):
         super().__init__(
             "flash_mla_sparse_fwd", vllm_flash_mla_sparse_fwd, [torch.bfloat16]
@@ -55,6 +57,25 @@ class FlashmlaSparseBenchmark(base.Benchmark):
         _ = dtype
         for param in FlashmlaSparseBenchmark.get_performance_test_params_flashmla():
             yield from FlashmlaSparseBenchmark.make_input_flashmla(param)
+
+    def get_tflops(self, op, *args, **kwargs):
+        query, _, indices = args[:3]
+        value_dim = args[4]
+        batch = 1 if query.ndim == 3 else query.shape[0]
+        query_length, query_heads, query_dim = query.shape[-3:]
+        key_value_heads, topk = indices.shape[-2:]
+        if key_value_heads == 0 or query_heads % key_value_heads:
+            raise ValueError(
+                "query heads must be divisible by key/value heads"
+            )
+        return (
+            2
+            * batch
+            * query_length
+            * query_heads
+            * topk
+            * (query_dim + value_dim)
+        )
 
     @staticmethod
     def _init_seed(seed):

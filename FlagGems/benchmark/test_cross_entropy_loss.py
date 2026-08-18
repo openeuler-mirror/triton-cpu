@@ -22,9 +22,31 @@ def cross_entropy_loss_input_fn(shape, cur_dtype, device):
         }
 
 
+class CrossEntropyLossBenchmark(utils.GenericBenchmark2DOnly):
+    DEFAULT_METRICS = utils.Benchmark.DEFAULT_METRICS[:] + ["gbps"]
+
+    def unpack_to_args_kwargs(self, input_tuple):
+        args, kwargs = super().unpack_to_args_kwargs(input_tuple)
+        self.metric_kwargs = kwargs
+        return args, kwargs
+
+    def get_gbps(self, args, latency):
+        logits, target = args[:2]
+        weight = self.metric_kwargs.get("weight")
+        reduction = self.metric_kwargs.get("reduction", "mean")
+        output_elements = target.numel() if reduction == "none" else 1
+        logical_bytes = (
+            logits.numel() * logits.element_size()
+            + target.numel() * target.element_size()
+            + (0 if weight is None else weight.numel() * weight.element_size())
+            + output_elements * logits.element_size()
+        )
+        return logical_bytes / latency / 1e6
+
+
 @pytest.mark.cross_entropy_loss
 def test_cross_entropy_loss():
-    bench = utils.GenericBenchmark2DOnly(
+    bench = CrossEntropyLossBenchmark(
         input_fn=cross_entropy_loss_input_fn,
         op_name="cross_entropy_loss",
         torch_op=torch.nn.functional.cross_entropy,

@@ -8,8 +8,20 @@ from . import performance_utils as utils
 
 
 class RWKVBenchmark(utils.GenericBenchmark):
+    DEFAULT_METRICS = utils.Benchmark.DEFAULT_METRICS[:] + ["gbps"]
+
     def set_more_shapes(self):
         return None
+
+    def get_gbps(self, args, latency):
+        key, key_key, attention, key_attention = args[:4]
+        logical_bytes = (
+            4 * key.numel() * key.element_size()
+            + key_key.numel() * key_key.element_size()
+            + attention.numel() * attention.element_size()
+            + key_attention.numel() * key_attention.element_size()
+        )
+        return logical_bytes / latency / 1e6
 
 
 def rwkv_ka_fusion_input_fn(shape, dtype, device):
