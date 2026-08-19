@@ -53,13 +53,15 @@ UNSUPPORTED_VENDORS = {
 }
 
 
-@pytest.mark.skipif(utils.SkipVersion("vllm", "<0.4"), reason="vLLM <0.4 not supported")
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(flag_gems.device != "cpu" and utils.SkipVersion("vllm", "<0.4"), reason="vLLM <0.4 not supported")
+@pytest.mark.skipif(flag_gems.device != "cpu" and not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(vendor_name in UNSUPPORTED_VENDORS, reason="Vendor not supported")
 @pytest.mark.apply_repetition_penalties
 def test_apply_repetition_penalties():
-    vllm_ops = pytest.importorskip("vllm._custom_ops")
-
+    if flag_gems.device == "cpu":
+        vllm_ops = flag_gems
+    else:
+        vllm_ops = pytest.importorskip("vllm._custom_ops")
     bench = RepetitionPenaltyBenchmark(
         op_name="apply_repetition_penalties",
         torch_op=vllm_ops.apply_repetition_penalties,
