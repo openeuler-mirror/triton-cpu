@@ -126,8 +126,24 @@ int64_t N = (int64_t)gridX * gridY * gridZ;
 
 #ifdef _OPENMP
 int max_threads = (num_threads > 0) ? num_threads : omp_get_max_threads();
+// Entering an OpenMP parallel region costs ~9us on a 32-thread pool regardless
+// of trip count, which dominates small-grid kernels.  Run the single-program
+// case inline and never spawn more threads than there is work for.
+if (N > 1) {{
+  int nthreads = (int64_t)max_threads < N ? max_threads : (int)N;
+#pragma omp parallel for schedule(static) num_threads(nthreads)
+  for (int64_t i = 0; i < N; ++i) {{
+    int x = i % gridX;
+    int y = (i / gridX) % gridY;
+    int z = i / (gridX * gridY);
 
-#pragma omp parallel for schedule(static) num_threads(max_threads)
+    {' '.join(f'StridedMemRefType<char, 0> ptr_arg{i} = {{static_cast<char *>(arg{i}), static_cast<char *>(arg{i}), 0}};' for i, ty in signature.items() if i not in constants and ty[0] == "*")}
+
+    {kernel_name}({kernel_parameters}
+                  gridX, gridY, gridZ, x, y, z);
+  }}
+  return;
+}}
 #endif
 for (int64_t i = 0; i < N; ++i) {{
   int x = i % gridX;
