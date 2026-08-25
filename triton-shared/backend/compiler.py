@@ -319,7 +319,7 @@ class CPUBackend(BaseBackend):
                     "linalg-generalize-named-ops",
                 )
                 with InsertionPoint(transform.ApplyPatternsOp(generalized).patterns):
-                    structured.apply_patterns_linalg_fold_unit_extent_dims_via_reshapes()
+                    structured.apply_patterns_linalg_fold_unit_extent_dims_via_slices()
 
                 cse = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
@@ -685,7 +685,6 @@ class CPUBackend(BaseBackend):
                     sequence.bodyTarget,
                     bufferize_function_boundaries=True,
                     allow_return_allocs_from_loops=True,
-                    copy_before_write=True,
                     memcpy_op="linalg.copy")
 
                 dealloc = transform.ApplyRegisteredPassOp(
