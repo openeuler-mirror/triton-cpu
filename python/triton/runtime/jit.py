@@ -275,6 +275,11 @@ class KernelParam:
         return self._param.default != inspect.Parameter.empty
 
 
+# Sentinel marking a parameter slot that has not been supplied yet.  Private, so
+# it can never collide with a user-supplied value.
+_NO_DEFAULT = object()
+
+
 def compute_spec_key(v, align):
 
     if align and hasattr(v, "data_ptr") and (v.data_ptr() % 16 == 0):
@@ -560,6 +565,12 @@ class JITFunction(KernelInterface[T]):
             i for (i, p) in enumerate(self.params) if (not p.do_not_specialize) and (not p.is_constexpr)
         ]
         self._param_names = [p.name for p in self.params]
+        # Lookup tables used by _normalize_args to merge keyword arguments into
+        # a positional tuple without going through the (expensive) binder.
+        self._n_params = len(self.params)
+        self._param_index = {p.name: i for (i, p) in enumerate(self.params)}
+        self._param_defaults = tuple(
+            p.default if p.has_default else _NO_DEFAULT for p in self.params)
         # Single-entry fast cache: skip binder when arg types haven't changed
         self._fast_args_fp = None   # fingerprint of last args
         self._fast_key = None       # last computed cache key
@@ -571,6 +582,58 @@ class JITFunction(KernelInterface[T]):
         self._cached_device = driver.active.get_current_device()
         self._cached_target = driver.active.get_current_target()
         self._cached_backend = make_backend(self._cached_target)
+
+    def _normalize_args(self, args, kwargs):
+        """Merge positional args, keyword args and defaults into one tuple.
+
+        Returns ``(full_args, opt_kwargs)`` where ``full_args`` has exactly one
+        entry per kernel parameter, in parameter order, and ``opt_kwargs`` holds
+        the keyword arguments that are *not* kernel parameters (backend options
+        such as ``debug``, ``num_warps``, ``num_stages``).
+
+        Returns ``(None, None)`` when the call cannot be normalized cheaply --
+        too many positional args, a parameter supplied twice, or a required
+        parameter missing.  Those cases fall back to the binder, which produces
+        the proper error message.
+
+        This exists so that the dispatch fast path is available to callers that
+        pass arguments by keyword.  Without it the fast path is gated on
+        ``len(args) == len(self.params)``, so a single keyword argument forces
+        every launch through the binder plus cache-key-string construction --
+        tens of microseconds per launch, which dominates short CPU kernels.
+        """
+        n = self._n_params
+        n_args = len(args)
+        if n_args > n:
+            return None, None
+
+        full = list(args) + [_NO_DEFAULT] * (n - n_args)
+        param_index = self._param_index
+        opt_kwargs = {}
+        filled = n_args
+        for name, value in kwargs.items():
+            idx = param_index.get(name)
+            if idx is None:
+                opt_kwargs[name] = value
+            elif idx < n_args:
+                # Supplied both positionally and by keyword; let the binder
+                # raise the same TypeError python would.
+                return None, None
+            else:
+                if full[idx] is _NO_DEFAULT:
+                    filled += 1
+                full[idx] = value
+
+        if filled != n:
+            defaults = self._param_defaults
+            for i in range(n_args, n):
+                if full[i] is _NO_DEFAULT:
+                    default = defaults[i]
+                    if default is _NO_DEFAULT:
+                        return None, None  # missing required parameter
+                    full[i] = default
+
+        return tuple(full), opt_kwargs
 
     def run(self, *args, grid, warmup, **kwargs):
         # parse options
@@ -595,28 +658,46 @@ class JITFunction(KernelInterface[T]):
         # Fast path: compute a cheap fingerprint (dtype + alignment for tensors,
         # value identity for scalars) and skip the expensive binder call when
         # arg types haven't changed since the last invocation.
-        _fp = tuple(
-            (a.dtype, a.data_ptr() & 15 == 0) if hasattr(a, 'dtype') else (type(a), a)
-            for a in args
-        ) + tuple(sorted(kwargs.items()))
+        #
+        # Arguments are first normalized into a full positional tuple, so the
+        # fast path works regardless of how the caller split them between
+        # positional and keyword form.  The fingerprint captures exactly what
+        # the binder specializes on -- tensor dtype and 16-byte alignment,
+        # scalar type and value -- so a match implies the same cache key.
+        # When every parameter already arrived positionally there is nothing to
+        # merge, so skip _normalize_args entirely: building the intermediate
+        # list and tuple costs a few microseconds, which is a measurable
+        # regression for callers that were already passing arguments the fast
+        # way.  Anything left in kwargs is then a backend option (debug,
+        # num_warps, ...); a keyword naming a parameter would be a duplicate,
+        # which the binder rejects on the first call, before anything is cached.
+        if len(args) == self._n_params:
+            full_args, opt_kwargs = args, kwargs
+        else:
+            full_args, opt_kwargs = self._normalize_args(args, kwargs)
 
-        # The fast-path index trick only works when all params are passed positionally
-        # (len(args) == len(self.params)).  When the autotuner passes constexpr configs
-        # as kwargs, args is shorter and args[i] for a constexpr-skipping index would
-        # be out of range.
-        _all_positional = len(args) == len(self.params)
+        if full_args is None:
+            _fp = None
+        else:
+            _fp = tuple(
+                (a.dtype, a.data_ptr() & 15 == 0) if hasattr(a, 'dtype') else (type(a), a)
+                for a in full_args
+            ) + tuple(
+                (k, (v.dtype, v.data_ptr() & 15 == 0) if hasattr(v, 'dtype') else v)
+                for k, v in sorted(opt_kwargs.items())
+            )
 
-        if _fp == self._fast_args_fp and _all_positional:
+        if _fp is not None and _fp == self._fast_args_fp:
             kernel = self._fast_kernel
             # Always extract fresh values from current args (pointers change each call)
-            non_constexpr_vals = tuple(args[i] for i in self.non_constexpr_indices)
+            non_constexpr_vals = tuple(full_args[i] for i in self.non_constexpr_indices)
             bound_args = None  # reconstructed lazily below if grid is callable
         else:
             bound_args, sig_and_spec, constexpr_vals, non_constexpr_vals, excess_kwargs = self.binder(*args, **kwargs)
             # compute cache key
             key = ''.join(sig_and_spec) + str((constexpr_vals, excess_kwargs))
             kernel = self.cache[device].get(key, None)
-            if kernel is not None and _all_positional:
+            if kernel is not None and _fp is not None:
                 self._fast_args_fp = _fp
                 self._fast_kernel = kernel
 
@@ -680,9 +761,11 @@ class JITFunction(KernelInterface[T]):
                 # TODO(jlebar): In the new launch API, pass the compiler flags as a
                 # second parameter to `grid`.
                 if bound_args is None:
-                    # Fast path: reconstruct bound_args cheaply from param names
-                    bound_args = dict(zip(self._param_names, args))
-                    bound_args.update(kwargs)
+                    # Fast path: reconstruct bound_args cheaply from param names.
+                    # full_args is already normalized, so this is correct even
+                    # when the caller used keyword arguments.
+                    bound_args = dict(zip(self._param_names, full_args))
+                    bound_args.update(opt_kwargs)
                 grid = grid(bound_args)
             grid_size = len(grid)
             grid_0 = grid[0]
