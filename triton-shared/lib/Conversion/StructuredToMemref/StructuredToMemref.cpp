@@ -51,6 +51,83 @@ static const std::string WRAP_STACKED = "wrap_stacked";
 static const std::string WRAP_1D = "wrap_1d";
 static const std::string ORIGINAL_ORDER_ATTR = "tts.original_order";
 
+// Return true if `v` is the constant `value` (an arith.constant index/int).
+static bool isConstValue(Value v, int64_t value) {
+  if (auto cst = v.getDefiningOp<arith::ConstantOp>()) {
+    if (auto attr = dyn_cast<IntegerAttr>(cst.getValue()))
+      return attr.getInt() == value;
+  }
+  return false;
+}
+
+// Recursively test whether the mask-dim value chain computes
+//   min(tileSize, clamp(shape - offset, 0, tileSize))
+// which equals `tileSize` for every in-bounds tile when
+// shape % tileSize == 0. The chain is built by MaskAnalysis as
+//   minsi(subi(maxsi(minsi(addi(offset, tileSize), shape), offset), offset),
+//         tileSize)
+// We only need to confirm that `tileSize` appears as an upper-bound clamp at
+// the outermost min; the inner clamp structure is produced by the same
+// analysis and is bounded by [0, tileSize] by construction.
+static bool maskDimIsFullTile(Value v, int64_t tileSize, unsigned depth = 0) {
+  if (depth > 8)
+    return false;
+  if (isConstValue(v, tileSize))
+    return true;
+  if (auto minOp = v.getDefiningOp<arith::MinSIOp>()) {
+    // min(tileSize, X) or min(X, tileSize): full iff the constant bound is the
+    // tile size (X is the remaining-elements expression, >= tileSize for full
+    // tiles).
+    if (isConstValue(minOp.getLhs(), tileSize) ||
+        isConstValue(minOp.getRhs(), tileSize))
+      return true;
+    // Otherwise recurse: the tile-size clamp may be nested deeper.
+    return maskDimIsFullTile(minOp.getLhs(), tileSize, depth + 1) ||
+           maskDimIsFullTile(minOp.getRhs(), tileSize, depth + 1);
+  }
+  if (auto maxOp = v.getDefiningOp<arith::MaxSIOp>())
+    return maskDimIsFullTile(maxOp.getLhs(), tileSize, depth + 1) ||
+           maskDimIsFullTile(maxOp.getRhs(), tileSize, depth + 1);
+  if (auto subOp = v.getDefiningOp<arith::SubIOp>())
+    return maskDimIsFullTile(subOp.getLhs(), tileSize, depth + 1);
+  if (auto addOp = v.getDefiningOp<arith::AddIOp>())
+    return maskDimIsFullTile(addOp.getLhs(), tileSize, depth + 1) ||
+           maskDimIsFullTile(addOp.getRhs(), tileSize, depth + 1);
+  return false;
+}
+
+// Return true if the masked access has the standard boundary-check mask form
+// for a block pointer, i.e. every mask dimension is clamped by the tile size:
+//   dim_i = min(tileSize_i, remaining_i)   (remaining_i = shape_i - offset_i)
+// For such accesses the tile is full iff dim_i == tileSize_i, which holds for
+// every in-bounds tile when shape_i is a multiple of tileSize_i. We cannot
+// prove divisibility statically (shape is dynamic), so callers emit a runtime
+// guard `dim_i == tileSize_i` and take a direct full-tile path when it holds.
+static bool hasBoundaryMaskForm(tts::MakeTensorPtrOp makeTensorPtr,
+                                ArrayRef<OpFoldResult> mixedDims) {
+  auto mixedSizes = makeTensorPtr.getMixedSizes();
+  size_t rank = mixedDims.size();
+  if (mixedSizes.size() != rank)
+    return false;
+
+  for (size_t i = 0; i < rank; ++i) {
+    auto sizeAttr = getIntAttr(mixedSizes[i]);
+    if (!sizeAttr || sizeAttr.value() <= 0)
+      return false;
+    int64_t tileSize = sizeAttr.value();
+
+    bool dimIsFull = false;
+    if (auto dimAttr = getIntAttr(mixedDims[i])) {
+      dimIsFull = (dimAttr.value() == tileSize);
+    } else if (auto v = dyn_cast<Value>(mixedDims[i])) {
+      dimIsFull = maskDimIsFullTile(v, tileSize);
+    }
+    if (!dimIsFull)
+      return false;
+  }
+  return true;
+}
+
 static memref::SubViewOp getSubview(int rank, ArrayRef<OpFoldResult> dims,
                                     Value source, Location loc, OpBuilder &b) {
   auto sourceType = cast<MemRefType>(source.getType());
@@ -1244,6 +1321,90 @@ private:
                                                  transposePermutation);
     }
 
+    auto ptrDefiningOp = ptr.getDefiningOp();
+
+    // Fast path: for a standard boundary-check mask on a block pointer, emit a
+    // runtime guard `dim == tileSize`. When it holds (every in-bounds tile of a
+    // divisible shape), copy the whole tile in one memref.copy, skipping the
+    // fill + partial subview. Otherwise fall back to the general masked path.
+    // The guard is a runtime check, so this is sound for partial tiles.
+    //
+    // NOTE: `ptr` (the adaptor value) is the *converted* memref, so its
+    // defining op is a reinterpret_cast, not the tts.make_tptr. Analyze the
+    // *original* pointer (op.getPtr()) to recover the block pointer metadata.
+    auto makeTensorPtr =
+        dyn_cast_or_null<tts::MakeTensorPtrOp>(op.getPtr().getDefiningOp());
+    // NOTE: the 1-D pointwise block pointer has an empty `order` (rank-1), so
+    // isBlockPtr() is false for it. hasBoundaryMaskForm already verifies the
+    // tile-size-clamped mask structure, so don't gate on isBlockPtr().
+    bool useGuardedFullPath =
+        makeTensorPtr &&
+        !ptrDefiningOp->hasAttr(WRAP_SIDE_BY_SIDE) &&
+        !ptrDefiningOp->hasAttr(WRAP_STACKED) &&
+        !ptrDefiningOp->hasAttr(WRAP_1D) &&
+        hasBoundaryMaskForm(makeTensorPtr, mixedDims);
+
+    if (useGuardedFullPath) {
+      auto storageTensorType = RankedTensorType::get(storageShape, elemType);
+      auto alloc = rewriter.create<memref::AllocOp>(
+          loc, MemRefType::get(storageShape, elemType));
+
+      // Build the full-tile condition: all mask dims equal their tile size.
+      auto mixedSizes = makeTensorPtr.getMixedSizes();
+      Value fullCond;
+      for (size_t i = 0; i < mixedDims.size(); ++i) {
+        Value dimVal = ofrToIndexValue(mixedDims[i], loc, rewriter);
+        Value tileVal = ofrToIndexValue(mixedSizes[i], loc, rewriter);
+        Value eq = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                                  dimVal, tileVal);
+        fullCond = fullCond ? rewriter.create<arith::AndIOp>(loc, fullCond, eq)
+                            : eq;
+      }
+
+      auto thenBuilder = [&](OpBuilder &b, Location l) {
+        // Full tile: the whole tile is in-bounds, so copy the full source
+        // tile into the scratch (no fill, no partial subview) and read it
+        // back. This keeps the value a plain bufferization.to_tensor of an
+        // alloc (uniform with the else branch) so dialect conversion /
+        // bufferization legalize cleanly, while skipping the fill + partial
+        // subview work.
+        b.create<memref::CopyOp>(l, ptr, alloc);
+        Value t = b.create<bufferization::ToTensorOp>(
+            l, storageTensorType, alloc, /*restrict=*/true,
+            /*writable=*/true);
+        b.create<scf::YieldOp>(l, t);
+      };
+      auto elseBuilder = [&](OpBuilder &b, Location l) {
+        // Partial tile: optional fill + subview copy of the in-bounds region.
+        if (Value other = op.getOther()) {
+          auto fillDims = mixedDims;
+          fillWithValue(l, alloc, other, storageShape, std::move(fillDims),
+                        staticMaskDims, rewriter);
+        }
+        memref::SubViewOp srcSubview =
+            getSubview(tensorType.getRank(), mixedDims, ptr, l, rewriter);
+        memref::SubViewOp dstSubview =
+            getSubview(tensorType.getRank(), mixedDims, alloc, l, rewriter);
+        b.create<memref::CopyOp>(l, srcSubview, dstSubview);
+        Value t = b.create<bufferization::ToTensorOp>(
+            l, storageTensorType, alloc, /*restrict=*/true,
+            /*writable=*/true);
+        b.create<scf::YieldOp>(l, t);
+      };
+      auto ifOp = rewriter.create<scf::IfOp>(loc, fullCond, thenBuilder,
+                                             elseBuilder);
+
+      Value tensor = ifOp.getResult(0);
+      if (originalOrderAttr) {
+        tensor = transposeTensor(tensor, tensorType.getShape(),
+                                 getRecoverPermutation(originalOrderAttr), loc,
+                                 rewriter);
+      }
+      rewriter.replaceOp(op, tensor);
+      return success();
+    }
+
+    // General (non-fast) path: scratch alloc + optional fill + partial copy.
     auto alloc = rewriter.create<memref::AllocOp>(
         loc, MemRefType::get(storageShape, elemType));
 
@@ -1254,7 +1415,6 @@ private:
                     staticMaskDims, rewriter);
     }
 
-    auto ptrDefiningOp = ptr.getDefiningOp();
     if (ptrDefiningOp->hasAttr(WRAP_SIDE_BY_SIDE) ||
         ptrDefiningOp->hasAttr(WRAP_STACKED) ||
         ptrDefiningOp->hasAttr(WRAP_1D)) {
@@ -1798,6 +1958,54 @@ public:
     }
 
     if (op.hasMask()) {
+      // Fast path: for a standard boundary-check mask on a block pointer, emit
+      // a runtime guard `dim == tileSize`. When it holds (every in-bounds tile
+      // of a divisible shape), store the whole tile directly without
+      // extract_slice / subview. Otherwise fall back to the partial path. The
+      // guard is a runtime check, so this is sound for partial tiles.
+      //
+      // NOTE: analyze the *original* pointer (op.getPtr()) to recover the
+      // block pointer metadata; `ptr` (adaptor) is the converted memref.
+      auto makeTensorPtr =
+          dyn_cast_or_null<tts::MakeTensorPtrOp>(op.getPtr().getDefiningOp());
+      // NOTE: the 1-D pointwise block pointer has an empty `order` (rank-1),
+      // so isBlockPtr() is false for it; hasBoundaryMaskForm already verifies
+      // the tile-size-clamped mask structure, so don't gate on isBlockPtr().
+      if (makeTensorPtr && hasBoundaryMaskForm(makeTensorPtr, mixedDims)) {
+        auto mixedSizes = makeTensorPtr.getMixedSizes();
+        Value fullCond;
+        for (size_t i = 0; i < mixedDims.size(); ++i) {
+          Value dimVal = ofrToIndexValue(mixedDims[i], loc, rewriter);
+          Value tileVal = ofrToIndexValue(mixedSizes[i], loc, rewriter);
+          Value eq = rewriter.create<arith::CmpIOp>(
+              loc, arith::CmpIPredicate::eq, dimVal, tileVal);
+          fullCond = fullCond
+                         ? rewriter.create<arith::AndIOp>(loc, fullCond, eq)
+                         : eq;
+        }
+
+        auto storeThen = [&](OpBuilder &b, Location l) {
+          auto fullStore =
+              b.create<bufferization::MaterializeInDestinationOp>(l, storeValue,
+                                                                  ptr);
+          fullStore.setWritable(true);
+          b.create<scf::YieldOp>(l);
+        };
+        auto storeElse = [&](OpBuilder &b, Location l) {
+          auto srcSlice = getExtractSlice(rank, mixedDims, storeValue, l, b);
+          auto dstSubview = getSubview(rank, mixedDims, ptr, l, b);
+          auto partStore =
+              b.create<bufferization::MaterializeInDestinationOp>(l, srcSlice,
+                                                                  dstSubview);
+          partStore.setWritable(true);
+          b.create<scf::YieldOp>(l);
+        };
+        rewriter.create<scf::IfOp>(loc, fullCond, storeThen, storeElse);
+
+        rewriter.eraseOp(op);
+        return success();
+      }
+
       auto srcSlice =
           getExtractSlice(rank, mixedDims, storeValue, loc, rewriter);
       auto dstSubview = getSubview(rank, mixedDims, ptr, loc, rewriter);
