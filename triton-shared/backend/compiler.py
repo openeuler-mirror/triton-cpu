@@ -2034,6 +2034,32 @@ class CPUBackend(BaseBackend):
             return Path(llir_path).read_text()
 
 
+    def _llvm_target_flags(self):
+        """Target selection shared by the IR optimizer and the code generator.
+
+        Both have to be told the same machine.  `llc` was already getting it;
+        `opt` was not, and without a triple it builds a TargetTransformInfo for
+        a machine with no vector registers, so LoopVectorize declines every
+        loop and the whole kernel body stays scalar.  Passing -mtriple to opt
+        also makes it stamp the matching `target datalayout` into the IR it
+        emits, which is what llc then reads.
+        """
+        if os.environ.get("TRITON_SHARED_FORCE_SME_PIPELINE", "0") == "1" \
+            or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features
+                and getattr(self, "_used_sme", False)):
+            return (
+                "-mtriple=aarch64-linux-gnu",
+                "-mattr=+sme,+dotprod,+v9a,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+sve,+sve2",
+            )
+        if os.environ.get("TRITON_SHARED_FORCE_SVE_PIPELINE", "0") == "1" \
+            or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
+            return (
+                "-mtriple=aarch64-linux-gnu",
+                "-mattr=+sve,+dotprod,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+spe",
+            )
+        return ()
+
+
     @timer
     def _optimize_llir(self, llir: str):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2042,10 +2068,15 @@ class CPUBackend(BaseBackend):
             Path(src_path).write_text(llir)
             opt_path = _get_llvm_bin_path("opt")
             if os.path.exists(opt_path):
+                # `simplifycfg,dse` alone left the loops the linalg lowering
+                # emits completely unoptimized: reduction accumulators kept
+                # round-tripping through their memref every iteration, and
+                # nothing was vectorized.  Run the full pipeline instead.
                 subprocess.check_call([
                     opt_path,
                     "-S",
-                    "-passes=simplifycfg,dse",
+                    *self._llvm_target_flags(),
+                    "-passes=default<O3>",
                     src_path,
                     "-o",
                     llir_path,
@@ -2067,24 +2098,11 @@ class CPUBackend(BaseBackend):
             dst_path = os.path.join(tmpdir, "kernel.o")
             Path(src_path).write_text(llir)
             llc_path = _get_llvm_bin_path("llc")
-            flags = ""
-            if os.environ.get("TRITON_SHARED_FORCE_SME_PIPELINE", "0") == "1" \
-                or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features
-                    and getattr(self, "_used_sme", False)):
-                flags = (
-                    "-mtriple=aarch64-linux-gnu",
-                    "-mattr=+sme,+dotprod,+v9a,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+sve,+sve2",
-                    "-disable-interleaved-load-combine=true",
-                )
-            elif os.environ.get("TRITON_SHARED_FORCE_SVE_PIPELINE", "0") == "1" \
-                or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
-                flags = (
-                    "-mtriple=aarch64-linux-gnu",
-                    "-mattr=+sve,+dotprod,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+spe",
-                    "-disable-interleaved-load-combine=true",
-                )
-            
-            subprocess.check_call([llc_path, src_path, "-filetype=obj", "-o", dst_path] + list(flags))
+            flags = self._llvm_target_flags()
+            if flags:
+                flags += ("-disable-interleaved-load-combine=true",)
+
+            subprocess.check_call([llc_path, src_path, "-filetype=obj", "-O3", "-o", dst_path] + list(flags))
             ## dump binary
             _debug_dump_dir = os.getenv("TRITON_SHARED_DUMP_PATH", "")
             _dump_ir_if_needed(_debug_dump_dir, [dst_path])
