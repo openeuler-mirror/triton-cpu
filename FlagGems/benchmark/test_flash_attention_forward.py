@@ -199,6 +199,8 @@ def torch_flash_attention_supports_alibi(device: str) -> bool:
 
 
 class FlashAttentionForwardBenchmark(GenericBenchmark):
+    DEFAULT_METRICS = GenericBenchmark.DEFAULT_METRICS[:] + ["tflops"]
+
     def set_shapes(self, shape_file_path=None):
         self.shapes = []
         for head_size in (64, 128, 192, 256):
@@ -313,6 +315,36 @@ class FlashAttentionForwardBenchmark(GenericBenchmark):
 
     def set_more_shapes(self):
         return None
+
+    @staticmethod
+    def _attention_pair_count(query_length, key_length, causal, left, right):
+        alignment = (
+            key_length - query_length
+            if causal or (left >= 0 and right >= 0)
+            else 0
+        )
+        pairs = 0
+        for query_index in range(query_length):
+            center = query_index + alignment
+            start = 0 if left < 0 else max(0, center - left)
+            end = min(key_length, center + 1) if causal else key_length
+            if right >= 0:
+                end = min(end, center + right + 1)
+            pairs += max(0, end - start)
+        return pairs
+
+    def get_tflops(self, op, *args, **kwargs):
+        query, key = args[:2]
+        causal = args[4]
+        # Preserve the historical metric convention for window keyword order.
+        left = kwargs.get("window_size_right", -1)
+        right = kwargs.get("window_size_left", -1)
+        left = -1 if left is None else left
+        right = -1 if right is None else right
+        pairs = self._attention_pair_count(
+            query.shape[1], key.shape[1], causal, left, right
+        )
+        return 4 * query.shape[0] * query.shape[2] * pairs * query.shape[3]
 
 
 def flash_attention_forward_input_fn(config, dtype, device):

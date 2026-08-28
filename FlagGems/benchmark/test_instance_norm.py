@@ -9,7 +9,8 @@ from . import utils
 
 
 class NormBenchmark(base.GenericBenchmark):
-    # TODO: add new metric
+    DEFAULT_METRICS = base.Benchmark.DEFAULT_METRICS[:] + ["gbps"]
+
     def set_more_shapes(self):
         return [
             # 3D shapes represented as [batch_size, channels, hidden_size]
@@ -20,6 +21,32 @@ class NormBenchmark(base.GenericBenchmark):
             (1, 8, 4, 4),
             (16, 8, 128, 128),
         ]
+
+    def get_gbps(self, args, latency):
+        inp, weight, bias, running_mean, running_variance, use_input_stats = args[:6]
+        elements_per_channel = inp.numel() // inp.shape[0] // inp.shape[1]
+        input_passes = 3 if elements_per_channel > 4096 else 2
+        statistics_passes = 2 if use_input_stats else 1
+        logical_bytes = (
+            input_passes * inp.numel() * inp.element_size()
+            + weight.numel() * weight.element_size()
+            + bias.numel() * bias.element_size()
+            + (
+                0
+                if running_mean is None
+                else statistics_passes
+                * running_mean.numel()
+                * running_mean.element_size()
+            )
+            + (
+                0
+                if running_variance is None
+                else statistics_passes
+                * running_variance.numel()
+                * running_variance.element_size()
+            )
+        )
+        return logical_bytes / latency / 1e6
 
 
 def input_fn(shape, dtype, device):

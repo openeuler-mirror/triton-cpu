@@ -10,8 +10,30 @@ from .performance_utils import GenericBenchmark
 
 
 class ConcatAndCacheMLABenchmark(GenericBenchmark):
+    DEFAULT_METRICS = GenericBenchmark.DEFAULT_METRICS[:] + ["gbps"]
+
     def set_more_shapes(self):
         return None
+
+    def unpack_to_args_kwargs(self, input_tuple):
+        args, kwargs = super().unpack_to_args_kwargs(input_tuple)
+        self.metric_kwargs = kwargs
+        return args, kwargs
+
+    def get_gbps(self, args, latency):
+        kv_content, key_position, kv_cache, slot_mapping = args[:4]
+        cache_dtype = self.metric_kwargs.get("kv_cache_dtype", "auto")
+        scale = self.metric_kwargs.get("scale")
+        cached_elements = kv_content.numel() + key_position.numel()
+        logical_bytes = (
+            kv_content.numel() * kv_content.element_size()
+            + key_position.numel() * key_position.element_size()
+            + cached_elements * kv_cache.element_size()
+            + slot_mapping.numel() * slot_mapping.element_size()
+        )
+        if cache_dtype != "auto" and scale is not None:
+            logical_bytes += scale.numel() * scale.element_size()
+        return logical_bytes / latency / 1e6
 
 
 def torch_concat_and_cache_mla_ref(

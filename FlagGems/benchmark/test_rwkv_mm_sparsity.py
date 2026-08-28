@@ -8,8 +8,22 @@ from . import performance_utils as utils
 
 
 class RWKVSparsityBenchmark(utils.GenericBenchmark):
+    DEFAULT_METRICS = utils.Benchmark.DEFAULT_METRICS[:] + ["gbps"]
+
     def set_more_shapes(self):
         return None
+
+    def get_gbps(self, args, latency):
+        key, value = args[:2]
+        if getattr(self, "_metric_key", None) is not key:
+            nonzero_rows = torch.count_nonzero(key).item()
+            self._metric_key = key
+            self._logical_bytes = (
+                key.numel() * key.element_size()
+                + nonzero_rows * value.shape[1] * value.element_size()
+                + value.shape[1] * key.element_size()
+            )
+        return self._logical_bytes / latency / 1e6
 
 
 def _input_fn(shape, dtype, device):

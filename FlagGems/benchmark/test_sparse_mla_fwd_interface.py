@@ -70,11 +70,32 @@ def sparse_mla_input_fn(param, dtype, device):
 
 
 class SparseMlaFwdBenchmark(GenericBenchmark):
+    DEFAULT_METRICS = GenericBenchmark.DEFAULT_METRICS[:] + ["tflops"]
+
     def set_shapes(self, shape_file_path=None):
         self.shapes = SPARSE_MLA_PARAMS
 
     def set_more_shapes(self):
         return []
+
+    def get_tflops(self, op, *args, **kwargs):
+        query, _, indices = args[:3]
+        value_dim = kwargs.get("d_v", args[4] if len(args) > 4 else None)
+        batch = 1 if query.ndim == 3 else query.shape[0]
+        query_length, query_heads, query_dim = query.shape[-3:]
+        key_value_heads, topk = indices.shape[-2:]
+        if key_value_heads == 0 or query_heads % key_value_heads:
+            raise ValueError(
+                "query heads must be divisible by key/value heads"
+            )
+        return (
+            2
+            * batch
+            * query_length
+            * query_heads
+            * topk
+            * (query_dim + value_dim)
+        )
 
 
 @pytest.mark.sparse_mla_fwd_interface

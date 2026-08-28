@@ -1,7 +1,7 @@
 import pytest
 
 import flag_gems
-from benchmark.attri_util import FLOAT_DTYPES
+from benchmark.attri_util import DEFAULT_METRICS, FLOAT_DTYPES
 from benchmark.performance_utils import TexGluForwardBenchmark
 
 # Note: Importing transformer_engine (especially in some versions like py 3.10) may automatically
@@ -19,6 +19,17 @@ except ImportError:
     TE_OP = None
 
 
+class GegluBenchmark(TexGluForwardBenchmark):
+    DEFAULT_METRICS = DEFAULT_METRICS[:] + ["gbps"]
+
+    def get_gbps(self, args, latency):
+        inp = args[0]
+        logical_bytes = (
+            inp.numel() + inp.numel() // 2
+        ) * inp.element_size()
+        return logical_bytes / latency / 1e6
+
+
 @pytest.mark.geglu
 @pytest.mark.skipif(flag_gems.device !="cpu" and not TE_AVAILABLE, reason="TransformerEngine not installed")
 @pytest.mark.skipif(flag_gems.device !="cpu" and TE_OP is None, reason="'geglu' not found in TransformerEngine")
@@ -26,7 +37,7 @@ except ImportError:
 def test_geglu():
     if flag_gems.device == "cpu":
         TE_OP = GEMS_OP
-    bench = TexGluForwardBenchmark(
+    bench = GegluBenchmark(
         op_name="geglu",
         torch_op=TE_OP,
         gems_op=GEMS_OP,
