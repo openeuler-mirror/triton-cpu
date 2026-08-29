@@ -430,10 +430,10 @@ def _vllm_num_splits_heuristic(
 
 
 @triton.jit
-def _prepare_pass1_kernel(
+def _prepare_fused_kernel(
     num_m_blocks_ptr,
     num_n_blocks_ptr,
-    total_blocks_ptr,
+    num_splits_dynamic_ptr,
     seqlen_k_ptr,
     cu_seqlens_q_ptr,
     cu_seqlens_k_ptr,
@@ -443,6 +443,9 @@ def _prepare_pass1_kernel(
     leftpad_k_ptr,
     batch,
     qhead_per_khead,
+    num_head,
+    num_sm,
+    num_splits_static,
     max_seqlen_q: tl.constexpr,
     max_seqlen_k_new: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -456,79 +459,95 @@ def _prepare_pass1_kernel(
     HAS_LEFT_PAD: tl.constexpr,
     HAS_K_NEW: tl.constexpr,
     HAS_CU_SEQLENS_K_NEW: tl.constexpr,
+    DYNAMIC_SPLIT: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    b_start = pid * BLOCK_SIZE_B
-    b_offs = b_start + tl.arange(0, BLOCK_SIZE_B)
-    mask = b_offs < batch
+    """_prepare_pass1_kernel and _prepare_pass2_kernel fused into one launch.
 
-    if HAS_SEQUSED_Q:
-        q_len = tl.load(seqused_q_ptr + b_offs, mask=mask, other=0)
-    elif HAS_CU_SEQLENS_Q:
-        cur = tl.load(cu_seqlens_q_ptr + b_offs, mask=mask, other=0)
-        nxt = tl.load(cu_seqlens_q_ptr + b_offs + 1, mask=mask, other=0)
-        q_len = nxt - cur
-    else:
-        q_len = tl.full(
-            [BLOCK_SIZE_B], max_seqlen_q, dtype=tl.int32
-        )  # max_seqlen_q constexpr
-    q_len = q_len * qhead_per_khead
-    m_blocks = (q_len + BLOCK_M - 1) // BLOCK_M
+    The second pass needs total_blocks, a sum over the whole batch, so the two
+    could not run as one grid.  Instead a single program walks the batch in
+    BLOCK_SIZE_B tiles and keeps the reduction in a register, which removes a
+    kernel launch, the atomic_add, and the total_blocks.item() readback that
+    had to sit between the two launches.
 
-    if HAS_SEQUSED_K:
-        k_len = tl.load(seqused_k_ptr + b_offs, mask=mask, other=0)
-    elif HAS_CU_SEQLENS_K:
-        cur = tl.load(cu_seqlens_k_ptr + b_offs, mask=mask, other=0)
-        nxt = tl.load(cu_seqlens_k_ptr + b_offs + 1, mask=mask, other=0)
-        k_len = nxt - cur
-    else:
-        k_len = tl.load(seqlen_k_ptr + b_offs, mask=mask, other=0)
-    left = tl.load(leftpad_k_ptr + b_offs, mask=mask, other=0) if HAS_LEFT_PAD else 0
+    The tile width stays BLOCK_SIZE_B rather than one block spanning the batch,
+    and that is load-bearing.  tl.sum below reduces over every lane, including
+    those masked off past `batch`, and they are not always zero: with HAS_K_NEW
+    the padding lanes pick up max_seqlen_k_new, giving a non-zero product that
+    does reach total_blocks.  Keeping the original tiling keeps the padding
+    lane count identical, and integer addition is associative, so accumulating
+    tile by tile here yields exactly what atomic_add accumulated across
+    programs.
+    """
+    total_blocks = tl.zeros([], dtype=tl.int32)
+    num_tiles = tl.cdiv(batch, BLOCK_SIZE_B)
 
-    if HAS_K_NEW:
-        if HAS_CU_SEQLENS_K_NEW:
-            cur_new = tl.load(cu_seqlens_k_new_ptr + b_offs, mask=mask, other=0)
-            nxt_new = tl.load(cu_seqlens_k_new_ptr + b_offs + 1, mask=mask, other=0)
-            k_len += nxt_new - cur_new
+    for t in range(num_tiles):
+        b_offs = t * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
+        mask = b_offs < batch
+
+        if HAS_SEQUSED_Q:
+            q_len = tl.load(seqused_q_ptr + b_offs, mask=mask, other=0)
+        elif HAS_CU_SEQLENS_Q:
+            cur = tl.load(cu_seqlens_q_ptr + b_offs, mask=mask, other=0)
+            nxt = tl.load(cu_seqlens_q_ptr + b_offs + 1, mask=mask, other=0)
+            q_len = nxt - cur
         else:
-            k_len += max_seqlen_k_new
-    k_len = k_len - left
-    n_blocks = (k_len + BLOCK_N - 1) // BLOCK_N
+            q_len = tl.full(
+                [BLOCK_SIZE_B], max_seqlen_q, dtype=tl.int32
+            )  # max_seqlen_q constexpr
+        q_len = q_len * qhead_per_khead
+        m_blocks = (q_len + BLOCK_M - 1) // BLOCK_M
 
-    tl.store(num_m_blocks_ptr + b_offs, m_blocks, mask=mask)
-    tl.store(num_n_blocks_ptr + b_offs, n_blocks, mask=mask)
-    total = m_blocks * n_blocks
-    tl.atomic_add(total_blocks_ptr, tl.sum(total, axis=0))
+        if HAS_SEQUSED_K:
+            k_len = tl.load(seqused_k_ptr + b_offs, mask=mask, other=0)
+        elif HAS_CU_SEQLENS_K:
+            cur = tl.load(cu_seqlens_k_ptr + b_offs, mask=mask, other=0)
+            nxt = tl.load(cu_seqlens_k_ptr + b_offs + 1, mask=mask, other=0)
+            k_len = nxt - cur
+        else:
+            k_len = tl.load(seqlen_k_ptr + b_offs, mask=mask, other=0)
+        left = (
+            tl.load(leftpad_k_ptr + b_offs, mask=mask, other=0) if HAS_LEFT_PAD else 0
+        )
 
+        if HAS_K_NEW:
+            if HAS_CU_SEQLENS_K_NEW:
+                cur_new = tl.load(cu_seqlens_k_new_ptr + b_offs, mask=mask, other=0)
+                nxt_new = tl.load(cu_seqlens_k_new_ptr + b_offs + 1, mask=mask, other=0)
+                k_len += nxt_new - cur_new
+            else:
+                k_len += max_seqlen_k_new
+        k_len = k_len - left
+        n_blocks = (k_len + BLOCK_N - 1) // BLOCK_N
 
-@triton.jit
-def _prepare_pass2_kernel(
-    num_n_blocks_per_seq_ptr,
-    num_splits_dynamic_ptr,
-    total_blocks,
-    num_batch,
-    num_head,
-    num_sm,
-    num_splits_static,
-    BLOCK_SIZE_B: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    b_start = pid * BLOCK_SIZE_B
-    b_offsets = b_start + tl.arange(0, BLOCK_SIZE_B)
-    b_mask = b_offsets < num_batch
+        tl.store(num_m_blocks_ptr + b_offs, m_blocks, mask=mask)
+        tl.store(num_n_blocks_ptr + b_offs, n_blocks, mask=mask)
+        total = m_blocks * n_blocks
+        # The original reduced with tl.atomic_add into an int32 tensor, which
+        # truncates the per-program sum to int32.  q_len (and hence total) is
+        # int64 whenever the caller passes an int64 seqused_q, so cast here to
+        # keep the same truncation instead of widening the accumulator.
+        total_blocks += tl.sum(total, axis=0).to(tl.int32)
 
-    blocks_per_sm_float = tl.ceil(total_blocks * 1.1 * num_head / num_sm)
-    blocks_per_sm = blocks_per_sm_float.to(tl.int32)
+    if DYNAMIC_SPLIT:
+        blocks_per_sm_float = tl.ceil(total_blocks * 1.1 * num_head / num_sm)
+        blocks_per_sm = blocks_per_sm_float.to(tl.int32)
 
-    blocks_per_sm = tl.maximum(1, blocks_per_sm)
+        blocks_per_sm = tl.maximum(1, blocks_per_sm)
 
-    num_n_blocks = tl.load(num_n_blocks_per_seq_ptr + b_offsets, mask=b_mask, other=0)
-    num_splits_dynamic = (num_n_blocks + blocks_per_sm - 1) // blocks_per_sm
+        for t in range(num_tiles):
+            b_offsets = t * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
+            b_mask = b_offsets < batch
 
-    num_splits_dynamic = tl.minimum(num_splits_dynamic, num_splits_static)
-    num_splits_dynamic = tl.maximum(1, num_splits_dynamic)
+            num_n_blocks = tl.load(num_n_blocks_ptr + b_offsets, mask=b_mask, other=0)
+            num_splits_dynamic = (num_n_blocks + blocks_per_sm - 1) // blocks_per_sm
 
-    tl.store(num_splits_dynamic_ptr + b_offsets, num_splits_dynamic, mask=b_mask)
+            num_splits_dynamic = tl.minimum(num_splits_dynamic, num_splits_static)
+            num_splits_dynamic = tl.maximum(1, num_splits_dynamic)
+
+            tl.store(
+                num_splits_dynamic_ptr + b_offsets, num_splits_dynamic, mask=b_mask
+            )
 
 
 def get_pack_gqa(
@@ -711,21 +730,12 @@ def get_scheduler_metadata(
         else torch.full((batch_size,), max_seqlen_q, dtype=dtype, device=device)
     )
     seqlen_k = seqused_k
-    seqlen_knew = (
-        torch.full((batch_size,), max_seqlen_k_new, dtype=dtype, device=device)
-        if max_seqlen_k_new > 0
-        else None
-    )
-
-    num_m_blocks = torch.empty_like(seqlen_q)
-    num_n_blocks = torch.empty_like(seqlen_k)
-    total_blocks = torch.zeros((1,), dtype=dtype, device=device)
-    num_splits_dynamic = torch.empty_like(seqlen_q)
+    # `seqlen_knew` used to be materialized here only so the launch could test
+    # it against None; that test is `max_seqlen_k_new > 0` by construction, and
+    # the kernel already receives max_seqlen_k_new as a constexpr.
+    has_k_new = max_seqlen_k_new > 0
 
     BLOCK_SIZE_B = 128
-    grid = (triton.cdiv(batch_size, BLOCK_SIZE_B),)
-
-    total_blocks_val = total_blocks.item()
 
     # dynamic split depends ONLY on batch_size, regardless of num_splits_static
     use_dynamic_split = batch_size <= 992
@@ -819,13 +829,12 @@ def get_scheduler_metadata(
 
     num_m_blocks = torch.empty_like(seqlen_q)
     num_n_blocks = torch.empty_like(seqlen_k)
-    total_blocks = torch.zeros((1,), dtype=dtype, device=device)
     num_splits_dynamic = torch.empty_like(seqlen_q)
 
-    _prepare_pass1_kernel[grid](
+    _prepare_fused_kernel[(1,)](
         num_m_blocks,
         num_n_blocks,
-        total_blocks,
+        num_splits_dynamic,
         seqlen_k,
         cu_seqlens_q,
         cu_seqlens_k,
@@ -835,6 +844,9 @@ def get_scheduler_metadata(
         leftpad_k,
         batch_size,
         qhead_per_khead,
+        num_head_k,
+        num_sm,
+        eff_num_splits,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k_new=max_seqlen_k_new,
         BLOCK_M=blockM,
@@ -845,45 +857,18 @@ def get_scheduler_metadata(
         HAS_SEQUSED_Q=seqused_q is not None,
         HAS_SEQUSED_K=True,
         HAS_LEFT_PAD=leftpad_k is not None,
-        HAS_K_NEW=seqlen_knew is not None,
+        HAS_K_NEW=has_k_new,
         HAS_CU_SEQLENS_K_NEW=cu_seqlens_k_new is not None,
+        DYNAMIC_SPLIT=use_dynamic_split,
     )
 
-    total_blocks_val = total_blocks.item()
-
-    if use_dynamic_split:
-        _prepare_pass2_kernel[grid](
-            num_n_blocks,
-            num_splits_dynamic,
-            total_blocks=total_blocks_val,
-            num_batch=batch_size,
-            num_head=num_head_k,
-            num_sm=num_sm,
-            num_splits_static=eff_num_splits,
-            BLOCK_SIZE_B=BLOCK_SIZE_B,
-        )
-    else:
+    if not use_dynamic_split:
         num_splits_dynamic.fill_(eff_num_splits)
 
-    final_num_splits = eff_num_splits
-
-    is_varlen = True
-
-    if arch >= 90:
-        scheduler_needs_semaphore = (
-            (final_is_causal or final_is_local) and (final_num_splits == 1)
-        ) or is_varlen
-    else:
-        scheduler_needs_semaphore = (final_is_causal and not is_varlen) or (
-            is_varlen and final_num_splits > 1
-        )
-
-    if use_dynamic_split:
-        final_num_splits_for_sem_check = eff_num_splits
-    else:
-        final_num_splits_for_sem_check = eff_num_splits
-
-    scheduler_needs_semaphore = arch >= 90 or final_num_splits_for_sem_check > 1
+    # The two branches above this used to compute scheduler_needs_semaphore and
+    # final_num_splits_for_sem_check, then unconditionally overwrite both; only
+    # this expression ever survived.
+    scheduler_needs_semaphore = arch >= 90 or eff_num_splits > 1
 
     alloc_size = int(scheduler_needs_semaphore) + int(use_dynamic_split) * batch_size
 
@@ -896,8 +881,6 @@ def get_scheduler_metadata(
 
         if use_dynamic_split:
             scheduler_metadata[offset:] = num_splits_dynamic
-        elif scheduler_needs_semaphore and not use_dynamic_split:
-            pass
         return scheduler_metadata
     else:
         return torch.empty((0,), dtype=torch.int32, device=device)
