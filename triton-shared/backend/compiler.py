@@ -2077,6 +2077,9 @@ class CPUBackend(BaseBackend):
                     "-S",
                     *self._llvm_target_flags(),
                     "-passes=default<O3>",
+                    "-vectorize-slp=false",
+                    "-enable-gvn-memdep=false",
+                    "-memdep-block-scan-limit=20",
                     src_path,
                     "-o",
                     llir_path,
@@ -2101,6 +2104,8 @@ class CPUBackend(BaseBackend):
             flags = self._llvm_target_flags()
             if flags:
                 flags += ("-disable-interleaved-load-combine=true",)
+                flags += ("-enable-misched=false",)
+                flags += ("-enable-post-misched=false",)
 
             subprocess.check_call([llc_path, src_path, "-filetype=obj", "-O3", "-o", dst_path] + list(flags))
             ## dump binary
