@@ -2068,18 +2068,12 @@ class CPUBackend(BaseBackend):
             Path(src_path).write_text(llir)
             opt_path = _get_llvm_bin_path("opt")
             if os.path.exists(opt_path):
-                # `simplifycfg,dse` alone left the loops the linalg lowering
-                # emits completely unoptimized: reduction accumulators kept
-                # round-tripping through their memref every iteration, and
-                # nothing was vectorized.  Run the full pipeline instead.
+                #FIXME: should we add other opt optimizations too?
                 subprocess.check_call([
                     opt_path,
                     "-S",
                     *self._llvm_target_flags(),
-                    "-passes=default<O3>",
-                    "-vectorize-slp=false",
-                    "-enable-gvn-memdep=false",
-                    "-memdep-block-scan-limit=20",
+                    "-passes=simplifycfg,dse,loop-vectorize",
                     src_path,
                     "-o",
                     llir_path,
