@@ -75,6 +75,70 @@ def celoss_indices_kernel(
 
 
 @libentry()
+@triton.jit(do_not_specialize=["ignore_index"])
+def celoss_indices_kernel_1d(
+    inp_ptr,
+    tgt_ptr,
+    w_ptr,
+    out_ptr,
+    w_tgt_ptr,
+    ignore_index,
+    C,
+    BLOCK_C: tl.constexpr,
+    EVEN: tl.constexpr,
+):
+    # Specialized kernel for D == 1 (2D input [N, C]): one program per sample
+    # with 1D tiles along the contiguous class axis. The general kernel's
+    # [BLOCK_C, BLOCK_D] tiles degenerate to [BLOCK_C, 1] here, which
+    # scalarizes every elementwise op (exp becomes a scalar polynomial).
+    # 1D tiles keep loads/stores and the exp polynomial vectorized.
+    # Online (FlashAttention-style) softmax tracks one max/sum per chunk
+    # instead of per element, halving the number of exp evaluations.
+    pid_n = tle.program_id(0)
+    base = pid_n.to(tl.int64) * C
+
+    tgt = tl.load(tgt_ptr + pid_n)
+    valid = tgt != ignore_index
+
+    m_i = -float("inf")
+    l_i = 0.0
+    for off in range(0, C, BLOCK_C):
+        idx = off + tl.arange(0, BLOCK_C)
+        if EVEN:
+            x = tl.load(inp_ptr + base + idx).to(tl.float32)
+        else:
+            x = tl.load(
+                inp_ptr + base + idx, mask=idx < C, other=-float("inf")
+            ).to(tl.float32)
+        chunk_max = tl.max(x, 0)
+        m_new = tl.maximum(m_i, chunk_max)
+        l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(x - m_new), 0)
+        m_i = m_new
+    lse = tl.log(l_i) + m_i
+
+    x_tgt = tl.load(inp_ptr + base + tgt, mask=valid, other=0.0).to(tl.float32)
+    out = lse - x_tgt
+
+    if w_ptr is None:
+        w_tgt = tl.where(valid, 1.0, 0.0)
+    else:
+        w_tgt = tl.load(w_ptr + tgt, mask=valid, other=0.0).to(tl.float32)
+    tl.store(w_tgt_ptr + pid_n, w_tgt)
+    out = out * w_tgt
+    tl.store(out_ptr + pid_n, out)
+
+
+def _select_block_c(C):
+    # Prefer an EVEN (unmasked) kernel: pick the largest power-of-two block
+    # (up to 2048) that divides C so that loads need no bounds mask (masked
+    # loads defeat pointer-analysis vectorization on the CPU backend).
+    for block in (2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2):
+        if C % block == 0:
+            return block, True
+    return 256, False
+
+
+@libentry()
 @triton.autotune(
     configs=runtime.get_tuned_config("cross_entropy_loss"),
     key=["C", "D"],
@@ -547,17 +611,33 @@ class CrossEntropyLoss(torch.autograd.Function):
         elif label_smoothing == 0:
             # target indices
             w_tgt = torch.empty(shape, dtype=torch.float32, device=inp.device)
-            with torch_device_fn.device(inp.device):
-                celoss_indices_kernel[grid](
-                    inp,
-                    tgt,
-                    weight,
-                    out,
-                    w_tgt,
-                    ignore_index,
-                    C,
-                    D,
-                )
+            if D == 1:
+                # 2D/1D input: specialized 1D-tile kernel (vectorizable)
+                BLOCK_C, even = _select_block_c(C)
+                with torch_device_fn.device(inp.device):
+                    celoss_indices_kernel_1d[(N,)](
+                        inp,
+                        tgt,
+                        weight,
+                        out,
+                        w_tgt,
+                        ignore_index,
+                        C,
+                        BLOCK_C=BLOCK_C,
+                        EVEN=even,
+                    )
+            else:
+                with torch_device_fn.device(inp.device):
+                    celoss_indices_kernel[grid](
+                        inp,
+                        tgt,
+                        weight,
+                        out,
+                        w_tgt,
+                        ignore_index,
+                        C,
+                        D,
+                    )
         else:
             w_tgt = torch.empty(shape, dtype=torch.float32, device=inp.device)
             with torch_device_fn.device(inp.device):
