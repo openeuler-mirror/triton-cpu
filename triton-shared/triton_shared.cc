@@ -453,8 +453,14 @@ void init_to_llvm(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_convert_math_to_libm", createConvertMathToLibmPass);
   ADD_PASS_WRAPPER_0("add_convert_complex_to_llvm",
                      createConvertComplexToLLVMPass);
-  ADD_PASS_WRAPPER_0("add_convert_vector_to_llvm",
-                     createConvertVectorToLLVMPass);
+  m.def(
+      "add_convert_vector_to_llvm",
+      [](mlir::PassManager &pm, bool reassociateFPReductions) {
+        mlir::ConvertVectorToLLVMPassOptions options;
+        options.reassociateFPReductions = reassociateFPReductions;
+        pm.addPass(mlir::createConvertVectorToLLVMPass(options));
+      },
+      py::arg("pm"), py::arg("reassociate_fp_reductions") = false);
   ADD_PASS_WRAPPER_0("add_convert_index_to_llvm", createConvertIndexToLLVMPass);
   ADD_PASS_WRAPPER_0("add_memref_expand", memref::createExpandOpsPass);
   ADD_PASS_WRAPPER_0("add_finalize_memref_to_llvm",

@@ -941,6 +941,7 @@ class CPUBackend(BaseBackend):
             with InsertionPoint(sequence.body):
                 result = transform.lower_to_llvm_new(
                     sequence.bodyTarget,
+                    reassociate_fp_reductions=True,
                     enable_arm_sve=True,
                     enable_index_optimizations=True,
                     vscale_range=self.sve_vscale,
@@ -1597,6 +1598,7 @@ class CPUBackend(BaseBackend):
             with InsertionPoint(sequence.body):
                 transform.lower_to_llvm_new(
                     sequence.bodyTarget,
+                    reassociate_fp_reductions=True,
                     enable_arm_sve=True,
                     enable_index_optimizations=True,
                     vscale_range=0,
@@ -1974,7 +1976,8 @@ class CPUBackend(BaseBackend):
                     
                     pm3 = ir.pass_manager(context)
                     triton_shared.to_llir.add_convert_math_to_libm(pm3)
-                    triton_shared.to_llir.add_convert_vector_to_llvm(pm3)
+                    triton_shared.to_llir.add_convert_vector_to_llvm(
+                        pm3, reassociate_fp_reductions=True)
                     triton_shared.to_llir.add_convert_to_llvm(pm3)
                     triton_shared.to_llir.add_promote_i1_to_i8(pm3)
                     pm3.run(mod)
@@ -1998,7 +2001,8 @@ class CPUBackend(BaseBackend):
                     triton_shared.to_llir.add_transform_interpreter(pm)
                     triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm)
                     triton_shared.to_llir.add_convert_math_to_libm(pm)
-                    triton_shared.to_llir.add_convert_vector_to_llvm(pm)
+                    triton_shared.to_llir.add_convert_vector_to_llvm(
+                        pm, reassociate_fp_reductions=True)
                     triton_shared.to_llir.add_convert_to_llvm(pm)
                     triton_shared.to_llir.add_promote_i1_to_i8(pm)
                     triton_shared.to_llir.add_canonicalizer(pm)
@@ -2013,7 +2017,8 @@ class CPUBackend(BaseBackend):
                 triton_shared.to_llir.add_expand_strided_metadata(pm)
                 triton_shared.to_llir.add_convert_scf_to_cf(pm)
                 triton_shared.to_llir.add_convert_math_to_libm(pm)
-                triton_shared.to_llir.add_convert_vector_to_llvm(pm)
+                triton_shared.to_llir.add_convert_vector_to_llvm(
+                    pm, reassociate_fp_reductions=True)
                 triton_shared.to_llir.add_convert_to_llvm(pm)
                 triton_shared.to_llir.add_promote_i1_to_i8(pm)
                 triton_shared.to_llir.add_strip_debug_info(pm)
