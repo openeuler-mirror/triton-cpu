@@ -94,6 +94,45 @@ def _new_debug_dump_dir(ir_text: str) -> str:
     return out_dir
 
 
+# Per-buffer ceiling, in bytes, for turning a bufferization scratch allocation
+# into a stack slot.  A tile of BLOCK_SIZE=4096 f32 is 16 KiB, so 16 KiB covers
+# the 1-D tiles kernels normally work on while leaving the large 2-D tiles
+# (128x128 f32 = 64 KiB and up) on the heap, where a deep kernel cannot blow an
+# OpenMP worker's stack.  Tunable for kernels that want to trade one for the
+# other.
+_STACK_PROMOTE_LIMIT = int(
+    os.environ.get("TRITON_SHARED_STACK_PROMOTE_LIMIT", str(16 * 1024))
+)
+
+def _promote_buffers_to_stack(funcs):
+    """memref.alloc -> memref.alloca for the small per-tile scratch buffers.
+
+    Bufferization hands every masked tt.load a private tile buffer and every
+    unfused linalg op its own destination.  As memref.alloc each of those is a
+    malloc/free pair *inside the kernel body*, so a grid of M programs pays M
+    times that, and LLVM has to treat the buffer as escaping memory: it cannot
+    forward a store to a later load, and it cannot sink a reduction's store out
+    of the loop.  As memref.alloca they are ordinary stack slots that SROA and
+    the vectorizer can see through.
+
+    buffer-loop-hoisting runs first so an allocation inside an scf.for is moved
+    out of the loop where that is legal; promoting a per-iteration allocation
+    would otherwise grow the frame on every trip.  Returns the new handle.
+    """
+    any_op = transform.AnyOpType.get()
+    hoisted = transform.ApplyRegisteredPassOp(any_op, funcs, "buffer-hoisting")
+    hoisted = transform.ApplyRegisteredPassOp(
+        any_op, hoisted.result, "buffer-loop-hoisting"
+    )
+    promoted = transform.ApplyRegisteredPassOp(
+        any_op,
+        hoisted.result,
+        "promote-buffers-to-stack",
+        options=f"max-alloc-size-in-bytes={_STACK_PROMOTE_LIMIT}",
+    )
+    return promoted.result
+
+
 def timer(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -298,6 +337,7 @@ class CPUBackend(BaseBackend):
 
 
     def _sve_transform(self, src: str) -> str:
+
         def linalg_opts():
             """Apply linalg-level optimizations before tiling."""
             any_op = transform.AnyOpType.get()
@@ -649,6 +689,13 @@ class CPUBackend(BaseBackend):
                     allow_return_allocs_from_loops=True,
                     copy_before_write=True,
                     memcpy_op="linalg.copy")
+
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    oneshot.result,
+                    ["func.func"],
+                )
+                _promote_buffers_to_stack(funcs.result)
 
                 dealloc = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
@@ -1515,9 +1562,11 @@ class CPUBackend(BaseBackend):
                     ["func.func"],
                 )
 
+                target = _promote_buffers_to_stack(funcs.result)
+
                 linalg2loops = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
-                    funcs.result,
+                    target,
                     "convert-linalg-to-loops",
                 )
 
