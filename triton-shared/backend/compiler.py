@@ -2132,7 +2132,7 @@ class CPUBackend(BaseBackend):
                     opt_path,
                     "-S",
                     *self._llvm_target_flags(),
-                    "-passes=simplifycfg,dse,loop-vectorize",
+                    "-passes=function(loop-mssa(loop-rotate,loop-idiom),instcombine<max-iterations=1;no-verify-fixpoint>,sroa),simplifycfg,dse,loop-vectorize",
                     src_path,
                     "-o",
                     llir_path,
