@@ -38,4 +38,9 @@ def CollapseShape : Pass</*cli-arg*/"collapse-shape", /*Op*/"mlir::ModuleOp"> {
   let constructor = "triton::createCollapseShapePass()";
 }
 
+def HoistStaticAllocs : Pass</*cli-arg*/"hoist-static-allocs", /*Op*/"mlir::ModuleOp"> {
+  let summary = "hoist statically sized allocs to the entry block, controlled by TRITON_SHARED_HOIST_STATIC_ALLOCS";
+  let constructor = "triton::createHoistStaticAllocsPass()";
+}
+
 #endif

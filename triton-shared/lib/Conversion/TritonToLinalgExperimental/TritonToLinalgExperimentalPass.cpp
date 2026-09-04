@@ -173,6 +173,7 @@ public:
     pm.addPass(createRemoveDeadValuesPass());
     pm.addPass(createCSEPass());
     pm.addPass(createCanonicalizerPass());
+
     if (enableCollapseShape) {
       // Canonicalizer pass will rewrite tensor.expand_shape(linalg.fill) to
       // linalg.fill(tensor.expand_shape) so we need to run it before
