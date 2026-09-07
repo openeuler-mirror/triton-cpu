@@ -12,6 +12,7 @@
 #include "triton-shared/Conversion/TritonToArmPL/ArmPLOpToFunctionPass.h"
 #include "triton-shared/Conversion/TritonPtrToMemref/TritonPtrToMemref.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/CollapseShape.h"
+#include "triton-shared/Conversion/TritonToLinalgExperimental/FullTileRegionVersioning.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/ReconcilePtrCasts.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/TritonToLinalgExperimental.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/TritonToPtr.h"
@@ -33,6 +34,11 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Analysis/SliceAnalysis.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 
@@ -151,6 +157,12 @@ public:
     if (enableArmPL)
       pm.addPass(createArmPLOpToFunctionPass());
 
+    // Version boundary-masked regions before the masks turn into scratch
+    // buffers and per-access guards.
+    pm.addPass(createFullTileVersioningPass());
+    pm.addPass(createCSEPass());
+    pm.addPass(createCanonicalizerPass());
+
     pm.addPass(createStructuredToMemrefPass());
     pm.addPass(createUnstructuredToMemrefPass());
     pm.addPass(createTritonPtrToMemrefPass());
@@ -161,6 +173,7 @@ public:
     pm.addPass(createRemoveDeadValuesPass());
     pm.addPass(createCSEPass());
     pm.addPass(createCanonicalizerPass());
+
     if (enableCollapseShape) {
       // Canonicalizer pass will rewrite tensor.expand_shape(linalg.fill) to
       // linalg.fill(tensor.expand_shape) so we need to run it before

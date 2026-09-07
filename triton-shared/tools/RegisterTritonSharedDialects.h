@@ -301,6 +301,7 @@ void registerTestPasses() {
 inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
   mlir::registerAllPasses();
   mlir::registerTritonPasses();
+  mlir::triton::registerHoistStaticAllocsPass();
   mlir::triton::gpu::registerTritonGPUPasses();
   mlir::triton::registerTritonToLinalgPass();
   mlir::triton::registerTritonToLinalgExperimentalPasses();

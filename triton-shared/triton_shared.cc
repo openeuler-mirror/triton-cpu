@@ -423,6 +423,10 @@ void init_to_llvm(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_transform_interpreter",
                      transform::createInterpreterPass);
 
+  // Runs on the LLVM-dialect module, so it belongs to this stage.
+  ADD_PASS_WRAPPER_0("add_hoist_static_allocs",
+                     mlir::triton::createHoistStaticAllocsPass);
+
   ADD_PASS_WRAPPER_0("add_convert_linalg_to_affine_loops",
                      createConvertLinalgToAffineLoopsPass);
   ADD_PASS_WRAPPER_0("add_empty_tensor_to_alloc_tensor",
@@ -507,6 +511,7 @@ void init_triton_shared_ir(py::module &&m) {
     if (!loaded) {
       mlir::registerAllPasses();
       mlir::registerTritonPasses();
+      mlir::triton::registerHoistStaticAllocsPass();
       mlir::triton::gpu::registerTritonGPUPasses();
       mlir::triton::registerTritonToLinalgPass();
       mlir::triton::registerTritonToLinalgExperimentalPasses();

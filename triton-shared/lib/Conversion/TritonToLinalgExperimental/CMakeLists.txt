@@ -9,6 +9,8 @@ add_triton_library(TritonToLinalgExperimental
   ReconcilePtrCastsPass.cpp
   TritonToPtrPass.cpp
   CollapseShape.cpp
+  FullTileRegionVersioning.cpp
+  HoistStaticAllocs.cpp
 
   DEPENDS
   TritonToLinalgExperimentalConversionPassIncGen

@@ -2023,6 +2023,10 @@ class CPUBackend(BaseBackend):
                     pm2.run(mod)
                     Path(os.path.join(kernel_debug_dir, "02_after_erase_schedule.mlir")).write_text(str(mod))
                     
+                    pm_hoist = ir.pass_manager(context)
+                    triton_shared.to_llir.add_hoist_static_allocs(pm_hoist)
+                    pm_hoist.run(mod)
+
                     pm3 = ir.pass_manager(context)
                     triton_shared.to_llir.add_convert_math_to_libm(pm3)
                     triton_shared.to_llir.add_convert_vector_to_llvm(
@@ -2049,6 +2053,7 @@ class CPUBackend(BaseBackend):
                 else:
                     triton_shared.to_llir.add_transform_interpreter(pm)
                     triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm)
+                    triton_shared.to_llir.add_hoist_static_allocs(pm)
                     triton_shared.to_llir.add_convert_math_to_libm(pm)
                     triton_shared.to_llir.add_convert_vector_to_llvm(
                         pm, reassociate_fp_reductions=True)
@@ -2127,7 +2132,7 @@ class CPUBackend(BaseBackend):
                     opt_path,
                     "-S",
                     *self._llvm_target_flags(),
-                    "-passes=simplifycfg,dse,loop-vectorize",
+                    "-passes=function(loop-mssa(loop-rotate,loop-idiom),instcombine<max-iterations=1;no-verify-fixpoint>,sroa),simplifycfg,dse,loop-vectorize",
                     src_path,
                     "-o",
                     llir_path,

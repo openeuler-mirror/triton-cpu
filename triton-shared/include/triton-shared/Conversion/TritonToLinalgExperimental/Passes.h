@@ -12,6 +12,7 @@
 #include "triton-shared/Conversion/TritonToLinalgExperimental/ReconcilePtrCasts.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/TritonToPtr.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/CollapseShape.h"
+#include "triton-shared/Conversion/TritonToLinalgExperimental/HoistStaticAllocs.h"
 
 namespace mlir {
 namespace triton {
