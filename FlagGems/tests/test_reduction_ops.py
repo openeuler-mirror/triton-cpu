@@ -69,6 +69,10 @@ THRESHOLD_SHAPE = (
     else list(zip([0.3, 0.5, 0.7], REDUCTION_SHAPES))
 )
 CROSS_ENTROPY_LOSS_REDUCTION = ["mean"] if QUICK_MODE else ["mean", "none", "sum"]
+# Shapes dedicated to celoss_indices_kernel_1d branch coverage: odd C hits
+# the masked EVEN=False path; large C spans multiple BLOCK_C chunks and
+# exercises the online-softmax max/sum rescaling across loop iterations.
+CE_LOSS_1D_KERNEL_SHAPES = [(16, 1001)] if QUICK_MODE else [(128, 1001), (64, 32000)]
 
 
 @pytest.mark.amax
@@ -194,6 +198,69 @@ def test_accuracy_cross_entropy_loss_indices(
     (ref_in_grad,) = torch.autograd.grad(ref_out, ref_inp, ref_grad)
     (res_in_grad,) = torch.autograd.grad(res_out, inp, out_grad)
     gems_assert_close(res_in_grad, ref_in_grad, dtype, reduce_dim=shape[dim])
+
+
+@pytest.mark.cross_entropy_loss
+@pytest.mark.parametrize("shape", CE_LOSS_1D_KERNEL_SHAPES)
+@pytest.mark.parametrize("reduction", CROSS_ENTROPY_LOSS_REDUCTION)
+@pytest.mark.parametrize("weight", [True, False])
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+def test_accuracy_cross_entropy_loss_indices_1d_kernel(
+    shape, dtype, weight, reduction
+):
+    # celoss_indices_kernel_1d branch coverage: odd C (masked EVEN=False
+    # loads) and multi-chunk online softmax (C > BLOCK_C).
+    dim = 1
+    up_limit = shape[dim] - 1
+    target_shape = list(shape)
+    del target_shape[dim]
+
+    inp = torch.randn(shape, dtype=dtype, device=flag_gems.device, requires_grad=True)
+    target = torch.randint(0, up_limit, target_shape, device=flag_gems.device)
+    ref_inp = to_reference(inp, True)
+    ref_target = to_reference(target)
+
+    if weight:
+        wgt = torch.randn(shape[dim], dtype=dtype, device=flag_gems.device)
+        ref_wgt = to_reference(wgt, True)
+    else:
+        wgt = None
+        ref_wgt = None
+    ref_out = torch.nn.functional.cross_entropy(
+        ref_inp, ref_target, weight=ref_wgt, reduction=reduction
+    )
+    res_out = flag_gems.cross_entropy_loss(
+        inp, target, weight=wgt, reduction=reduction
+    )
+    gems_assert_close(res_out, ref_out, dtype, reduce_dim=shape[dim])
+
+    out_grad = torch.randn_like(res_out)
+    ref_grad = to_reference(out_grad, True)
+    (ref_in_grad,) = torch.autograd.grad(ref_out, ref_inp, ref_grad)
+    (res_in_grad,) = torch.autograd.grad(res_out, inp, out_grad)
+    gems_assert_close(res_in_grad, ref_in_grad, dtype, reduce_dim=shape[dim])
+
+
+@pytest.mark.cross_entropy_loss
+@pytest.mark.parametrize("C", [1001] if QUICK_MODE else [1001, 32000])
+@pytest.mark.parametrize("reduction", CROSS_ENTROPY_LOSS_REDUCTION)
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+def test_accuracy_cross_entropy_loss_indices_1d_input(C, dtype, reduction):
+    # 1D input [C] routes to celoss_indices_kernel_1d with N == 1.
+    inp = torch.randn(C, dtype=dtype, device=flag_gems.device, requires_grad=True)
+    target = torch.randint(0, C - 1, (), device=flag_gems.device)
+    ref_inp = to_reference(inp, True)
+    ref_target = to_reference(target)
+
+    ref_out = torch.nn.functional.cross_entropy(ref_inp, ref_target, reduction=reduction)
+    res_out = flag_gems.cross_entropy_loss(inp, target, reduction=reduction)
+    gems_assert_close(res_out, ref_out, dtype, reduce_dim=C)
+
+    out_grad = torch.randn_like(res_out)
+    ref_grad = to_reference(out_grad, True)
+    (ref_in_grad,) = torch.autograd.grad(ref_out, ref_inp, ref_grad)
+    (res_in_grad,) = torch.autograd.grad(res_out, inp, out_grad)
+    gems_assert_close(res_in_grad, ref_in_grad, dtype, reduce_dim=C)
 
 
 @pytest.mark.cross_entropy_loss
