@@ -130,12 +130,13 @@ def celoss_indices_kernel_1d(
 
 def _select_block_c(C):
     # Prefer an EVEN (unmasked) kernel: pick the largest power-of-two block
-    # (up to 2048) that divides C so that loads need no bounds mask (masked
-    # loads defeat pointer-analysis vectorization on the CPU backend).
-    for block in (2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2):
+    # (up to 128) that divides C so that loads need no bounds mask (masked
+    # loads defeat pointer-analysis vectorization on the CPU backend) and be in
+    # caches.
+    for block in (128, 64, 32, 16, 8, 4, 2):
         if C % block == 0:
             return block, True
-    return 256, False
+    return 128, False
 
 
 @libentry()
