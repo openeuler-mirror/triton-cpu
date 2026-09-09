@@ -102,6 +102,11 @@ naive_reduction:
   - 8
   block_n:
   - 128
+gated_activation:
+- META:
+    BLOCK_M: 4
+    BLOCK_N: 512
+  num_warps: 4
 min:
 - META:
     BLOCK_M: 8
