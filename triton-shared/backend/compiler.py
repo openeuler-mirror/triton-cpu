@@ -352,12 +352,33 @@ class CPUBackend(BaseBackend):
                     ["func.func"]
                 )
 
+                # linalg-drop-unit-dims requires linalg.generics
+                generalized = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                    "linalg-generalize-named-ops",
+                )
+                with InsertionPoint(transform.ApplyPatternsOp(generalized).patterns):
+                    structured.apply_patterns_linalg_fold_unit_extent_dims_via_slices()
+
+                cse = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    generalized.result,
+                    "cse",
+                )
+
+                can = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    cse.result,
+                    "canonicalize",
+                )
+
                 # EW fusion needs to happen BEFORE `linalg_erase_unnecessary_inputs` to avoid correctness issues. e.g.
                 # FlagGems/tests/test_reduction_ops.py::test_accuracy_cross_entropy_loss_indices[dtype0-True-mean-1--100-shape2]
                 # TODO: Follow-up https://github.com/llvm/llvm-project/issues/154290
                 fused = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
-                    funcs.result,
+                    can.result,
                     "linalg-fuse-elementwise-ops",
                 )
 
@@ -371,18 +392,35 @@ class CPUBackend(BaseBackend):
                 with InsertionPoint(transform.ApplyPatternsOp(specialized).patterns):
                     structured.apply_patterns_linalg_fold_add_into_dest()
 
-                # Flatten ew ops to 1D for more efficient tiling.
-                # TODO: requires LLVM change to support linalgs with broadcasted inputs
-                # e.g. FlagGems/tests/test_reduction_ops.py::test_accuracy_cross_entropy_loss_indices[dtype0-True-mean-1--100-shape2]
-                # linalgs = structured.MatchOp.__base__(
-                #     any_op,
-                #     fused,
-                #     interface=structured.MatchInterfaceEnum.LinalgOp,
-                # )
-                # structured.FlattenElementwiseLinalgOp(any_op, linalgs.result)
-                transform.ApplyRegisteredPassOp(
+                linalgs = structured.MatchOp.__base__(
+                    any_op,
+                    seq.bodyTarget,
+                    interface=structured.MatchInterfaceEnum.LinalgOp,
+                )
+                flattened = structured.FlattenElementwiseLinalgOp(any_op, linalgs.result)
+                # TODO: tile other 1D e.g. reductions
+                # TODO: Fix 
+                # TEST=python/test/unit/language/test_core.py::test_join
+                # TEST=python/test/unit/language/test_core.py::test_trans_2d[perm1-shape0-int8]
+                # TEST=python/test/unit/language/test_core.py::test_broadcast[int16]
+                tiled = structured.TileUsingForOp(
+                    flattened.result,
+                    sizes=[64],
+                )
+                for_op_type = transform.OperationType.get("scf.for")
+                castedLoop = transform.CastOp(for_op_type, tiled.results[-1])
+                loop.LoopPeelOp(for_op_type, for_op_type, castedLoop).results
+
+
+                cse = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
                     specialized.result,
+                    "cse",
+                )
+
+                transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    cse.result,
                     "canonicalize",
                 )
                 transform.YieldOp()
@@ -687,7 +725,6 @@ class CPUBackend(BaseBackend):
                     sequence.bodyTarget,
                     bufferize_function_boundaries=True,
                     allow_return_allocs_from_loops=True,
-                    copy_before_write=True,
                     memcpy_op="linalg.copy")
 
                 funcs = structured.MatchOp.match_op_names(
