@@ -22,6 +22,10 @@ from mlir.dialects.transform import structured, loop, vector, bufferization, ten
 
 ENABLE_FALLBACK = False
 
+def _enable_linalg_tiling_pipeline() -> bool:
+    """Return whether the experimental linalg tiling pipeline is enabled."""
+    return os.getenv("TRITON_SHARED_ENABLE_LINALG_TILING_PIPELINE", "0") == "1"
+
 def _armpl_is_available() -> bool:
     """Return True if ArmPL is available on this system."""
     try:
@@ -337,6 +341,7 @@ class CPUBackend(BaseBackend):
 
 
     def _sve_transform(self, src: str) -> str:
+        enable_linalg_tiling_pipeline = _enable_linalg_tiling_pipeline()
 
         def linalg_opts():
             """Apply linalg-level optimizations before tiling."""
@@ -352,33 +357,36 @@ class CPUBackend(BaseBackend):
                     ["func.func"]
                 )
 
-                # linalg-drop-unit-dims requires linalg.generics
-                generalized = transform.ApplyRegisteredPassOp(
-                    transform.AnyOpType.get(),
-                    funcs.result,
-                    "linalg-generalize-named-ops",
-                )
-                with InsertionPoint(transform.ApplyPatternsOp(generalized).patterns):
-                    structured.apply_patterns_linalg_fold_unit_extent_dims_via_slices()
+                fusion_target = funcs.result
+                if enable_linalg_tiling_pipeline:
+                    # linalg-drop-unit-dims requires linalg.generics
+                    generalized = transform.ApplyRegisteredPassOp(
+                        transform.AnyOpType.get(),
+                        funcs.result,
+                        "linalg-generalize-named-ops",
+                    )
+                    with InsertionPoint(transform.ApplyPatternsOp(generalized).patterns):
+                        structured.apply_patterns_linalg_fold_unit_extent_dims_via_slices()
 
-                cse = transform.ApplyRegisteredPassOp(
-                    transform.AnyOpType.get(),
-                    generalized.result,
-                    "cse",
-                )
+                    cse = transform.ApplyRegisteredPassOp(
+                        transform.AnyOpType.get(),
+                        generalized.result,
+                        "cse",
+                    )
 
-                can = transform.ApplyRegisteredPassOp(
-                    transform.AnyOpType.get(),
-                    cse.result,
-                    "canonicalize",
-                )
+                    can = transform.ApplyRegisteredPassOp(
+                        transform.AnyOpType.get(),
+                        cse.result,
+                        "canonicalize",
+                    )
+                    fusion_target = can.result
 
                 # EW fusion needs to happen BEFORE `linalg_erase_unnecessary_inputs` to avoid correctness issues. e.g.
                 # FlagGems/tests/test_reduction_ops.py::test_accuracy_cross_entropy_loss_indices[dtype0-True-mean-1--100-shape2]
                 # TODO: Follow-up https://github.com/llvm/llvm-project/issues/154290
                 fused = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
-                    can.result,
+                    fusion_target,
                     "linalg-fuse-elementwise-ops",
                 )
 
@@ -392,35 +400,34 @@ class CPUBackend(BaseBackend):
                 with InsertionPoint(transform.ApplyPatternsOp(specialized).patterns):
                     structured.apply_patterns_linalg_fold_add_into_dest()
 
-                linalgs = structured.MatchOp.__base__(
-                    any_op,
-                    seq.bodyTarget,
-                    interface=structured.MatchInterfaceEnum.LinalgOp,
-                )
-                flattened = structured.FlattenElementwiseLinalgOp(any_op, linalgs.result)
-                # TODO: tile other 1D e.g. reductions
-                # TODO: Fix 
-                # TEST=python/test/unit/language/test_core.py::test_join
-                # TEST=python/test/unit/language/test_core.py::test_trans_2d[perm1-shape0-int8]
-                # TEST=python/test/unit/language/test_core.py::test_broadcast[int16]
-                tiled = structured.TileUsingForOp(
-                    flattened.result,
-                    sizes=[64],
-                )
-                for_op_type = transform.OperationType.get("scf.for")
-                castedLoop = transform.CastOp(for_op_type, tiled.results[-1])
-                loop.LoopPeelOp(for_op_type, for_op_type, castedLoop).results
+                canonicalize_target = specialized.result
+                if enable_linalg_tiling_pipeline:
+                    linalgs = structured.MatchOp.__base__(
+                        any_op,
+                        seq.bodyTarget,
+                        interface=structured.MatchInterfaceEnum.LinalgOp,
+                    )
+                    flattened = structured.FlattenElementwiseLinalgOp(any_op, linalgs.result)
+                    # TODO: tile other 1D e.g. reductions
+                    tiled = structured.TileUsingForOp(
+                        flattened.result,
+                        sizes=[64],
+                    )
+                    for_op_type = transform.OperationType.get("scf.for")
+                    castedLoop = transform.CastOp(for_op_type, tiled.results[-1])
+                    loop.LoopPeelOp(for_op_type, for_op_type, castedLoop).results
 
 
-                cse = transform.ApplyRegisteredPassOp(
-                    transform.AnyOpType.get(),
-                    specialized.result,
-                    "cse",
-                )
+                    cse = transform.ApplyRegisteredPassOp(
+                        transform.AnyOpType.get(),
+                        specialized.result,
+                        "cse",
+                    )
+                    canonicalize_target = cse.result
 
                 transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
-                    cse.result,
+                    canonicalize_target,
                     "canonicalize",
                 )
                 transform.YieldOp()
@@ -725,6 +732,7 @@ class CPUBackend(BaseBackend):
                     sequence.bodyTarget,
                     bufferize_function_boundaries=True,
                     allow_return_allocs_from_loops=True,
+                    copy_before_write=not enable_linalg_tiling_pipeline,
                     memcpy_op="linalg.copy")
 
                 funcs = structured.MatchOp.match_op_names(
