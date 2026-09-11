@@ -28,8 +28,8 @@ def geglu_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_h = tl.program_id(1)
+    pid_h = tl.program_id(0)
+    pid_m = tl.program_id(1)
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
@@ -71,8 +71,8 @@ def dgeglu_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_h = tl.program_id(1)
+    pid_h = tl.program_id(0)
+    pid_m = tl.program_id(1)
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_h = pid_h * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
@@ -130,8 +130,8 @@ def geglu(input_tensor: torch.Tensor, quantizer: Optional[Any] = None) -> torch.
     output_2d = torch.empty(M, H, device=input_tensor.device, dtype=input_tensor.dtype)
 
     grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(H, META["BLOCK_SIZE_H"]),
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
     )
 
     geglu_kernel[grid](
@@ -143,8 +143,8 @@ def geglu(input_tensor: torch.Tensor, quantizer: Optional[Any] = None) -> torch.
         input_2d.stride(1),
         output_2d.stride(0),
         output_2d.stride(1),
-        BLOCK_SIZE_M=4,
-        BLOCK_SIZE_H=256,
+        BLOCK_SIZE_M=1,
+        BLOCK_SIZE_H=64,
     )
     # print("geglu")
     return output_2d.view(*shape[:-1], H)
@@ -164,8 +164,8 @@ def dgeglu(
     grad_in_2d = torch.empty_like(input_2d)
 
     grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(H, META["BLOCK_SIZE_H"]),
+        triton.cdiv(M, META["BLOCK_SIZE_M"]),
     )
 
     dgeglu_kernel[grid](
@@ -180,8 +180,8 @@ def dgeglu(
         input_2d.stride(1),
         grad_in_2d.stride(0),
         grad_in_2d.stride(1),
-        BLOCK_SIZE_M=4,
-        BLOCK_SIZE_H=256,
+        BLOCK_SIZE_M=1,
+        BLOCK_SIZE_H=64,
     )
     # print(dgeglu)
     return grad_in_2d.view_as(input_tensor)
