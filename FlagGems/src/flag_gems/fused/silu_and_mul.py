@@ -1,15 +1,24 @@
 import logging
+from dataclasses import replace
 
 import torch
 import triton
 import triton.language as tl
 
 from flag_gems.utils import pointwise_dynamic
+from flag_gems.utils.codegen_config_utils import get_codegen_config
 
 logger = logging.getLogger(__name__)
 
 
-@pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")])
+_SILU_AND_MUL_CONFIG = replace(
+    get_codegen_config(), contiguous_tiles_per_cta=True
+)
+
+
+@pointwise_dynamic(
+    promotion_methods=[(0, 1, "DEFAULT")], config=_SILU_AND_MUL_CONFIG
+)
 @triton.jit
 def silu_and_mul_kernel(x, y):
     x_fp32 = x.to(tl.float32)

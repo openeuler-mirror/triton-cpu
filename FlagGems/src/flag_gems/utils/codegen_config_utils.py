@@ -47,6 +47,7 @@ class CodeGenConfig:
 
     prefer_block_pointer: bool
     prefer_1d_tile: bool
+    contiguous_tiles_per_cta: bool = False
     # gen_configs: -> configs
     # prune_config: (as jit function, ) cofigs -> configs
 
