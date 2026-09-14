@@ -512,7 +512,10 @@ class KernelGenerator:
         code.writeline("num_ctas = tle.num_programs(0)")
         code.writeline("for j in range(0, tiles_per_cta):")
         with code.indent():
-            code.writeline("tile_id = pid + j * num_ctas")
+            if self.config.contiguous_tiles_per_cta:
+                code.writeline("tile_id = pid * tiles_per_cta + j")
+            else:
+                code.writeline("tile_id = pid + j * num_ctas")
             self.gen_body_one_tile_per_cta_with_bptr(code)
 
     def gen_body_one_tile_per_cta_without_bptr(self, code):
@@ -588,7 +591,10 @@ class KernelGenerator:
         code.writeline("num_ctas = tle.num_programs(0)")
         code.writeline("for j in range(0, tiles_per_cta):")
         with code.indent():
-            code.writeline("tile_id = pid + j * num_ctas")
+            if self.config.contiguous_tiles_per_cta:
+                code.writeline("tile_id = pid * tiles_per_cta + j")
+            else:
+                code.writeline("tile_id = pid + j * num_ctas")
             self.gen_body_one_tile_per_cta_without_bptr(code)
 
     def codegen_nd_tile_with_bptr(self, code):
@@ -707,7 +713,10 @@ class KernelGenerator:
         code.writeline("num_ctas = tle.num_programs(0)")
         code.writeline("for j in range(0, tiles_per_cta):")
         with code.indent():
-            code.writeline("tile_id = pid + j * num_ctas")
+            if self.config.contiguous_tiles_per_cta:
+                code.writeline("tile_id = pid * tiles_per_cta + j")
+            else:
+                code.writeline("tile_id = pid + j * num_ctas")
             self.gen_body_one_tile_per_cta_1d_tile(code)
 
     def codegen_1d_tile(self, code):
@@ -1292,6 +1301,7 @@ class PointwiseDynamicFunction:
             f"pointwise_dynamic_{self._scalar_fn_cache_key}_{kernel_name}_"
             f"{'1d_tile_' if self.config.prefer_1d_tile else ''}"
             f"{'bptr' if (not self.config.prefer_1d_tile and self.config.prefer_block_pointer) else ''}"
+            f"{'_contiguous_tiles' if self.config.contiguous_tiles_per_cta else ''}"
             ".py"
         )
 

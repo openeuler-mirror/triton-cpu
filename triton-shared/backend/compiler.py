@@ -178,6 +178,7 @@ class CPUOptions:
     enable_fp_fusion: bool = True
     max_num_imprecise_acc_default: int = 0
     enable_fast_math: bool = True
+    disable_machine_scheduler: bool = False
     sanitize_overflow: bool = True
     vec_lib: Optional[str] = 'libsleef'
 
@@ -259,6 +260,12 @@ class CPUBackend(BaseBackend):
     def parse_options(self, opts) -> Any:
         args = {'arch': self.target.arch}
         args.update({k: opts[k] for k in CPUOptions.__dataclass_fields__.keys() if k in opts})
+        # CI can trade machine scheduling quality for shorter compile time. Keep
+        # the choice in CPUOptions so scheduled and unscheduled objects never
+        # share a compilation-cache entry.
+        args['disable_machine_scheduler'] = (
+            os.environ.get("TRITON_SHARED_DISABLE_MACHINE_SCHEDULER", "0") == "1"
+        )
         return CPUOptions(**args)
 
     def get_codegen_implementation(self):
@@ -2189,7 +2196,7 @@ class CPUBackend(BaseBackend):
 
 
     @timer
-    def _llir_to_bin(self, llir: str, metadata):
+    def _llir_to_bin(self, llir: str, metadata, options):
         pattern = r"define void @(\w+)\(.+"
         matches = re.findall(pattern, llir)
         assert len(matches) != 0
@@ -2202,8 +2209,9 @@ class CPUBackend(BaseBackend):
             flags = self._llvm_target_flags()
             if flags:
                 flags += ("-disable-interleaved-load-combine=true",)
-                flags += ("-enable-misched=false",)
-                flags += ("-enable-post-misched=false",)
+                if options.disable_machine_scheduler:
+                    flags += ("-enable-misched=false",)
+                    flags += ("-enable-post-misched=false",)
 
             subprocess.check_call([llc_path, src_path, "-filetype=obj", "-O3", "-o", dst_path] + list(flags))
             ## dump binary
@@ -2217,7 +2225,7 @@ class CPUBackend(BaseBackend):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: self._optimize_ttsharedir(self._ttir_to_ttsharedir(src))
         stages["llir"] = lambda src, metadata: self._optimize_llir(self._ttsharedir_to_llir(src))
-        stages["obj"] = lambda src, metadata: self._llir_to_bin(src, metadata)
+        stages["obj"] = lambda src, metadata: self._llir_to_bin(src, metadata, options)
 
 
     @functools.lru_cache()
