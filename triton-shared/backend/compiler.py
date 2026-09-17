@@ -137,6 +137,31 @@ def _promote_buffers_to_stack(funcs):
     return promoted.result
 
 
+_FAST_MATH_ATTRS = (
+    '"unsafe-fp-math"="true" "no-nans-fp-math"="true" '
+    '"no-infs-fp-math"="true" "no-signed-zeros-fp-math"="true" '
+    '"approx-func-fp-math"="true"'
+)
+
+_KERNEL_ATTR_GROUP_RE = re.compile(r"^define\s+.*?@[\w.$]+\s*\(.*\)\s*#(\d+)\s*\{",
+                                   re.MULTILINE)
+
+
+def _add_fast_math_attrs(llir: str) -> str:
+    groups = set(_KERNEL_ATTR_GROUP_RE.findall(llir))
+    #FIXME: handle the case where a function define does not have an attribute
+    if not groups:
+        return llir
+
+    def patch(m):
+        if m.group(1) not in groups or "unsafe-fp-math" in m.group(2):
+            return m.group(0)
+        return f"attributes #{m.group(1)} = {{ {_FAST_MATH_ATTRS} {m.group(2)}"
+
+    return re.sub(r"^attributes #(\d+) = \{ (.*)$", patch, llir,
+                  flags=re.MULTILINE)
+
+
 def timer(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -177,7 +202,7 @@ class CPUOptions:
     allow_fp8e4b15: bool = True
     enable_fp_fusion: bool = True
     max_num_imprecise_acc_default: int = 0
-    enable_fast_math: bool = True
+    enable_fast_math: bool = False
     disable_machine_scheduler: bool = False
     sanitize_overflow: bool = True
     vec_lib: Optional[str] = 'libsleef'
@@ -265,6 +290,9 @@ class CPUBackend(BaseBackend):
         # share a compilation-cache entry.
         args['disable_machine_scheduler'] = (
             os.environ.get("TRITON_SHARED_DISABLE_MACHINE_SCHEDULER", "0") == "1"
+        )
+        args['enable_fast_math'] = (
+            os.environ.get("TRITON_SHARED_ENABLE_FASTMATH", "0") == "1"
         )
         return CPUOptions(**args)
 
@@ -2172,7 +2200,9 @@ class CPUBackend(BaseBackend):
 
 
     @timer
-    def _optimize_llir(self, llir: str):
+    def _optimize_llir(self, llir: str, options=None):
+        if options is not None and options.enable_fast_math:
+            llir = _add_fast_math_attrs(llir)
         with tempfile.TemporaryDirectory() as tmpdir:
             src_path = os.path.join(tmpdir, "kernel.ll")
             llir_path = os.path.join(tmpdir, "ll.ir")
@@ -2213,7 +2243,8 @@ class CPUBackend(BaseBackend):
                     flags += ("-enable-misched=false",)
                     flags += ("-enable-post-misched=false",)
 
-            subprocess.check_call([llc_path, src_path, "-filetype=obj", "-O3", "-o", dst_path] + list(flags))
+            fp_flags = ["-fp-contract=fast"] if options.enable_fast_math else []
+            subprocess.check_call([llc_path, src_path, "-filetype=obj", "-O3"] + fp_flags + ["-o", dst_path] + list(flags))
             ## dump binary
             _debug_dump_dir = os.getenv("TRITON_SHARED_DUMP_PATH", "")
             _dump_ir_if_needed(_debug_dump_dir, [dst_path])
@@ -2224,7 +2255,7 @@ class CPUBackend(BaseBackend):
     def add_stages(self, stages, options):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: self._optimize_ttsharedir(self._ttir_to_ttsharedir(src))
-        stages["llir"] = lambda src, metadata: self._optimize_llir(self._ttsharedir_to_llir(src))
+        stages["llir"] = lambda src, metadata: self._optimize_llir(self._ttsharedir_to_llir(src), options)
         stages["obj"] = lambda src, metadata: self._llir_to_bin(src, metadata, options)
 
 
