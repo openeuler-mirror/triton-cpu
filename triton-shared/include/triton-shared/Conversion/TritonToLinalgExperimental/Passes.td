@@ -43,4 +43,25 @@ def HoistStaticAllocs : Pass</*cli-arg*/"hoist-static-allocs", /*Op*/"mlir::Modu
   let constructor = "triton::createHoistStaticAllocsPass()";
 }
 
+def TritonAnnotateNontemporalArgs : Pass</*cli-arg*/"triton-annotate-nontemporal-args", /*Op*/"mlir::ModuleOp"> {
+  let summary = "record, per tt.func, the pointer arguments accessed only through evict_first loads / stores";
+  let description = [{
+    Sets `tts.nontemporal_load_args` and `tts.nontemporal_store_args`
+    (ordinals among the function's pointer arguments) plus
+    `tts.ptr_arg_count` on every tt.func that has a pointer argument whose
+    tt.load ops or tt.store ops all carry evictionPolicy = evict_first.
+  }];
+  let constructor = "triton::createTritonAnnotateNontemporalArgsPass()";
+}
+
+def MarkNontemporalLoads : Pass</*cli-arg*/"mark-nontemporal-loads", /*Op*/"mlir::ModuleOp"> {
+  let summary = "set nontemporal on llvm.load / llvm.store ops whose address derives from an annotated argument";
+  let description = [{
+    For every llvm.func carrying `tts.nontemporal_load_args` and/or
+    `tts.nontemporal_store_args`, follows each llvm.load's / llvm.store's
+    address and sets `nontemporal` when every path ends at one of the pointer parameters listed for that access kind.
+  }];
+  let constructor = "triton::createMarkNontemporalLoadsPass()";
+}
+
 #endif

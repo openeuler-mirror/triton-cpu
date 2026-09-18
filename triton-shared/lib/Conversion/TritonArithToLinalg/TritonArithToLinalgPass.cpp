@@ -222,6 +222,9 @@ public:
         auto funcFunc = builder.create<func::FuncOp>(func.getLoc(), name, type);
         funcFunc.setAllArgAttrs(argAttrs);
         funcFunc.setAllResultAttrs(resAttrs);
+        for (NamedAttribute attr : func->getDiscardableAttrs())
+          if (attr.getName().strref().contains('.'))
+            funcFunc->setAttr(attr.getName(), attr.getValue());
 
         auto &funcFuncBody = funcFunc.getBody();
         auto &funcBody = func.getBody();

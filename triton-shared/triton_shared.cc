@@ -426,6 +426,8 @@ void init_to_llvm(py::module &&m) {
   // Runs on the LLVM-dialect module, so it belongs to this stage.
   ADD_PASS_WRAPPER_0("add_hoist_static_allocs",
                      mlir::triton::createHoistStaticAllocsPass);
+  ADD_PASS_WRAPPER_0("add_mark_nontemporal_loads",
+                     mlir::triton::createMarkNontemporalLoadsPass);
 
   ADD_PASS_WRAPPER_0("add_convert_linalg_to_affine_loops",
                      createConvertLinalgToAffineLoopsPass);
