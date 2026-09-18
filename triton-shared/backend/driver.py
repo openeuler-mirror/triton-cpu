@@ -164,6 +164,8 @@ typedef struct _DevicePtrInfo {{
   bool valid;
 }} DevicePtrInfo;
 
+static PyObject *g_data_ptr_name = NULL;
+
 static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {{
   DevicePtrInfo ptr_info;
   ptr_info.dev_ptr = 0;
@@ -176,24 +178,32 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {{
     // valid nullptr
     return ptr_info;
   }}
-  PyObject *ptr = PyObject_GetAttrString(obj, "data_ptr");
-  if(ptr){{
-    PyObject *empty_tuple = PyTuple_New(0);
-    PyObject *ret = PyObject_Call(ptr, empty_tuple, NULL);
-    Py_DECREF(empty_tuple);
-    Py_DECREF(ptr);
-    if (!PyLong_Check(ret)) {{
-      PyErr_SetString(PyExc_TypeError, "data_ptr method of Pointer object must return 64-bit int");
+  // Instead of using GetAttrString() to generate a new string each time, use PyUnicode_InternFormString()
+  // to only allocate once for the string
+  if (g_data_ptr_name == NULL) {{
+    g_data_ptr_name = PyUnicode_InternFromString("data_ptr");
+    if (g_data_ptr_name == NULL) {{
       ptr_info.valid = false;
       return ptr_info;
     }}
-    ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(ret));
-    if(!ptr_info.dev_ptr)
-      return ptr_info;
-    Py_DECREF(ret);  // Thanks ChatGPT!
+  }}
+  PyObject *self_arg[1] = {{ obj }};
+  PyObject *ret = PyObject_VectorcallMethod(g_data_ptr_name, self_arg,
+                                            1 | PY_VECTORCALL_ARGUMENTS_OFFSET, NULL);
+  if (ret == NULL) {{
+    PyErr_Clear();
+    PyErr_SetString(PyExc_TypeError, "Pointer argument must be either uint64 or have data_ptr method");
+    ptr_info.valid = false;
     return ptr_info;
   }}
-  PyErr_SetString(PyExc_TypeError, "Pointer argument must be either uint64 or have data_ptr method");
+  if (!PyLong_Check(ret)) {{
+    Py_DECREF(ret);
+    PyErr_SetString(PyExc_TypeError, "data_ptr method of Pointer object must return 64-bit int");
+    ptr_info.valid = false;
+    return ptr_info;
+  }}
+  ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(ret));
+  Py_DECREF(ret);
   return ptr_info;
 }}
 
@@ -308,6 +318,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
     # kernel_obj (cu_function) and kernel_name are fixed for a given compiled kernel,
     # so src and therefore the key never change across calls to this closure.
     _cached_key = [None]
+    _cached_fn = [None]     # the loaded module's launch(), once resolved
 
     def launch(
         gridX, gridY, gridZ, stream, cu_function,
@@ -317,15 +328,23 @@ def compile_module(launcher_src, kernel_placeholder_name):
         # Let's compile one kernel every time.
         # The cu_function parameter actually contains our kernel obj.
         # See CPUUtils.load_binary method.
+        # Fast path: the C entry point resolved on an earlier call.  Bound
+        # directly, so a launch is one closure-cell read and one call -- no
+        # metadata indexing, no key check, no dict lookup.
+        fn = _cached_fn[0]
+        if fn is not None:
+            return fn(gridX, gridY, gridZ, kernel_metadata, launch_metadata,
+                      launch_enter_hook, launch_exit_hook, *args)
+
         kernel_obj = cu_function
         kernel_name = kernel_metadata[6] # see pack_metadata in compiler.py
 
-        # Fast path: key and .so are both cached — skip MD5, src build, and all filesystem work.
         if _cached_key[0] is not None and _cached_key[0] in _LAUNCHER_MODULE_CACHE:
-            return _LAUNCHER_MODULE_CACHE[_cached_key[0]](gridX, gridY, gridZ,
-                                                          kernel_metadata, launch_metadata,
-                                                          launch_enter_hook, launch_exit_hook,
-                                                          *args)
+            _cached_fn[0] = _LAUNCHER_MODULE_CACHE[_cached_key[0]]
+            return _cached_fn[0](gridX, gridY, gridZ,
+                                 kernel_metadata, launch_metadata,
+                                 launch_enter_hook, launch_exit_hook,
+                                 *args)
 
         src = launcher_src.replace(kernel_placeholder_name, kernel_name)
         key = hashlib.md5(src.encode("utf-8") + kernel_obj).hexdigest()
@@ -334,10 +353,11 @@ def compile_module(launcher_src, kernel_placeholder_name):
         # Second fast path: module already loaded (e.g. from a prior process run that
         # populated _LAUNCHER_MODULE_CACHE) but _cached_key was not yet set.
         if key in _LAUNCHER_MODULE_CACHE:
-            return _LAUNCHER_MODULE_CACHE[key](gridX, gridY, gridZ,
-                                               kernel_metadata, launch_metadata,
-                                               launch_enter_hook, launch_exit_hook,
-                                               *args)
+            _cached_fn[0] = _LAUNCHER_MODULE_CACHE[key]
+            return _cached_fn[0](gridX, gridY, gridZ,
+                                 kernel_metadata, launch_metadata,
+                                 launch_enter_hook, launch_exit_hook,
+                                 *args)
 
         cache = get_cache_manager(key)
         name = "__triton_shared_ref_cpu_kernel_launcher"
@@ -391,6 +411,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         _LAUNCHER_MODULE_CACHE[key] = mod.launch
+        _cached_fn[0] = mod.launch
         return mod.launch(gridX, gridY, gridZ,
                           kernel_metadata, launch_metadata,
                           launch_enter_hook, launch_exit_hook,
@@ -423,6 +444,7 @@ class CPULauncher(object):
         # values that jit.py sends, and must not be inserted again.
         constexpr_indices = set(getattr(src.fn, 'constexpr_indices', []))
         self.constants = {k: v for k, v in constants.items() if k in constexpr_indices}
+        self._constant_inserts = tuple(sorted(self.constants.items()))
         # Later KERNEL_NAME_PLACEHOLDER will be used to assign the kernel name
         # in the following launch function.
         self.launch = compile_module(launcher_src, kernel_placeholder_name)
@@ -434,10 +456,11 @@ class CPULauncher(object):
         ## original index (processing in ascending order so earlier inserts shift
         ## later positions correctly), matching the sorted signature order that
         ## _generate_launcher's PyArg_ParseTuple format expects.
-        args = list(args)
-        offset = 9  ## skips first 9 preamble args
-        for idx, val in sorted(self.constants.items()):
-            args.insert(idx + offset, val)
+        inserts = self._constant_inserts
+        if inserts:
+            args = list(args)
+            for idx, val in inserts:
+                args.insert(idx + 9, val)   ## 9 = the preamble args
         self.launch(*args, **kwargs)
 
 
