@@ -31,8 +31,14 @@ def _repetition_penalty_kernel(
 
     penalty = tl.load(penalties_ptr + seq_idx)
 
-    out = tl.where(is_repeated & (logits > 0), logits / penalty, logits)
-    out = tl.where(is_repeated & (logits <= 0), logits * penalty, out)
+    # Bit-exact rewrite of the two-predicate form: the second predicate of the
+    # original is the complement of the first one (`logits <= 0` vs
+    # `logits > 0`, and both are false for NaN), so one comparison plus a
+    # nested select yields identical values while saving a compare, an and and
+    # a select per element.
+    out = tl.where(
+        is_repeated, tl.where(logits > 0, logits / penalty, logits * penalty), logits
+    )
 
     tl.store(logits_ptr + idx, out, mask=valid_vocab)
 
