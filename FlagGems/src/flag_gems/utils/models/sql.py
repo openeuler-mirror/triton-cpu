@@ -1,3 +1,5 @@
+import functools
+import time
 from itertools import chain
 from typing import (
     Any,
@@ -13,6 +15,8 @@ from typing import (
 )
 
 import sqlalchemy
+import sqlalchemy.event
+import sqlalchemy.exc
 import sqlalchemy.ext.automap
 import sqlalchemy.orm
 import triton
@@ -20,6 +24,45 @@ from typing_extensions import override
 
 from .model import PersistantModel
 from .session import RollbackSession
+
+# When parallel processes access the shared SQLite file at the same time,
+# lock conflicts or file damage errors may occur.
+# (disk I/O error / database disk image is malformed / readonly / no such table).
+# Use WAL + busy_timeout + retry to mitigate multi-process concurrency.
+DB_RETRY_ATTEMPTS = 5
+
+
+def _set_sqlite_pragma(dbapi_connection, connection_record):
+    """
+    After the connection is established, set WAL and busy_timeout
+    to improve the security of multi-process concurrency.
+    """
+    try:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
+    except Exception:
+        # Ignored when the SQLite backend is not used or the connection is not supported.
+        pass
+
+
+def _retry_on_db_locked(fn):
+    """Perform a limited number of retries for SQLite concurrent locks/IO errors"""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        for attempt in range(DB_RETRY_ATTEMPTS):
+            try:
+                return fn(self, *args, **kwargs)
+            except sqlalchemy.exc.OperationalError as e:
+                if attempt == DB_RETRY_ATTEMPTS - 1:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+        return None
+
+    return wrapper
 
 
 class Base(sqlalchemy.orm.DeclarativeBase):
@@ -29,7 +72,12 @@ class Base(sqlalchemy.orm.DeclarativeBase):
 class SQLPersistantModel(PersistantModel):
     def __init__(self, db_url: str, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.engine: Final[sqlalchemy.engine.Engine] = sqlalchemy.create_engine(db_url)
+        self.engine: Final[sqlalchemy.engine.Engine] = sqlalchemy.create_engine(
+            db_url,
+            connect_args={"timeout": 30, "check_same_thread": False},
+        )
+        if self.engine.dialect.name == "sqlite":
+            sqlalchemy.event.listen(self.engine, "connect", _set_sqlite_pragma)
         self.sql_model_pool: Dict[str, Type[Base]] = {}
 
     @staticmethod
@@ -84,6 +132,7 @@ class SQLPersistantModel(PersistantModel):
             if isinstance(v, (int, float, str))
         }
 
+    @_retry_on_db_locked
     def get_sql_model(
         self,
         name: str,
@@ -111,6 +160,7 @@ class SQLPersistantModel(PersistantModel):
             return ModelCls
 
     @override
+    @_retry_on_db_locked
     def get_config(
         self, name: str, keys: Sequence[Union[bool, int, float, str]]
     ) -> Optional[triton.Config]:
@@ -141,6 +191,7 @@ class SQLPersistantModel(PersistantModel):
             return triton.Config(kwargs, **config_dict)
 
     @override
+    @_retry_on_db_locked
     def get_benchmark(
         self,
         name: str,
@@ -166,6 +217,7 @@ class SQLPersistantModel(PersistantModel):
             p80: float = obj.p80
             return (p50, p20, p80)
 
+    @_retry_on_db_locked
     def put_config(
         self,
         name: str,
@@ -190,6 +242,7 @@ class SQLPersistantModel(PersistantModel):
                 session.merge(obj)
                 session.commit()
 
+    @_retry_on_db_locked
     def put_benchmark(
         self,
         name: str,
