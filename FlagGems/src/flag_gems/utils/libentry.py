@@ -412,7 +412,8 @@ class LibTuner(triton.runtime.Autotuner):
         # so please make sure the orders of `arg_names` and `args` match.
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
-        if len(self.configs) > 1:
+        enable_autotuning = os.getenv("TRITON_ENABLE_AUTOTUNING", "1") != "0"
+        if len(self.configs) > 1 and enable_autotuning:
             all_args = {**self.nargs, **kwargs}
             _args = {k: v for k, v in all_args.items() if k in self.arg_names}
             key = self.get_key(_args)
