@@ -56,10 +56,11 @@ DIM_SHAPE_STRIDES = (
 REGULAR_DIM_SHAPE_STRIDES = (
     [(1, *CONTIGUOUS_SHAPE_STRIDES_2D[1])]
     if QUICK_MODE
-    else list(
-        (random.randint(0, len(shape) - 1), shape, stride)
-        for shape, stride in CONTIGUOUS_SHAPE_STRIDES_2D
-    )
+    else [
+      (dim, shape, stride)
+      for shape, stride in CONTIGUOUS_SHAPE_STRIDES_2D
+      for dim in range(len(shape))
+    ]
 )
 IRREGULAR_DIM_SHAPE_STRIDES = [(3, *IRREGULAR_SHAPE_STRIDES)]
 
