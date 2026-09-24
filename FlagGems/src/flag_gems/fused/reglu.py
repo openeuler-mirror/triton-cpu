@@ -140,6 +140,15 @@ def reglu(input_tensor: torch.Tensor, quantizer: Optional[Any] = None) -> torch.
     return output_2d.view(output_shape)
 
 
+_out_buf = None  # (shape, dtype, device), tensor
+def _output_for(like: torch.Tensor) -> torch.Tensor:
+    global _out_buf
+    key = (like.shape, like.dtype, like.device)
+    if _out_buf is None or _out_buf[0] != key:
+        _out_buf = (key, torch.empty_like(like))
+    return _out_buf[1]
+
+
 def dreglu(
     grad_output: torch.Tensor,
     input_tensor: torch.Tensor,
@@ -154,7 +163,7 @@ def dreglu(
     N = grad_output.shape[-1]
     grad_output_2d = grad_output.contiguous().view(M, N)
     input_2d = input_tensor.contiguous().view(M, 2 * N)
-    grad_input = torch.empty_like(input_2d)
+    grad_input = _output_for(input_2d)
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]),
         triton.cdiv(N, META["BLOCK_N"]),
