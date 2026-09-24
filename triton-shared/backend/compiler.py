@@ -352,10 +352,10 @@ class CPUBackend(BaseBackend):
             triton_shared_opt_path = _get_triton_shared_opt_path()
             try:
                 if _armpl_is_available():
-                    cmd = [triton_shared_opt_path, src_path,
+                    cmd = [triton_shared_opt_path, src_path, "--triton-annotate-nontemporal-args",
                            "--triton-to-linalg-experimental=enable-armpl=true"]
                 else:
-                    cmd = [triton_shared_opt_path, src_path,
+                    cmd = [triton_shared_opt_path, src_path, "--triton-annotate-nontemporal-args",
                            "--triton-to-linalg-experimental"]
                 # If mlir dump is enabled, pass option --mlir-print-ir-after-all to triton-shared
                 if os.environ.get("MLIR_ENABLE_DUMP", "0") == "1":
@@ -2112,6 +2112,7 @@ class CPUBackend(BaseBackend):
                     triton_shared.to_llir.add_convert_vector_to_llvm(
                         pm3, reassociate_fp_reductions=True)
                     triton_shared.to_llir.add_convert_to_llvm(pm3)
+                    triton_shared.to_llir.add_mark_nontemporal_loads(pm3)
                     triton_shared.to_llir.add_promote_i1_to_i8(pm3)
                     pm3.run(mod)
                     Path(os.path.join(kernel_debug_dir, "03_after_convert_to_llvm.mlir")).write_text(str(mod))
@@ -2138,6 +2139,7 @@ class CPUBackend(BaseBackend):
                     triton_shared.to_llir.add_convert_vector_to_llvm(
                         pm, reassociate_fp_reductions=True)
                     triton_shared.to_llir.add_convert_to_llvm(pm)
+                    triton_shared.to_llir.add_mark_nontemporal_loads(pm)
                     triton_shared.to_llir.add_promote_i1_to_i8(pm)
                     triton_shared.to_llir.add_canonicalizer(pm)
                     triton_shared.to_llir.add_strip_debug_info(pm)
@@ -2154,6 +2156,7 @@ class CPUBackend(BaseBackend):
                 triton_shared.to_llir.add_convert_vector_to_llvm(
                     pm, reassociate_fp_reductions=True)
                 triton_shared.to_llir.add_convert_to_llvm(pm)
+                triton_shared.to_llir.add_mark_nontemporal_loads(pm)
                 triton_shared.to_llir.add_promote_i1_to_i8(pm)
                 triton_shared.to_llir.add_strip_debug_info(pm)
 

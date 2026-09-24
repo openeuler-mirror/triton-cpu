@@ -13,6 +13,7 @@
 #include "triton-shared/Conversion/TritonToLinalgExperimental/TritonToPtr.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/CollapseShape.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/HoistStaticAllocs.h"
+#include "triton-shared/Conversion/TritonToLinalgExperimental/NontemporalLoads.h"
 
 namespace mlir {
 namespace triton {

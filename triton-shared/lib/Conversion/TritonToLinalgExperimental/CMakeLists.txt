@@ -11,6 +11,7 @@ add_triton_library(TritonToLinalgExperimental
   CollapseShape.cpp
   FullTileRegionVersioning.cpp
   HoistStaticAllocs.cpp
+  NontemporalLoads.cpp
 
   DEPENDS
   TritonToLinalgExperimentalConversionPassIncGen
@@ -20,6 +21,9 @@ add_triton_library(TritonToLinalgExperimental
   MLIRArithDialect
   MLIRDialectUtils
   MLIRIR
+  MLIRLLVMDialect
+  MLIRSCFDialect
+  MLIRControlFlowInterfaces
   MLIRMathDialect
   MLIRPass
   MLIRTensorDialect
