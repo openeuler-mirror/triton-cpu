@@ -14,6 +14,7 @@
 #include "triton-shared/Conversion/TritonToLinalgExperimental/CollapseShape.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/HoistStaticAllocs.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/NontemporalLoads.h"
+#include "triton-shared/Conversion/TritonToLinalgExperimental/DoubleBufferLoopAllocations.h"
 
 namespace mlir {
 namespace triton {

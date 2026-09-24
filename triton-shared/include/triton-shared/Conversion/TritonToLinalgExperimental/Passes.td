@@ -64,4 +64,9 @@ def MarkNontemporalLoads : Pass</*cli-arg*/"mark-nontemporal-loads", /*Op*/"mlir
   let constructor = "triton::createMarkNontemporalLoadsPass()";
 }
 
+def DoubleBufferLoopAllocations : Pass<"double-buffer-loop-allocations", "mlir::ModuleOp"> {
+  let summary = "hoist small allocations from reusable loops into two buffers";
+  let constructor = "triton::createDoubleBufferLoopAllocationsPass()";
+}
+
 #endif

@@ -756,6 +756,7 @@ class CPUBackend(BaseBackend):
                 arg_attrs = [{"transform.consumed": UnitAttr.get()}],
             )
             with InsertionPoint(sequence.body):
+                any_op = transform.AnyOpType.get()
                 matched = structured.MatchOp.match_op_names(
                     sequence.bodyTarget,
                     ["tensor.empty"]
@@ -770,16 +771,22 @@ class CPUBackend(BaseBackend):
                     copy_before_write=not enable_linalg_tiling_pipeline,
                     memcpy_op="linalg.copy")
 
+                double_buffered = transform.ApplyRegisteredPassOp(
+                    any_op,
+                    oneshot.result,
+                    "double-buffer-loop-allocations",
+                )
+
                 funcs = structured.MatchOp.match_op_names(
                     transform.AnyOpType.get(),
-                    oneshot.result,
+                    double_buffered.result,
                     ["func.func"],
                 )
                 _promote_buffers_to_stack(funcs.result)
 
                 dealloc = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
-                    oneshot.result,
+                    double_buffered.result,
                     "buffer-deallocation-pipeline"
                 )
                 memref = transform.ApplyRegisteredPassOp(
