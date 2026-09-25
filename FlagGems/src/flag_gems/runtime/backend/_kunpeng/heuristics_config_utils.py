@@ -353,7 +353,62 @@ def mean_heur_one_tile_per_cta(args):
     return args["TILE_N"] >= args["N"]
 
 
+# --- Paged varlen flash-attention (CPU) tiling ---------------------------------
+# These override the default (nvidia) mha_block_* configs for the Kunpeng CPU
+# backend.  triton-cpu scalarizes the paged-KV gather, so a wide BLOCK_N is
+# memory/issue-bound; BLOCK_N is capped at 32.  BLOCK_M is capped at the actual
+# (possibly group-swapped) query length so the kernel never runs softmax/PV over
+# padded rows -- for a group-swapped GQA decode seqlen_q collapses to q_groups.
+_MHA_SEQLEN_Q_IDX = [None]
+
+
+def _mha_block_n(args):
+    return 32
+
+
+def _mha_block_m(base):
+    def block_m(args):
+        idx = _MHA_SEQLEN_Q_IDX[0]
+        if idx is None:
+            # Resolve the slot position lazily to avoid an import cycle at load.
+            from flag_gems.ops.flash_api import fwd_params
+
+            idx = fwd_params.__slots__.index("seqlen_q")
+            _MHA_SEQLEN_Q_IDX[0] = idx
+        return min(base, triton.next_power_of_2(int(args[idx])))
+
+    return block_m
+
+
+def _mha_const(value):
+    return lambda args: value
+
+
 HEURISTICS_CONFIGS = {
+    "mha_block_128": {
+        "BLOCK_M": _mha_block_m(128),
+        "BLOCK_N": _mha_block_n,
+        "num_warps": _mha_const(4),
+        "num_stages": _mha_const(3),
+    },
+    "mha_block_64": {
+        "BLOCK_M": _mha_block_m(64),
+        "BLOCK_N": _mha_block_n,
+        "num_warps": _mha_const(4),
+        "num_stages": _mha_const(3),
+    },
+    "mha_block_32": {
+        "BLOCK_M": _mha_block_m(32),
+        "BLOCK_N": _mha_block_n,
+        "num_warps": _mha_const(4),
+        "num_stages": _mha_const(3),
+    },
+    "mha_block_16": {
+        "BLOCK_M": _mha_block_m(16),
+        "BLOCK_N": _mha_block_n,
+        "num_warps": _mha_const(4),
+        "num_stages": _mha_const(3),
+    },
     "argmax": {
         "BLOCK_M": argmax_heur_block_m,
         "BLOCK_N": argmax_heur_block_n,
