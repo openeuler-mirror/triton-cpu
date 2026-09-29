@@ -64,6 +64,54 @@ def gelu_none_and_mul_contiguous_kernel(
             else:
                 tl.store(output_ptr + offsets, output, mask=mask)
 
+@triton.jit
+def gelu_tanh_and_mul_contiguous_kernel(
+    x_ptr,
+    y_ptr,
+    output_ptr,
+    n_elements,
+    tiles_per_program,
+    chunks_per_tile,
+    BLOCK_SIZE: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    FULL_TILES: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    sqrt_2_over_pi: tl.constexpr = 0.7978845608028654
+    gelu_coeff: tl.constexpr = 0.044715
+
+    for tile_offset in tl.range(0, tiles_per_program, loop_unroll_factor = 1):
+        tile_id = pid * tiles_per_program + tile_offset
+        tile_base = tile_id.to(tl.int64) * BLOCK_SIZE
+
+        for chunk_id in tl.range(0, chunks_per_tile, loop_unroll_factor=1):
+            offsets = tile_base + chunk_id.to(tl.int64) * CHUNK_SIZE + tl.arange(0, CHUNK_SIZE)
+
+            if FULL_TILES:
+                x = tl.load(x_ptr + offsets)
+                y = tl.load(y_ptr + offsets)
+            else:
+                mask = offsets < n_elements
+                x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+                y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+
+            x_fp32 = x.to(tl.float32)
+            x2 = x_fp32 * x_fp32
+            x3 = x_fp32 * x2
+
+            tanh_arg = sqrt_2_over_pi * (x_fp32 + gelu_coeff * x3)
+            tanh_x = tanh(tanh_arg)
+
+            gelu_x = 0.5 * x_fp32 * (1.0 + tanh_x)
+            output = gelu_x * y
+
+            if FULL_TILES:
+                tl.store(output_ptr + offsets, output)
+            else:
+                tl.store(output_ptr + offsets, output, mask=mask)
+
+
 @pointwise_dynamic(
     promotion_methods=[(0, 1, "DEFAULT")],
     config = _GELU_AND_MUL_CONFIG,
@@ -160,7 +208,7 @@ def _can_use_contiguous_kernel(x, y):
         and y.is_contiguous()
     )
 
-def _contiguous_forward(x, y):
+def _contiguous_forward(x, y, approximate):
     output = torch.empty_like(x)
     n_elements = x.numel()
 
@@ -181,17 +229,30 @@ def _contiguous_forward(x, y):
 
     grid = (grid_size,)
 
-    gelu_none_and_mul_contiguous_kernel[grid](
-        x,
-        y,
-        output,
-        n_elements,
-        tiles_per_program,
-        chunks_per_tile,
-        BLOCK_SIZE = block_size,
-        CHUNK_SIZE = chunk_size,
-        FULL_TILES = full_tiles,
-    )
+    if approximate == "none":
+        gelu_none_and_mul_contiguous_kernel[grid](
+            x,
+            y,
+            output,
+            n_elements,
+            tiles_per_program,
+            chunks_per_tile,
+            BLOCK_SIZE = block_size,
+            CHUNK_SIZE = chunk_size,
+            FULL_TILES = full_tiles,
+        )
+    else:
+        gelu_tanh_and_mul_contiguous_kernel[grid](
+            x,
+            y,
+            output,
+            n_elements,
+            tiles_per_program,
+            chunks_per_tile,
+            BLOCK_SIZE = block_size,
+            CHUNK_SIZE = chunk_size,
+            FULL_TILES = full_tiles,
+        )
 
     return output
 
@@ -205,12 +266,12 @@ class GeluAndMul(torch.autograd.Function):
         if approximate not in ("none", "tanh"):
             raise ValueError(f"Invalid approximate value: {approximate}")
 
-        if approximate == "tanh":
-            return gelu_tanh_and_mul_kernel(x, y)
-        elif _can_use_contiguous_kernel(x, y):
-            return _contiguous_forward(x, y)
+        if _can_use_contiguous_kernel(x, y):
+            return _contiguous_forward(x, y, approximate)
         elif approximate == "none":
             return gelu_none_and_mul_kernel(x, y)
+        else:
+            return gelu_tanh_and_mul_kernel(x, y)
 
     @staticmethod
     def backward(ctx, dgrad):
