@@ -204,6 +204,9 @@ class CPUOptions:
     max_num_imprecise_acc_default: int = 0
     enable_fast_math: bool = False
     disable_machine_scheduler: bool = False
+    # Keep tl.dot on the linalg (SME/SVE) matmul lowering instead of turning
+    # it into ArmPL BLAS calls.
+    disable_armpl: bool = False
     sanitize_overflow: bool = True
     vec_lib: Optional[str] = 'libsleef'
 
@@ -294,6 +297,9 @@ class CPUBackend(BaseBackend):
         args['enable_fast_math'] = (
             os.environ.get("TRITON_SHARED_ENABLE_FASTMATH", "0") == "1"
         )
+        args['disable_armpl'] = (
+            os.environ.get("TRITON_SHARED_DISABLE_ARMPL", "0") == "1"
+        )
         return CPUOptions(**args)
 
     def get_codegen_implementation(self):
@@ -340,7 +346,7 @@ class CPUBackend(BaseBackend):
         return mod
 
     @timer
-    def _ttir_to_ttsharedir(self, mod):
+    def _ttir_to_ttsharedir(self, mod, options):
         # Get Triton-MLIR as string
         ttir_code = str(mod)
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -351,7 +357,7 @@ class CPUBackend(BaseBackend):
             _dump_ir_if_needed(kernel_debug_dir, [src_path])
             triton_shared_opt_path = _get_triton_shared_opt_path()
             try:
-                if _armpl_is_available():
+                if not options.disable_armpl and _armpl_is_available():
                     cmd = [triton_shared_opt_path, src_path, "--triton-annotate-nontemporal-args",
                            "--triton-to-linalg-experimental=enable-armpl=true"]
                 else:
@@ -2257,7 +2263,7 @@ class CPUBackend(BaseBackend):
 
     def add_stages(self, stages, options):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
-        stages["ttsharedir"] = lambda src, metadata: self._optimize_ttsharedir(self._ttir_to_ttsharedir(src))
+        stages["ttsharedir"] = lambda src, metadata: self._optimize_ttsharedir(self._ttir_to_ttsharedir(src, options))
         stages["llir"] = lambda src, metadata: self._optimize_llir(self._ttsharedir_to_llir(src), options)
         stages["obj"] = lambda src, metadata: self._llir_to_bin(src, metadata, options)
 
