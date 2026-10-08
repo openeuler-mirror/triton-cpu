@@ -61,6 +61,36 @@ def skip_layer_norm_kernel(
 
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
+def skip_layer_norm_cpu_kernel(
+    Y,
+    X,
+    R,
+    W,
+    B,
+    eps,
+    N: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Forward makes all operands contiguous, so column strides are always one.
+    pid = tle.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    offsets = pid * N + cols
+    mask = cols < N
+    x = tl.load(X + offsets, mask=mask, other=0.0).to(tl.float32)
+    residual = tl.load(R + offsets, mask=mask, other=0.0).to(tl.float32)
+    x += residual
+    mean = tl.sum(x, axis=0) / N
+    centered = tl.where(mask, x - mean, 0.0)
+    var = tl.sum(centered * centered, axis=0) / N
+    rstd = 1 / tl.sqrt(var + eps)
+    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(B + cols, mask=mask, other=0.0).to(tl.float32)
+    y = w * centered * rstd + b
+    tl.store(Y + offsets, y.to(Y.dtype.element_ty), mask=mask)
+
+
+@libentry()
+@triton.jit(do_not_specialize=["eps"])
 def skip_layer_norm_loop_kernel(
     Y,  # pointer to the output
     X,  # pointer to the input
@@ -143,7 +173,20 @@ class SkipLayerNorm(torch.autograd.Function):
         y = torch.empty_like(x)
 
         with torch_device_fn.device(x.device):
-            if N < 4096:
+            # Keep the static CPU row below the register-pressure cliff. Wider
+            # rows retain the existing persistent/loop kernels.
+            if x.device.type == "cpu" and N <= 1024:
+                skip_layer_norm_cpu_kernel[M,](
+                    y,
+                    x,
+                    residual,
+                    weight,
+                    bias,
+                    eps,
+                    N=N,
+                    BLOCK_SIZE=triton.next_power_of_2(N),
+                )
+            elif N < 4096:
                 BLOCK_SIZE = triton.next_power_of_2(N)
                 skip_layer_norm_kernel[M,](
                     y, x, residual, weight, bias, N, 1, N, 1, N, 1, N, eps, BLOCK_SIZE

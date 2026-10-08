@@ -594,6 +594,61 @@ def test_accuracy_skip_layernorm(shape, dtype):
     gems_assert_close(res_out, ref_out, dtype)
 
 
+@pytest.mark.skip_layer_norm
+@pytest.mark.skipif(
+    flag_gems.device != "cpu", reason="the static-width path is CPU-only"
+)
+@pytest.mark.parametrize(
+    "dtype,width",
+    [(dtype, 1024) for dtype in FLOAT_DTYPES]
+    + [(torch.float32, 768), (torch.float32, 1025)],
+)
+def test_accuracy_skip_layernorm_cpu_static_width(dtype, width):
+    shape = (33, width)
+    normalized_shape = (shape[-1],)
+    inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    residual = torch.randn_like(inp)
+    weight = torch.randn(normalized_shape, dtype=dtype, device=flag_gems.device)
+    bias = torch.randn(normalized_shape, dtype=dtype, device=flag_gems.device)
+    residual_before = residual.clone()
+
+    ref_out = torch.layer_norm(
+        to_reference(inp, True) + to_reference(residual, True),
+        normalized_shape,
+        to_reference(weight, True),
+        to_reference(bias, True),
+    )
+    res_out = flag_gems.skip_layer_norm(
+        inp, residual, normalized_shape, weight, bias
+    )
+
+    gems_assert_close(res_out, ref_out, dtype)
+    torch.testing.assert_close(residual, residual_before, rtol=0, atol=0)
+
+
+@pytest.mark.skip_layer_norm
+@pytest.mark.skipif(flag_gems.device != "cpu", reason="CPU static-width path")
+def test_accuracy_skip_layernorm_cpu_strided_offset():
+    shape = (3, 7, 32, 24)
+    normalized_shape = shape[2:]
+    # A large common offset catches unstable E[x*x] - E[x]**2 statistics.
+    inp = (torch.randn((*shape[:-1], shape[-1] * 2)) + 1000.0)[..., ::2]
+    residual = torch.randn_like(inp).repeat_interleave(2, dim=-1)[..., ::2]
+    weight = torch.randn((*normalized_shape[:-1], normalized_shape[-1] * 2))[..., ::2]
+    bias = torch.randn_like(weight).repeat_interleave(2, dim=-1)[..., ::2]
+    residual_before = residual.clone()
+    ref_out = torch.layer_norm(
+        inp.double() + residual.double(),
+        normalized_shape,
+        weight.double(),
+        bias.double(),
+    )
+    res_out = flag_gems.skip_layer_norm(inp, residual, normalized_shape, weight, bias)
+    torch.testing.assert_close(res_out.double(), ref_out, rtol=1e-3, atol=1e-3)
+    # Contiguous conversion means the original strided residual stays intact.
+    torch.testing.assert_close(residual, residual_before, rtol=0, atol=0)
+
+
 @pytest.mark.fused_add_rms_norm
 @pytest.mark.parametrize("shape", REDUCTION_SHAPES)
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
