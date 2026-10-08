@@ -115,6 +115,49 @@ extern "C" void memrefCopy(int64_t elemSize, UnrankedMemRefType<char> *srcArg,
     return;
   }
 
+  // Copy in runs: when both sides are contiguous along the innermost axes
+  // (e.g. a strided 2-D tile of a row-major tensor), fold those axes into a
+  // single memcpy instead of copying element by element.
+  int64_t runBytes = elemSize;
+  while (rank > 0 && src.strides[rank - 1] * elemSize == runBytes &&
+         dst.strides[rank - 1] * elemSize == runBytes) {
+    runBytes *= src.sizes[rank - 1];
+    --rank;
+  }
+  if (rank == 0) {
+    memcpy(dstPtr, srcPtr, runBytes);
+    return;
+  }
+
+  // Strided 2-D element copies (e.g. a transposed tile load): copy with typed
+  // loads and stores instead of one memcpy call per element.  The inner loop
+  // runs along the source's unit-stride axis, if it has one, so the reads are
+  // sequential.
+  if (rank == 2 && runBytes == elemSize &&
+      (elemSize == 1 || elemSize == 2 || elemSize == 4 || elemSize == 8)) {
+    const int inner = src.strides[0] == 1 && src.strides[1] != 1 ? 0 : 1;
+    const int outer = 1 - inner;
+    const int64_t n0 = src.sizes[outer], n1 = src.sizes[inner];
+    const int64_t ss0 = src.strides[outer], ss1 = src.strides[inner];
+    const int64_t ds0 = dst.strides[outer], ds1 = dst.strides[inner];
+#define FAST_COPY_2D(T)                                                        \
+  do {                                                                         \
+    const T *s = reinterpret_cast<const T *>(srcPtr);                          \
+    T *d = reinterpret_cast<T *>(dstPtr);                                      \
+    for (int64_t i = 0; i < n0; ++i)                                           \
+      for (int64_t j = 0; j < n1; ++j)                                         \
+        d[i * ds0 + j * ds1] = s[i * ss0 + j * ss1];                           \
+  } while (0)
+    switch (elemSize) {
+    case 1: FAST_COPY_2D(uint8_t); break;
+    case 2: FAST_COPY_2D(uint16_t); break;
+    case 4: FAST_COPY_2D(uint32_t); break;
+    default: FAST_COPY_2D(uint64_t); break;
+    }
+#undef FAST_COPY_2D
+    return;
+  }
+
   int64_t *indices = static_cast<int64_t *>(alloca(sizeof(int64_t) * rank));
   int64_t *srcStrides = static_cast<int64_t *>(alloca(sizeof(int64_t) * rank));
   int64_t *dstStrides = static_cast<int64_t *>(alloca(sizeof(int64_t) * rank));
@@ -128,8 +171,8 @@ extern "C" void memrefCopy(int64_t elemSize, UnrankedMemRefType<char> *srcArg,
 
   int64_t readIndex = 0, writeIndex = 0;
   for (;;) {
-    // Copy over the element, byte by byte.
-    memcpy(dstPtr + writeIndex, srcPtr + readIndex, elemSize);
+    // Copy over one run (a single element if nothing could be folded).
+    memcpy(dstPtr + writeIndex, srcPtr + readIndex, runBytes);
     // Advance index and read position.
     for (int64_t axis = rank - 1; axis >= 0; --axis) {
       // Advance at current axis.
