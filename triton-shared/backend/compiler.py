@@ -207,6 +207,7 @@ class CPUOptions:
     # Keep tl.dot on the linalg (SME/SVE) matmul lowering instead of turning
     # it into ArmPL BLAS calls.
     disable_armpl: bool = False
+    sme_matmul_k_tile : int = 32
     sanitize_overflow: bool = True
     vec_lib: Optional[str] = 'libsleef'
 
@@ -299,6 +300,9 @@ class CPUBackend(BaseBackend):
         )
         args['disable_armpl'] = (
             os.environ.get("TRITON_SHARED_DISABLE_ARMPL", "0") == "1"
+        )
+        args['sme_matmul_k_tile'] = int(
+            os.environ.get("TRITON_SHARED_SME_MATMUL_K_TILE", "32")
         )
         return CPUOptions(**args)
 
@@ -1264,8 +1268,23 @@ class CPUBackend(BaseBackend):
             return src + "\n" + str(mod)
 
 
-    def _sme_transform(self, src: str) -> str:
+    def _sme_transform(self, src: str, options) -> str:
         # TODO: share with SVE transform.
+
+        # Reduction tile for the regular SME matmul path.  With a tile of 1
+        # every outer product reloads and stores the ZA accumulators; a larger
+        # tile keeps them in ZA for that many steps.  It must divide every
+        # matmul's K (the contraction size of the first operand), otherwise the
+        # partial tile needs a vector.mask the SME lowering cannot legalize.
+        matmul_ks = [
+            int(shape.split("x")[-1]) for shape in re.findall(
+                r"\blinalg\.(?:batch_)?matmul\b[^\n]*?ins\([^:]*:\s*tensor<([0-9x]+?)x[a-z]\w*>",
+                src,
+            )
+        ]
+        k_tile = max(1, options.sme_matmul_k_tile)
+        while k_tile > 1 and any(k % k_tile for k in matmul_ks):
+            k_tile //= 2
         has_bf16_matmul = re.search(
             r"\blinalg\.(?:batch_)?matmul\b[\s\S]*?xbf16\b",
             src,
@@ -1486,12 +1505,13 @@ class CPUBackend(BaseBackend):
                 transform.YieldOp([])
             return "__skip_matmul"
 
-        def make_tile_matmul_for_bitwidth_action(bitwidth, reduction_tile_size=1):
+        def make_tile_matmul_for_bitwidth_action(bitwidth, reduction_tile_size=1,
+                                                 name_tag=""):
             """Create a tiling sequence for a specific bitwidth."""
             VL = 128 // bitwidth
             any_op_type = transform.AnyOpType.get()
             for_op_type = transform.OperationType.get("scf.for")
-            name = f"__tile_matmul_{bitwidth}bit"
+            name = f"__tile_matmul_{bitwidth}bit{name_tag}"
             if reduction_tile_size != 1:
                 name = f"{name}_k{reduction_tile_size}"
             sequence = transform.NamedSequenceOp(
@@ -1615,7 +1635,11 @@ class CPUBackend(BaseBackend):
 
             for bitwidth in [16, 32, 64]:
                 matmul_matcher_name = make_regular_matmul_matcher(bitwidth)
-                tile_action = make_tile_matmul_for_bitwidth_action(bitwidth)
+                # name_tag keeps these apart from the widening actions above,
+                # which may use the same bitwidth and reduction tile.
+                tile_action = make_tile_matmul_for_bitwidth_action(
+                    bitwidth, reduction_tile_size=k_tile, name_tag="_regular"
+                )
                 matcher_list.append(FlatSymbolRefAttr.get(matmul_matcher_name))
                 action_list.append(FlatSymbolRefAttr.get(tile_action))
 
@@ -2013,7 +2037,7 @@ class CPUBackend(BaseBackend):
             if not has_matmul:
                 warnings.warn("Running SME pipeline on payload without matmul.")
             self._used_sme = True
-            return self._sme_transform(src)
+            return self._sme_transform(src, options)
         if (os.environ.get("TRITON_SHARED_FORCE_SVE_PIPELINE", "0") == "1"):
             return self._sve_transform(src)
         if not self.cpu_arch == "aarch64":
@@ -2021,7 +2045,7 @@ class CPUBackend(BaseBackend):
 
         if ("sme" in self.cpu_features and has_matmul):
             self._used_sme = True
-            return self._sme_transform(src)
+            return self._sme_transform(src, options)
         if ("sve" in self.cpu_features):
             return self._sve_transform(src)
 
