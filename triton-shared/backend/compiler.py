@@ -1842,6 +1842,16 @@ class CPUBackend(BaseBackend):
                     options='include-f8e5m2=true include-bf16=true include-f8e4m3fn=true'
                 )
  
+                # math.exp2 has no polynomial approximation of its own and
+                # would otherwise become a scalar exp2f libm call; inside the
+                # ZA-using kernel each such call also pays for the lazy ZA
+                # save.  Rewrite it as exp(x * ln 2) so the exp approximation
+                # below inlines it.
+                fp2 = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    fp2.result,
+                    "test-expand-math",
+                )
                 poly = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
                     fp2.result,
