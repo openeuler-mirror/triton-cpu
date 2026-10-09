@@ -8,9 +8,9 @@ attention:
     num_warps: 4
     num_stages: 1
   block_m:
-  - 16
+  - 64
   block_n:
-  - 8
+  - 64
   pre_load_v:
   - true
   - false
