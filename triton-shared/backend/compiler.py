@@ -1993,6 +1993,8 @@ class CPUBackend(BaseBackend):
 
     @timer
     def _optimize_ttsharedir(self, src: str):
+        # A backend instance is reused across kernels; do not reuse its SME choice.
+        self._used_sme = False
         has_matmul = re.search(r"\blinalg\.(?:batch_)?matmul\b", src) is not None
         # Track whether the SME pipeline was used for this kernel so that
         # _llir_to_bin can pass the correct -mattr flags to llc. Passing `+sme`
