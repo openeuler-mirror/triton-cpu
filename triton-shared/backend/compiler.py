@@ -207,6 +207,7 @@ class CPUOptions:
     # Keep tl.dot on the linalg (SME/SVE) matmul lowering instead of turning
     # it into ArmPL BLAS calls.
     disable_armpl: bool = False
+    enable_sme_streaming_autovec: bool = False
     sanitize_overflow: bool = True
     vec_lib: Optional[str] = 'libsleef'
 
@@ -299,6 +300,9 @@ class CPUBackend(BaseBackend):
         )
         args['disable_armpl'] = (
             os.environ.get("TRITON_SHARED_DISABLE_ARMPL", "0") == "1"
+        )
+        args['enable_sme_streaming_autovec'] = (
+            os.environ.get("TRITON_SHARED_ENABLE_SME_STREAMING_AUTOVEC", "0") == "1"
         )
         return CPUOptions(**args)
 
@@ -2194,6 +2198,11 @@ class CPUBackend(BaseBackend):
             return Path(llir_path).read_text()
 
 
+    def _sme_pipeline_used(self):
+        return os.environ.get("TRITON_SHARED_FORCE_SME_PIPELINE", "0") == "1" \
+            or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features
+                and getattr(self, "_used_sme", False))
+
     def _llvm_target_flags(self):
         """Target selection shared by the IR optimizer and the code generator.
 
@@ -2204,9 +2213,7 @@ class CPUBackend(BaseBackend):
         also makes it stamp the matching `target datalayout` into the IR it
         emits, which is what llc then reads.
         """
-        if os.environ.get("TRITON_SHARED_FORCE_SME_PIPELINE", "0") == "1" \
-            or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features
-                and getattr(self, "_used_sme", False)):
+        if self._sme_pipeline_used():
             return (
                 "-mtriple=aarch64-linux-gnu",
                 "-mattr=+sme,+dotprod,+v9a,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+sve,+sve2",
@@ -2235,6 +2242,15 @@ class CPUBackend(BaseBackend):
                     opt_path,
                     "-S",
                     *self._llvm_target_flags(),
+                    # SME-pipeline kernels run entirely in streaming mode
+                    # (aarch64_pstate_sm_body); LLVM disables scalable
+                    # auto-vectorization there by default, which leaves every
+                    # elementwise loop scalar.  Opt-in via
+                    # TRITON_SHARED_ENABLE_SME_STREAMING_AUTOVEC=1.
+                    *(["-enable-scalable-autovec-in-streaming-mode"]
+                      if options is not None
+                      and options.enable_sme_streaming_autovec
+                      and self._sme_pipeline_used() else []),
                     "-passes=function(loop-mssa(loop-rotate,loop-idiom),instcombine<max-iterations=1;no-verify-fixpoint>,sroa),simplifycfg,dse,loop-vectorize",
                     src_path,
                     "-o",
