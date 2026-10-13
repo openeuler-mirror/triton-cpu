@@ -1109,7 +1109,7 @@ class CPUBackend(BaseBackend):
                     transform.OperationType.get("func.func"),
                     fp.result,
                     "arith-expand",
-                    options='include-f8e5m2=true include-bf16=true include-f8e4m3fn=true'
+                    options='include-f8e5m2=true include-f8e4m3fn=true'
                 )
  
                 poly = transform.ApplyRegisteredPassOp(
@@ -1849,7 +1849,7 @@ class CPUBackend(BaseBackend):
                     transform.OperationType.get("func.func"),
                     fp.result,
                     "arith-expand",
-                    options='include-f8e5m2=true include-bf16=true include-f8e4m3fn=true'
+                    options='include-f8e5m2=true include-f8e4m3fn=true'
                 )
  
                 # math.exp2 has no polynomial approximation of its own and
