@@ -264,10 +264,7 @@ instance_norm_loop:
       TILE_N: tile_n
     num_warps: 4
   tile_n:
-    - 1024
-    - 2048
-    - 4096
-    - 8192
+    - 64
 instance_norm_backward:
 - gen : true
   param_map:

@@ -192,12 +192,15 @@ def instance_norm_loop_kernel(
         w = 1
         b = 0
 
+    # Use wider tiles for the elementwise output without enlarging loop state.
+    OUT_TILE: tl.constexpr = 256 if TILE_N < 256 else TILE_N
+
     # reverse the order of the second sweep
     # Normalize and apply linear transformation
-    prev_multiple = prev_multiple_of(N, TILE_N)
+    prev_multiple = prev_multiple_of(N, OUT_TILE)
     # the first step, masking is needed
-    for start_n in range(0, TILE_N, TILE_N):
-        n_offsets = (prev_multiple - start_n) + tl.arange(0, TILE_N)
+    for start_n in range(0, OUT_TILE, OUT_TILE):
+        n_offsets = (prev_multiple - start_n) + tl.arange(0, OUT_TILE)
         mask = n_offsets < N
         x = tl.load(
             in_ptr + pid * N + n_offsets,
@@ -208,8 +211,8 @@ def instance_norm_loop_kernel(
         out = w * (x - m) * rstd + b
         tl.store(out_ptr + pid * N + n_offsets, out, mask=mask)
 
-    for start_n in range(TILE_N, N, TILE_N):
-        n_offsets = (prev_multiple - start_n) + tl.arange(0, TILE_N)
+    for start_n in range(OUT_TILE, N, OUT_TILE):
+        n_offsets = (prev_multiple - start_n) + tl.arange(0, OUT_TILE)
         x = tl.load(in_ptr + pid * N + n_offsets, eviction_policy="evict_first").to(
             tl.float32
         )

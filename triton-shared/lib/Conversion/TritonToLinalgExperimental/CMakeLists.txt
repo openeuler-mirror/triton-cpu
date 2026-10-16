@@ -12,6 +12,7 @@ add_triton_library(TritonToLinalgExperimental
   FullTileRegionVersioning.cpp
   HoistStaticAllocs.cpp
   NontemporalLoads.cpp
+  DoubleBufferLoopAllocations.cpp
 
   DEPENDS
   TritonToLinalgExperimentalConversionPassIncGen
@@ -25,10 +26,13 @@ add_triton_library(TritonToLinalgExperimental
   MLIRSCFDialect
   MLIRControlFlowInterfaces
   MLIRMathDialect
+  MLIRMemRefDialect
   MLIRPass
+  MLIRSCFDialect
   MLIRTensorDialect
   MLIRTransforms
   MLIRSupport
+  MLIRVectorDialect
   TPtrIR
   TritonAnalysis
   TritonIR
