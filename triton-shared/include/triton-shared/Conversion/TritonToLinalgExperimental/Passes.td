@@ -20,6 +20,9 @@ def TritonToLinalgExperimental : Pass<"triton-to-linalg-experimental", "mlir::Mo
              "Enable collapse shape pass">,
       Option<"enableArmPL", "enable-armpl", "bool", /*default*/"false",
              "Enable ArmPL BLAS path for tt.dot operations">,
+      Option<"enableKunpengLLM", "enable-kunpeng-llm", "bool", /*default*/"false",
+             "Replace recognised kernels (flash-attention forward) by "
+             "libkunpeng_llm calls">,
   ];
 }
 

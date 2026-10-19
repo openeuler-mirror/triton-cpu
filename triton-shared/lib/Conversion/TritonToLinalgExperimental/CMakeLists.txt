@@ -43,6 +43,7 @@ add_triton_library(TritonToLinalgExperimental
   UnstructuredToMemref
   TritonPtrToMemref
   TritonToArmPL
+  TritonToKunpengLLM
   TritonSharedUtils
 
   TritonArithToLinalg
