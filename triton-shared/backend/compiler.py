@@ -2037,7 +2037,7 @@ class CPUBackend(BaseBackend):
             return src + "\n" + str(mod)
 
     @timer
-    def _optimize_ttsharedir(self, src: str):
+    def _optimize_ttsharedir(self, src: str, options):
         # A backend instance is reused across kernels; do not reuse its SME choice.
         self._used_sme = False
         has_matmul = re.search(r"\blinalg\.(?:batch_)?matmul\b", src) is not None
@@ -2322,7 +2322,7 @@ class CPUBackend(BaseBackend):
 
     def add_stages(self, stages, options):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
-        stages["ttsharedir"] = lambda src, metadata: self._optimize_ttsharedir(self._ttir_to_ttsharedir(src, options))
+        stages["ttsharedir"] = lambda src, metadata: self._optimize_ttsharedir(self._ttir_to_ttsharedir(src, options), options)
         stages["llir"] = lambda src, metadata: self._optimize_llir(self._ttsharedir_to_llir(src), options)
         stages["obj"] = lambda src, metadata: self._llir_to_bin(src, metadata, options)
 
