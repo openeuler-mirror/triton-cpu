@@ -687,3 +687,16 @@ index_put:
   - 1024
   - 2048
   - 4096
+kron:
+  - gen: true
+    param_map:
+      META:
+        BLOCK_M: block_m
+        BLOCK_N: block_n
+      num_warps: warps
+    block_m:
+      - 1
+    block_n:
+      - 1024
+    warps:
+      - 4
