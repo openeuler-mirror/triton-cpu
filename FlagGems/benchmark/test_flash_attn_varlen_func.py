@@ -149,6 +149,10 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
 
         self.shapes = all_configs
 
+    def select_max_level_shapes(self, shapes):
+        # Configs are ordered by growing sequence lengths; keep the last one.
+        return [shapes[-1]]
+
     def get_input_iter(self, dtype):
         for config in self.shapes:
             yield self.flash_attn_varlen_input_fn(config, dtype, self.device)
