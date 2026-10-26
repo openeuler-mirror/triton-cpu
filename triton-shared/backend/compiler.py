@@ -1676,8 +1676,42 @@ class CPUBackend(BaseBackend):
             )
                 
             with InsertionPoint(sequence.body):
+                # Normalize vector contractions while transfers still have
+                # tensor semantics, then hoist their invariant accumulator
+                # subsets into loop-carried vectors before bufferization.
+                with InsertionPoint(
+                    transform.ApplyPatternsOp(sequence.bodyTarget).patterns
+                ):
+                    vector.ApplyLowerMaskedTransfersPatternsOp()
+                    vector.ApplyTransferPermutationPatternsOp()
+                    vector.ApplyVectorReductionToContractPatternsOp()
+                with InsertionPoint(
+                    transform.ApplyPatternsOp(sequence.bodyTarget).patterns
+                ):
+                    vector.ApplyCastAwayVectorLeadingOneDimPatternsOp()
+                    vector.ApplyLowerContractionPatternsOp(
+                        lowering_strategy=vector.VectorContractLowering.OuterProduct
+                    )
+                    vector.ApplyLowerMasksPatternsOp()
+                    transform.ApplyCanonicalizationPatternsOp()
+                invariant = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    sequence.bodyTarget,
+                    "loop-invariant-code-motion",
+                )
+                hoisted = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    invariant.result,
+                    "loop-invariant-subset-hoisting",
+                )
+                # Subset hoisting adds temporary tensor loop arguments. Drop
+                # their now-unused yields before bufferization, otherwise the
+                # alias analysis may allocate/copy a dynamic accumulator tile.
+                canonical = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(), hoisted.result, "canonicalize"
+                )
                 buff = bufferization.OneShotBufferizeOp(
-                    sequence.bodyTarget, bufferize_function_boundaries=True,
+                    canonical.result, bufferize_function_boundaries=True,
                     allow_return_allocs_from_loops=True,
                     )
 
@@ -1844,7 +1878,10 @@ class CPUBackend(BaseBackend):
                     vector.ApplyTransferPermutationPatternsOp()
                     # Repeat lowerMultiReduction in case lowerContraction generated some multi reductions.
                     vector.ApplyLowerMultiReductionPatternsOp(lowering_strategy=vector.VectorMultiReductionLowering.InnerReduction)
-                    vector.ApplySplitTransferFullPartialPatternsOp(split_transfer_strategy=vector.VectorTransferSplit.VectorTransfer)
+                    # Do not split transfers back into vector.transfer_read
+                    # branches here: dynamically sized boundary buffers can
+                    # repeatedly match that split. The lower-transfer/SCF
+                    # patterns below lower their masks directly.
                     vector.ApplyLowerTransferPatternsOp()
                     # TODO: Check if full unroll false is still necessary with tiling.
                     vector.ApplyTransferToScfPatternsOp(full_unroll=True)
