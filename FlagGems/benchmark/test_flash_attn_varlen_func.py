@@ -16,7 +16,7 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
     benchmark for flash_attn_varlen_func
     """
 
-    DEFAULT_METRICS = base.Benchmark.DEFAULT_METRICS[:] + ["tflops"]
+    DEFAULT_METRICS = base.Benchmark.DEFAULT_METRICS[:] + ["tflops", "gbps"]
 
     @staticmethod
     def _attention_pair_count(query_length, key_length, causal, left, right):
@@ -34,6 +34,52 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
                 end = min(end, center + right + 1)
             pairs += max(0, end - start)
         return pairs
+
+    @staticmethod
+    def _visible_key_count(query_length, key_length, causal, left, right):
+        """Number of keys at least one query row of the sequence attends to.
+
+        Windows and the causal mask are aligned to the bottom-right corner:
+        row i sees keys [i + Sk - Sq - left, i + Sk - Sq + right].
+        """
+        if causal:
+            right = 0
+        if query_length <= 0 or key_length <= 0:
+            return 0
+        offset = key_length - query_length
+        # The first row has the leftmost bound, the last row the rightmost.
+        start = 0 if left < 0 else max(0, offset - left)
+        end = key_length if right < 0 else min(key_length, query_length + offset + right)
+        return max(0, end - start)
+
+    def get_gbps(self, args, latency):
+        query = args[0]
+        key_cache = args[1]
+        cumulative_query_lengths = args[4].tolist()
+        used_key_lengths = args[7].tolist()
+        causal = args[11]
+        window_size = args[12]
+        block_table = args[17]
+        left, right = (-1, -1) if window_size is None else window_size
+        _, block_size, num_kv_heads, head_size = key_cache.shape
+
+        kv_row_bytes = num_kv_heads * head_size * key_cache.element_size()
+        kv_bytes = 0
+        table_bytes = 0
+        for index, key_length in enumerate(used_key_lengths):
+            query_length = (
+                cumulative_query_lengths[index + 1] - cumulative_query_lengths[index]
+            )
+            visible = self._visible_key_count(
+                query_length, key_length, causal, left, right
+            )
+            kv_bytes += 2 * visible * kv_row_bytes  # K and V
+            table_bytes += (
+                (key_length + block_size - 1) // block_size
+            ) * block_table.element_size()
+        q_bytes = query.numel() * query.element_size()
+        o_bytes = q_bytes  # output has the query's shape and dtype
+        return (q_bytes + o_bytes + kv_bytes + table_bytes) / latency / 1e6
 
     def get_tflops(self, op, *args, **kwargs):
         query = args[0]
@@ -56,8 +102,62 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
         return 4 * query.shape[1] * query.shape[2] * pairs
 
     def set_shapes(self, shape_file_path: Optional[List[Any]] = None):
-        # Collecting from qwen/Qwen3-1.7B
+        # A shape file entry for this op, if present, fully replaces the
+        # built-in list below.  Each entry is the 9-field config unpacked by
+        # flash_attn_varlen_input_fn: [cu_seq_lens_q, seqused_k, num_heads,
+        # num_heads_k, head_size, block_size, num_blocks, alibi, soft_cap].
+        #if shape_file_path is not None and os.path.isfile(shape_file_path):
+        #    with open(shape_file_path, "r") as file:
+        #        yaml_config = yaml.safe_load(file) or {}
+        #    op_config = yaml_config.get(self.op_name) or {}
+        #    if "shapes" in op_config:
+        #        self.shapes = [
+        #            (tuple(shape[0]), tuple(shape[1]), *shape[2:])
+        #            for shape in op_config["shapes"]
+        #        ]
+        #        return
+
+        num_heads = 16
+        num_heads_k = 8
+        head_dim = 128
+        block_size = 16
+        num_blocks = 2000
+        alibi = False
+        soft_cap = None
+
+        # Chunked prefill: every sequence presents q_len == seqused_k query
+        # rows, so each key is reused by q_len rows instead of by one.  The
+        # arithmetic intensity of square causal prefill is
+        #     S * H / (2 * (H + Hk))   (= S/3 for 16 query / 8 KV heads)
+        # against 4 FLOP/byte for a q_len = 1 decode step, which puts these
+        # shapes above the compute/bandwidth ridge point of current Arm SME
+        # parts (~200 FLOP/byte): they measure the matmul throughput of the
+        # kernel, where the decode batches below measure its memory system.
+        # 69 - 275 GFLOP per call, and >= 2048 programs to schedule.
+        prefill_configs = [
+            (
+                tuple(range(0, num_seqs * seqlen + 1, seqlen)),  # cu_seq_lens_q
+                (seqlen,) * num_seqs,  # seqused_k
+                num_heads,
+                num_heads_k,
+                head_dim,
+                block_size,
+                max(num_blocks, num_seqs * -(-seqlen // block_size)),
+                alibi,
+                soft_cap,
+            )
+            for seqlen, num_seqs in ((1024, 16), (2048, 8), (2048, 16))
+        ]
+
+        if base.Config.bench_level != base.BenchLevel.COMPREHENSIVE:
+            self.shapes = prefill_configs
+            return
+
+        # Decode and mixed continuous-batching shapes, collected from
+        # qwen/Qwen3-1.7B
         # --random-input 512 --random-output 2048 --num-prompts 200 --request-rate inf
+        # Most sequences contribute a single query row, so these are bound by
+        # reading the paged K/V cache; watch the gbps metric rather than tflops.
         # Format: (cu_seq_lens_q, seqused_k, num_heads, head_size, block_size,
         # num_blocks, alibi, soft_cap)
 
@@ -124,14 +224,6 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
             ),
         ]
 
-        num_heads = 16
-        num_heads_k = 8
-        head_dim = 128
-        block_size = 16
-        num_blocks = 2000
-        alibi = False
-        soft_cap = None
-
         all_configs = [
             (
                 cu_seq_lens_q,
@@ -147,7 +239,7 @@ class FlashAttnVarlenBenchmark(base.Benchmark):
             for cu_seq_lens_q, seqused_k in zip(all_cu_seq_lens_q, all_seqused_k)
         ]
 
-        self.shapes = all_configs
+        self.shapes = prefill_configs + all_configs
 
     def get_input_iter(self, dtype):
         for config in self.shapes:
