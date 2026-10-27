@@ -364,6 +364,33 @@ class Benchmark:
             ]
         return args, kwargs
 
+    @staticmethod
+    def shape_numel(shape) -> Optional[int]:
+        """Element count of a plain numeric shape, None for structured shapes."""
+        if isinstance(shape, (list, tuple)) and shape and all(
+            isinstance(dim, int) and not isinstance(dim, bool) for dim in shape
+        ):
+            return math.prod(shape)
+        return None
+
+    def select_max_level_shapes(self, shapes):
+        """Keep only the largest shape (by element count) for --level max.
+
+        Structured shapes (configs/dicts, e.g. attention benchmarks) cannot be
+        sized here; subclasses override this to pick their heaviest config.
+        """
+        if not shapes:
+            return shapes
+        sizes = [self.shape_numel(shape) for shape in shapes]
+        if any(size is not None for size in sizes):
+            best = max(
+                range(len(shapes)),
+                key=lambda i: sizes[i] if sizes[i] is not None else -1,
+            )
+        else:
+            best = len(shapes) - 1
+        return [shapes[best]]
+
     def run(self):
         if Config.query:
             self.init_default_config()
@@ -377,6 +404,8 @@ class Benchmark:
             return
 
         self.init_user_config()
+        if Config.bench_level == BenchLevel.MAX:
+            self.shapes = self.select_max_level_shapes(self.shapes)
         for dtype in self.to_bench_dtypes:
             metrics = []
             input_iter = self.get_input_iter(dtype)

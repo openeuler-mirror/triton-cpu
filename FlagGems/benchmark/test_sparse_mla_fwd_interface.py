@@ -78,6 +78,18 @@ class SparseMlaFwdBenchmark(GenericBenchmark):
     def set_more_shapes(self):
         return []
 
+    def select_max_level_shapes(self, shapes):
+        # SPARSE_MLA_PARAMS grows monotonically; keep the heaviest config.
+        return [
+            max(
+                shapes,
+                key=lambda p: p["seq_len_q"]
+                * p["num_heads"]
+                * p["topk"]
+                * (p["seq_len_kv"] + 576),
+            )
+        ]
+
     def get_tflops(self, op, *args, **kwargs):
         query, _, indices = args[:3]
         value_dim = kwargs.get("d_v", args[4] if len(args) > 4 else None)

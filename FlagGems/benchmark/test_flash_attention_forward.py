@@ -316,6 +316,15 @@ class FlashAttentionForwardBenchmark(GenericBenchmark):
     def set_more_shapes(self):
         return None
 
+    def select_max_level_shapes(self, shapes):
+        # Config layout: (batch, num_head, num_head_k, q_seq_len, kv_seq_len,
+        # head_size, ...). Pick the config with the largest attention workload.
+        def workload(config):
+            batch, num_head, _, q_seq_len, kv_seq_len, head_size = config[:6]
+            return batch * num_head * q_seq_len * kv_seq_len * head_size
+
+        return [max(shapes, key=workload)]
+
     @staticmethod
     def _attention_pair_count(query_length, key_length, causal, left, right):
         alignment = (
