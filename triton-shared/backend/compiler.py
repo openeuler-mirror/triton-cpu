@@ -1169,6 +1169,13 @@ class CPUBackend(BaseBackend):
                     vector.ApplyTransferToScfPatternsOp(full_unroll=True)
                     vector.ApplyLowerShapeCastPatternsOp()
 
+                funcs = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                    "lower-outer-reduction-sve",
+                    options=f"vscale={self.sve_vscale}",
+                )
+
                 # 7) add lower_transpose
                 with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
                     vector.ApplyLowerContractionPatternsOp()
@@ -1966,6 +1973,15 @@ class CPUBackend(BaseBackend):
                     # TODO: Check if full unroll false is still necessary with tiling.
                     vector.ApplyTransferToScfPatternsOp(full_unroll=True)
                     vector.ApplyLowerShapeCastPatternsOp()
+
+                funcs = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                    "lower-outer-reduction-sve",
+                    options=f"vscale={self.sve_vscale}",
+                )
+
+                with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
                     # TODO: CHECK if we still need that lowering strategy once we have auto tiling.
                     vector.ApplyLowerTransposePatternsOp()
 
