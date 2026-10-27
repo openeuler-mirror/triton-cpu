@@ -209,6 +209,7 @@ class CPUOptions:
     disable_armpl: bool = False
     sme_matmul_k_tile : int = 32
     enable_sme_streaming_autovec: bool = False
+    enable_opt_o3: bool = False
     sanitize_overflow: bool = True
     vec_lib: Optional[str] = 'libsleef'
 
@@ -307,6 +308,9 @@ class CPUBackend(BaseBackend):
         )
         args['enable_sme_streaming_autovec'] = (
             os.environ.get("TRITON_SHARED_ENABLE_SME_STREAMING_AUTOVEC", "0") == "1"
+        )
+        args['enable_opt_o3'] = (
+            os.environ.get("TRITON_SHARED_ENABLE_OPT_O3", "0") == "1"
         )
         return CPUOptions(**args)
 
@@ -2268,6 +2272,7 @@ class CPUBackend(BaseBackend):
             Path(src_path).write_text(llir)
             opt_path = _get_llvm_bin_path("opt")
             if os.path.exists(opt_path):
+                use_o3 = options is not None and options.enable_opt_o3
                 #FIXME: should we add other opt optimizations too?
                 subprocess.check_call([
                     opt_path,
@@ -2282,7 +2287,8 @@ class CPUBackend(BaseBackend):
                       if options is not None
                       and options.enable_sme_streaming_autovec
                       and self._sme_pipeline_used() else []),
-                    "-passes=function(loop-mssa(loop-rotate,loop-idiom),instcombine<max-iterations=1;no-verify-fixpoint>,sroa),simplifycfg,dse,loop-vectorize",
+                    ("-passes=default<O3>" if use_o3 else
+                     "-passes=function(loop-mssa(loop-rotate,loop-idiom),instcombine<max-iterations=1;no-verify-fixpoint>,sroa),simplifycfg,dse,loop-vectorize"),
                     src_path,
                     "-o",
                     llir_path,
