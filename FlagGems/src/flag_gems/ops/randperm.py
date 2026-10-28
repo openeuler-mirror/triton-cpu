@@ -84,7 +84,7 @@ def bitonic_sortbykey_kernel(
     mask_val = _get_iinfo_val(chunk_x.dtype.element_ty, return_max=not DESCENDING)
 
     chunk_x_val = tl.load(chunk_x + cols, mask=mask, other=mask_val)
-    chunk_index_val = tl.load(chunk_index + cols, mask=mask)
+    chunk_index_val = tl.load(chunk_index + cols, mask=mask, other=0)
 
     sorted_chunk_x, sorted_chunk_index = argsort(
         chunk_x_val, chunk_index_val, 0, descending=DESCENDING
