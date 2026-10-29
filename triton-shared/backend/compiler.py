@@ -23,22 +23,6 @@ from mlir.dialects.transform import structured, loop, vector, bufferization, ten
 ENABLE_FALLBACK = False
 
 
-@functools.lru_cache(maxsize=1)
-def _get_linux_cpu_features() -> frozenset[str]:
-    """Return features common to every CPU listed in /proc/cpuinfo."""
-    try:
-        feature_sets = []
-        for line in Path("/proc/cpuinfo").read_text().splitlines():
-            name, separator, values = line.partition(":")
-            if separator and name.strip().lower() in {"features", "flags"}:
-                feature_sets.append(set(values.split()))
-        if feature_sets:
-            return frozenset(set.intersection(*feature_sets))
-    except OSError:
-        pass
-    return frozenset()
-
-
 def _enable_linalg_tiling_pipeline() -> bool:
     """Return whether the experimental linalg tiling pipeline is enabled."""
     return os.getenv("TRITON_SHARED_ENABLE_LINALG_TILING_PIPELINE", "0") == "1"
@@ -258,12 +242,6 @@ class CPUBackend(BaseBackend):
         if CPUBackend._cpu_features_cache is None:
             CPUBackend._cpu_arch_cache = llvm.get_cpu_tripple().split("-")[0]
             CPUBackend._cpu_features_cache = set(llvm.get_cpu_features())
-            # LLVM 20 does not report FEAT_BF16 on all AArch64 hosts.  Consult
-            # the Linux feature list so code generation can use the hardware
-            # BF16 conversion instructions when they are available.
-            if CPUBackend._cpu_arch_cache == "aarch64" \
-                    and "bf16" in _get_linux_cpu_features():
-                CPUBackend._cpu_features_cache.add("bf16")
         self.cpu_features = CPUBackend._cpu_features_cache
         self.cpu_arch = CPUBackend._cpu_arch_cache
         # Only detect vscale on aarch64 with SVE; None means SVE unused
