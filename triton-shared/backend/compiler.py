@@ -22,6 +22,7 @@ from mlir.dialects.transform import structured, loop, vector, bufferization, ten
 
 ENABLE_FALLBACK = False
 
+
 def _enable_linalg_tiling_pipeline() -> bool:
     """Return whether the experimental linalg tiling pipeline is enabled."""
     return os.getenv("TRITON_SHARED_ENABLE_LINALG_TILING_PIPELINE", "0") == "1"
@@ -239,8 +240,8 @@ class CPUBackend(BaseBackend):
         super().__init__(target)
         # Cache get_cpu_features() - it calls into LLVM and costs ~150µs on aarch64.
         if CPUBackend._cpu_features_cache is None:
-            CPUBackend._cpu_features_cache = llvm.get_cpu_features()
             CPUBackend._cpu_arch_cache = llvm.get_cpu_tripple().split("-")[0]
+            CPUBackend._cpu_features_cache = set(llvm.get_cpu_features())
         self.cpu_features = CPUBackend._cpu_features_cache
         self.cpu_arch = CPUBackend._cpu_arch_cache
         # Only detect vscale on aarch64 with SVE; None means SVE unused
@@ -2249,15 +2250,21 @@ class CPUBackend(BaseBackend):
         emits, which is what llc then reads.
         """
         if self._sme_pipeline_used():
+            features = "+sme,+dotprod,+v9a,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+sve,+sve2"
+            if "bf16" in self.cpu_features:
+                features += ",+bf16"
             return (
                 "-mtriple=aarch64-linux-gnu",
-                "-mattr=+sme,+dotprod,+v9a,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+sve,+sve2",
+                f"-mattr={features}",
             )
         if os.environ.get("TRITON_SHARED_FORCE_SVE_PIPELINE", "0") == "1" \
             or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
+            features = "+sve,+dotprod,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+spe"
+            if "bf16" in self.cpu_features:
+                features += ",+bf16"
             return (
                 "-mtriple=aarch64-linux-gnu",
-                "-mattr=+sve,+dotprod,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+spe",
+                f"-mattr={features}",
             )
         return ()
 
