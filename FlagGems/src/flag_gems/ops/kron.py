@@ -206,8 +206,9 @@ def calculate_batch_indices_kernel(
 
     a_store_offset = 2 * offset
     b_store_offset = 2 * offset + 1
-    tl.store(batch_indices_ptr + a_store_offset, a_idx)
-    tl.store(batch_indices_ptr + b_store_offset, b_idx)
+    mask = offset < out_batch0 * out_batch1
+    tl.store(batch_indices_ptr + a_store_offset, a_idx, mask=mask)
+    tl.store(batch_indices_ptr + b_store_offset, b_idx, mask=mask)
 
 
 def kron(A, B):
