@@ -109,6 +109,119 @@ _STACK_PROMOTE_LIMIT = int(
     os.environ.get("TRITON_SHARED_STACK_PROMOTE_LIMIT", str(16 * 1024))
 )
 
+_OUTER_REDUCTION_WIDTH_THRESHOLD = 256
+_OUTER_REDUCTION_TILE_SIZE = 64
+
+
+def _add_outer_reduction_tiling_schedule():
+    """Add a schedule that tiles statically large dimension-zero reductions."""
+    any_op = transform.AnyOpType.get()
+    i64_type = IntegerType.get_signless(64)
+    param_i64_type = transform.ParamType.get(i64_type)
+
+    matcher_name = "large_outer_reduction_matcher"
+    matcher = transform.NamedSequenceOp(
+        matcher_name,
+        [any_op],
+        [any_op],
+        arg_attrs=[{"transform.readonly": UnitAttr.get()}],
+    )
+    with InsertionPoint(matcher.body):
+        candidate = matcher.body.arguments[0]
+        match_op = Operation.create(
+            "transform.match.structured",
+            results=[any_op],
+            operands=[candidate],
+            attributes={
+                "failure_propagation_mode": IntegerAttr.get(
+                    IntegerType.get_signless(32),
+                    int(transform.FailurePropagationMode.Propagate),
+                ),
+            },
+            regions=1,
+        )
+        body = match_op.regions[0].blocks.append(any_op)
+        struct = body.arguments[0]
+        with InsertionPoint(body):
+            transform.match_operation_name(struct, ["linalg.reduce"])
+            # Partial reduction tiling requires each result to have a single
+            # recognized combiner. Exclude tuple reductions such as argmax and
+            # Welford before applying the transform.
+            one = transform.ParamConstantOp(
+                param_i64_type,
+                IntegerAttr.get(i64_type, 1),
+            ).param
+            num_inputs = Operation.create(
+                "transform.match.structured.num_inputs",
+                results=[param_i64_type],
+                operands=[struct],
+            ).results[0]
+            transform.MatchParamCmpIOp(
+                num_inputs,
+                one,
+                transform.MatchCmpIPredicate.eq,
+            )
+            num_inits = Operation.create(
+                "transform.match.structured.num_inits",
+                results=[param_i64_type],
+                operands=[struct],
+            ).results[0]
+            transform.MatchParamCmpIOp(
+                num_inits,
+                one,
+                transform.MatchCmpIPredicate.eq,
+            )
+            Operation.create(
+                "transform.match.structured.body",
+                operands=[struct],
+                attributes={
+                    "reduction_position": IntegerAttr.get(i64_type, 0),
+                },
+            )
+            reduction_width = Operation.create(
+                "transform.match.structured.dim",
+                results=[param_i64_type],
+                operands=[struct],
+                attributes={"raw_dim_list": DenseI64ArrayAttr.get([0])},
+            ).results[0]
+            threshold = transform.ParamConstantOp(
+                param_i64_type,
+                IntegerAttr.get(i64_type, _OUTER_REDUCTION_WIDTH_THRESHOLD),
+            ).param
+            transform.MatchParamCmpIOp(
+                reduction_width,
+                threshold,
+                transform.MatchCmpIPredicate.gt,
+            )
+            Operation.create(
+                "transform.match.structured.yield",
+                operands=[struct],
+            )
+        transform.YieldOp([match_op.results[0]])
+
+    schedule = transform.NamedSequenceOp(
+        "reduction_tiling_schedule",
+        [any_op],
+        [any_op],
+        arg_attrs=[{"transform.readonly": UnitAttr.get()}],
+    )
+    with InsertionPoint(schedule.body):
+        reductions = transform.CollectMatchingOp(
+            [any_op],
+            schedule.bodyTarget,
+            FlatSymbolRefAttr.get(matcher_name),
+        )
+        structured.TileReductionUsingForOp(
+            [any_op],
+            any_op,
+            any_op,
+            any_op,
+            reductions.results[0],
+            tile_sizes=[_OUTER_REDUCTION_TILE_SIZE],
+        )
+        transform.YieldOp([schedule.bodyTarget])
+
+
 def _promote_buffers_to_stack(funcs):
     """memref.alloc -> memref.alloca for the small per-tile scratch buffers.
 
@@ -1061,6 +1174,13 @@ class CPUBackend(BaseBackend):
                     vector.ApplyTransferToScfPatternsOp(full_unroll=True)
                     vector.ApplyLowerShapeCastPatternsOp()
 
+                funcs = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                    "lower-outer-reduction-sve",
+                    options=f"vscale={self.sve_vscale}",
+                )
+
                 # 7) add lower_transpose
                 with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
                     vector.ApplyLowerContractionPatternsOp()
@@ -1177,6 +1297,13 @@ class CPUBackend(BaseBackend):
             )
                 
             with InsertionPoint(sequence.body):
+                transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    FlatSymbolRefAttr.get("reduction_tiling_schedule"),
+                    transform.FailurePropagationMode.Propagate,
+                    [sequence.bodyTarget],
+                )
+
                 # Apply pre-tiling linalg optimizations
                 opts = transform.IncludeOp(
                     [],
@@ -1266,6 +1393,7 @@ class CPUBackend(BaseBackend):
                 linalg_opts()
                 contraction_schedule()
                 main_type1("contraction_schedule", "contraction")
+                _add_outer_reduction_tiling_schedule()
                 vectorize_schedule()
                 main_type1("vectorize_schedule", "vectorize")
                 bufferize_schedule()
@@ -1887,6 +2015,15 @@ class CPUBackend(BaseBackend):
                     # TODO: Check if full unroll false is still necessary with tiling.
                     vector.ApplyTransferToScfPatternsOp(full_unroll=True)
                     vector.ApplyLowerShapeCastPatternsOp()
+
+                funcs = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                    "lower-outer-reduction-sve",
+                    options=f"vscale={self.sve_vscale}",
+                )
+
+                with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
                     # TODO: CHECK if we still need that lowering strategy once we have auto tiling.
                     vector.ApplyLowerTransposePatternsOp()
 
@@ -1993,11 +2130,17 @@ class CPUBackend(BaseBackend):
                     funcs.result,
                     deduplicate=True,
                 )
+                tiled_reductions = transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    FlatSymbolRefAttr.get("reduction_tiling_schedule"),
+                    transform.FailurePropagationMode.Propagate,
+                    [module],
+                )
                 optimized_linalgs = transform.IncludeOp(
                     [transform.AnyOpType.get()],
                     FlatSymbolRefAttr.get("linalg_opts"),
                     transform.FailurePropagationMode.Suppress, # Flatten ew can emit failures for non-linalg ew ops, expected
-                    [module],
+                    [tiled_reductions],
                 )
                 optimized_linalgs = transform.IncludeOp(
                     [transform.AnyOpType.get()],
@@ -2066,6 +2209,7 @@ class CPUBackend(BaseBackend):
             
             with InsertionPoint(mod.body):
                 linalg_opts()
+                _add_outer_reduction_tiling_schedule()
                 tile_batch_matmul_sme()
                 tile_matmul_sme()
                 bufferize_schedule()
