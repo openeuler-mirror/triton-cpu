@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import tempfile
 import sysconfig
@@ -11,6 +12,7 @@ _LAUNCHER_MODULE_CACHE: dict = {}
 
 import os, subprocess, tempfile, platform
 import importlib
+import importlib.resources
 import importlib.util
 import sys
 
@@ -40,7 +42,12 @@ except AttributeError:
 # needed.  When absent (non-Arm or non-ArmPL builds) the flag is omitted to
 # avoid a link error.
 _armpl_lib_path = os.path.join(str(_triton_C_dir), "libarmpl_lp64.so")
-_has_armpl = os.path.exists(_armpl_lib_path)
+# A file may exist without being loadable on this host.
+try:
+    ctypes.CDLL(_armpl_lib_path)
+    _has_armpl = True
+except OSError:
+    _has_armpl = False
 
 # -------------------- Launcher ----------------------------
 def _ty_to_cpp(ty):

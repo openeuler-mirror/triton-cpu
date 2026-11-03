@@ -1758,6 +1758,32 @@ private:
     return success();
   }
 
+  void createMaskedStoreFallback(
+      int rank, ArrayRef<OpFoldResult> mixedDims,
+      ArrayRef<int64_t> storageShape, Type elemType, Value storeValue,
+      Value ptr, Location loc, ConversionPatternRewriter &rewriter) const {
+    // Materialize the full tensor before copying the masked region so a
+    // partial destination does not determine the producer's buffer layout.
+    SmallVector<Value> dynamicSizes;
+    for (auto [dimIdx, dim] : llvm::enumerate(storageShape)) {
+      if (dim == ShapedType::kDynamic) {
+        dynamicSizes.push_back(
+            rewriter.create<tensor::DimOp>(loc, storeValue, dimIdx));
+      }
+    }
+
+    auto tempAlloc = rewriter.create<memref::AllocOp>(
+        loc, MemRefType::get(storageShape, elemType), dynamicSizes);
+    auto materializeStore =
+        rewriter.create<bufferization::MaterializeInDestinationOp>(
+            loc, storeValue, tempAlloc);
+    materializeStore.setWritable(true);
+
+    auto srcSubview = getSubview(rank, mixedDims, tempAlloc, loc, rewriter);
+    auto dstSubview = getSubview(rank, mixedDims, ptr, loc, rewriter);
+    rewriter.create<memref::CopyOp>(loc, srcSubview, dstSubview);
+  }
+
 public:
   StoreConverter(const TypeConverter &typeConverter, MLIRContext *context)
       : OpConversionPattern<tts::StoreOp>(typeConverter, context) {}
@@ -1901,17 +1927,20 @@ public:
 
     auto ptr = adaptor.getPtr();
     Value storeValue = op.getValue();
-    auto rank = cast<RankedTensorType>(storeValue.getType()).getRank();
+    auto storeTensorType = cast<RankedTensorType>(storeValue.getType());
+    auto rank = storeTensorType.getRank();
+    auto elemType = storeTensorType.getElementType();
     auto originalOrderAttr = getOriginalOrderAttr(ptr);
+    SmallVector<int64_t> storageShape(storeTensorType.getShape().begin(),
+                                      storeTensorType.getShape().end());
     SmallVector<OpFoldResult> mixedDims;
     if (op.hasMask())
       mixedDims = op.getMixedMaskDims();
 
     if (originalOrderAttr) {
       auto transposePermutation = getTransposePermutation(originalOrderAttr);
-      auto storeTensorType = cast<RankedTensorType>(storeValue.getType());
-      auto storageShape = applyPermutation<int64_t>(storeTensorType.getShape(),
-                                                    transposePermutation);
+      storageShape = applyPermutation<int64_t>(storeTensorType.getShape(),
+                                               transposePermutation);
       storeValue = transposeTensor(storeValue, storageShape,
                                    transposePermutation, loc, rewriter);
       if (op.hasMask())
@@ -2006,13 +2035,8 @@ public:
         return success();
       }
 
-      auto srcSlice =
-          getExtractSlice(rank, mixedDims, storeValue, loc, rewriter);
-      auto dstSubview = getSubview(rank, mixedDims, ptr, loc, rewriter);
-
-      auto storeOp = rewriter.create<bufferization::MaterializeInDestinationOp>(
-          loc, srcSlice, dstSubview);
-      storeOp.setWritable(true);
+      createMaskedStoreFallback(rank, mixedDims, storageShape, elemType,
+                                storeValue, ptr, loc, rewriter);
     } else {
       auto storeOp = rewriter.create<bufferization::MaterializeInDestinationOp>(
           loc, storeValue, ptr);
