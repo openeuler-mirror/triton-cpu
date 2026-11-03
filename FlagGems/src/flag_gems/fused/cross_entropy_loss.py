@@ -1,3 +1,4 @@
+import contextlib
 import logging
 
 import torch
@@ -104,17 +105,23 @@ def celoss_indices_kernel_1d(
     l_i = 0.0
     for off in range(0, C, BLOCK_C):
         idx = off + tl.arange(0, BLOCK_C)
+        # Work in base-2: tl.exp2 lowers to the SVE FEXPA accelerator (+ a
+        # short correction polynomial, ~1 ULP), measurably cheaper than the
+        # tl.exp polynomial; the lse is converted back to natural log once.
         if EVEN:
-            x = tl.load(inp_ptr + base + idx).to(tl.float32)
+            x = tl.load(inp_ptr + base + idx).to(tl.float32) * 1.4426950408889634
         else:
-            x = tl.load(
-                inp_ptr + base + idx, mask=idx < C, other=-float("inf")
-            ).to(tl.float32)
+            x = (
+                tl.load(
+                    inp_ptr + base + idx, mask=idx < C, other=-float("inf")
+                ).to(tl.float32)
+                * 1.4426950408889634
+            )
         chunk_max = tl.max(x, 0)
         m_new = tl.maximum(m_i, chunk_max)
-        l_i = l_i * tl.exp(m_i - m_new) + tl.sum(tl.exp(x - m_new), 0)
+        l_i = l_i * tl.exp2(m_i - m_new) + tl.sum(tl.exp2(x - m_new), 0)
         m_i = m_new
-    lse = tl.log(l_i) + m_i
+    lse = (m_i + tl.log2(l_i)) * 0.6931471805599453
 
     x_tgt = tl.load(inp_ptr + base + tgt, mask=valid, other=0.0).to(tl.float32)
     out = lse - x_tgt
@@ -578,110 +585,130 @@ def sum_and_scale(
     tl.store(out_ptr, out_val)
 
 
-class CrossEntropyLoss(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, inp, target, weight, reduction, ignore_index, label_smoothing):
-        logger.debug("GEMS CrossEntropyLoss")
+def cross_forward_impl(ctx, inp, target, weight, reduction, ignore_index, label_smoothing):
+    # Core forward shared by the autograd path (ctx is a Function ctx) and the
+    # no-grad fast path (ctx is None). Passing ctx through keeps a single code
+    # path so both stay in sync.
+    shape = list(inp.shape)
+    dim = inp.ndim
+    N = 1 if dim == 1 else shape[0]
+    C = shape[0] if dim == 1 else shape[1]
+    D = inp.numel() // N // C
+    axis = 0 if dim == 1 else 1
+    del shape[axis]
 
-        shape = list(inp.shape)
-        dim = inp.ndim
-        N = 1 if dim == 1 else shape[0]
-        C = shape[0] if dim == 1 else shape[1]
-        D = inp.numel() // N // C
-        axis = 0 if dim == 1 else 1
-        del shape[axis]
+    inp = inp.contiguous()
+    tgt = target.contiguous()
+    weight = weight.contiguous() if weight is not None else None
+    out = torch.empty(shape, dtype=torch.float32, device=inp.device)
+    grid = lambda meta: (triton.cdiv(D, meta["BLOCK_D"]), N)
 
-        inp = inp.contiguous()
-        tgt = target.contiguous()
-        weight = weight.contiguous() if weight is not None else None
-        out = torch.empty(shape, dtype=torch.float32, device=inp.device)
-        grid = lambda meta: (triton.cdiv(D, meta["BLOCK_D"]), N)
+    # The device context is only meaningful on accelerator devices; on CPU it
+    # is a pure no-op whose enter/exit still costs measurable per-call time
+    # (~60us for this op), so skip it there.
+    if inp.device.type == "cpu":
+        device_ctx = contextlib.nullcontext()
+    else:
+        device_ctx = torch_device_fn.device(inp.device)
 
-        if tgt.ndim == dim:
-            # target probabilities
-            with torch_device_fn.device(inp.device):
-                celoss_probability_kernel[grid](
-                    inp,
-                    tgt,
-                    weight,
-                    out,
-                    label_smoothing,
-                    C,
-                    D,
-                )
-        elif label_smoothing == 0:
-            # target indices
-            w_tgt = torch.empty(shape, dtype=torch.float32, device=inp.device)
-            if D == 1:
-                # 2D/1D input: specialized 1D-tile kernel (vectorizable)
-                BLOCK_C, even = _select_block_c(C)
-                with torch_device_fn.device(inp.device):
-                    celoss_indices_kernel_1d[(N,)](
-                        inp,
-                        tgt,
-                        weight,
-                        out,
-                        w_tgt,
-                        ignore_index,
-                        C,
-                        BLOCK_C=BLOCK_C,
-                        EVEN=even,
-                    )
-            else:
-                with torch_device_fn.device(inp.device):
-                    celoss_indices_kernel[grid](
-                        inp,
-                        tgt,
-                        weight,
-                        out,
-                        w_tgt,
-                        ignore_index,
-                        C,
-                        D,
-                    )
-        else:
-            w_tgt = torch.empty(shape, dtype=torch.float32, device=inp.device)
-            with torch_device_fn.device(inp.device):
-                celoss_indices_smooth_kernel[grid](
+    if tgt.ndim == dim:
+        # target probabilities
+        with device_ctx:
+            celoss_probability_kernel[grid](
+                inp,
+                tgt,
+                weight,
+                out,
+                label_smoothing,
+                C,
+                D,
+            )
+    elif label_smoothing == 0:
+        # target indices
+        w_tgt = torch.empty(shape, dtype=torch.float32, device=inp.device)
+        if D == 1:
+            # 2D/1D input: specialized 1D-tile kernel (vectorizable)
+            BLOCK_C, even = _select_block_c(C)
+            with device_ctx:
+                celoss_indices_kernel_1d[(N,)](
                     inp,
                     tgt,
                     weight,
                     out,
                     w_tgt,
                     ignore_index,
-                    label_smoothing,
+                    C,
+                    BLOCK_C=BLOCK_C,
+                    EVEN=even,
+                    # tl.exp2 in this kernel lowers to the SVE FEXPA
+                    # accelerator (opt-in, per-kernel; see CPUOptions).
+                    enable_fexpa_exp2=True,
+                )
+        else:
+            with device_ctx:
+                celoss_indices_kernel[grid](
+                    inp,
+                    tgt,
+                    weight,
+                    out,
+                    w_tgt,
+                    ignore_index,
                     C,
                     D,
                 )
+    else:
+        w_tgt = torch.empty(shape, dtype=torch.float32, device=inp.device)
+        with device_ctx:
+            celoss_indices_smooth_kernel[grid](
+                inp,
+                tgt,
+                weight,
+                out,
+                w_tgt,
+                ignore_index,
+                label_smoothing,
+                C,
+                D,
+            )
 
-        if reduction == 1:  # MEAN
-            out_reduce = torch.empty([], dtype=inp.dtype, device=inp.device)
-            if tgt.ndim == dim:
-                sum_and_scale[(1,)](out, out_reduce, N * D, False, scale=N * D)
-            else:
-                wgt_sum = torch.empty([], dtype=torch.float32, device=inp.device)
-                sum_and_scale[(1,)](
-                    out, out_reduce, N * D, True, scale=w_tgt, mean_num=wgt_sum
-                )
-            out = out_reduce
-        elif reduction == 2:  # SUM
-            out_reduce = torch.empty([], dtype=inp.dtype, device=inp.device)
-            sum_and_scale[(1,)](out, out_reduce, N * D, False)
-            out = out_reduce
+    if reduction == 1:  # MEAN
+        out_reduce = torch.empty([], dtype=inp.dtype, device=inp.device)
+        if tgt.ndim == dim:
+            sum_and_scale[(1,)](out, out_reduce, N * D, False, scale=N * D)
+        else:
+            wgt_sum = torch.empty([], dtype=torch.float32, device=inp.device)
+            sum_and_scale[(1,)](
+                out, out_reduce, N * D, True, scale=w_tgt, mean_num=wgt_sum
+            )
+        out = out_reduce
+    elif reduction == 2:  # SUM
+        out_reduce = torch.empty([], dtype=inp.dtype, device=inp.device)
+        sum_and_scale[(1,)](out, out_reduce, N * D, False)
+        out = out_reduce
 
-        if inp.requires_grad:
-            ctx.save_for_backward(inp, tgt, weight)
-            ctx.N = N
-            ctx.C = C
-            ctx.D = D
-            ctx.ignore_index = ignore_index
-            ctx.label_smoothing = label_smoothing
-            ctx.shape = shape
-            ctx.mean_num = 1
-            if reduction == 1:
-                ctx.mean_num = N * D if tgt.ndim == dim else wgt_sum
+    if ctx is not None and inp.requires_grad:
+        ctx.save_for_backward(inp, tgt, weight)
+        ctx.N = N
+        ctx.C = C
+        ctx.D = D
+        ctx.ignore_index = ignore_index
+        ctx.label_smoothing = label_smoothing
+        ctx.shape = shape
+        ctx.mean_num = 1
+        if reduction == 1:
+            ctx.mean_num = N * D if tgt.ndim == dim else wgt_sum
 
-        return out.to(inp.dtype)
+    # out is already in inp.dtype for the common case; skip the cast dispatch.
+    return out if out.dtype == inp.dtype else out.to(inp.dtype)
+
+
+class CrossEntropyLoss(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, inp, target, weight, reduction, ignore_index, label_smoothing):
+        logger.debug("GEMS CrossEntropyLoss")
+        return cross_forward_impl(
+            ctx, inp, target, weight, reduction, ignore_index, label_smoothing
+        )
 
     @staticmethod
     def backward(ctx, out_grad):
@@ -731,11 +758,23 @@ class CrossEntropyLoss(torch.autograd.Function):
 def cross_entropy_loss(
     inp, target, weight=None, reduction="mean", ignore_index=-100, label_smoothing=0.0
 ):
+    reduction = _Reduction.get_enum(reduction)
+    if not (inp.requires_grad or (weight is not None and weight.requires_grad)):
+        # No-grad fast path: bypass torch.autograd.Function.apply, whose
+        # graph-recording machinery costs ~0.3ms per call. That is significant
+        # for memory-bound shapes (e.g. [1024, 65536] runs its kernel in ~3ms),
+        # and when nothing requires grad the recorded graph is never used, so
+        # running the forward directly is semantically identical.
+        logger.debug("GEMS CrossEntropyLoss")
+        return cross_forward_impl(
+            None, inp, target, weight, reduction, ignore_index, label_smoothing
+        )
     return CrossEntropyLoss.apply(
         inp,
         target,
         weight,
-        _Reduction.get_enum(reduction),
+        reduction,
         ignore_index,
         label_smoothing,
     )
+
