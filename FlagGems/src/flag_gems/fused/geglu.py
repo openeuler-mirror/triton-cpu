@@ -143,8 +143,8 @@ def geglu(input_tensor: torch.Tensor, quantizer: Optional[Any] = None) -> torch.
         input_2d.stride(1),
         output_2d.stride(0),
         output_2d.stride(1),
-        BLOCK_SIZE_M=8,
-        BLOCK_SIZE_H=64,
+        BLOCK_SIZE_M=16,
+        BLOCK_SIZE_H=16,
     )
     # print("geglu")
     return output_2d.view(*shape[:-1], H)

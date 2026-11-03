@@ -147,6 +147,7 @@ class BenchMode(Enum):
 class BenchLevel(Enum):
     COMPREHENSIVE = "comprehensive"
     CORE = "core"
+    MAX = "max"
 
 
 @dataclass
@@ -186,7 +187,7 @@ class BenchmarkResult:
 
     def __str__(self) -> str:
         header_title = (
-            f"\nOperator: {self.op_name}  Performance Test (dtype={self.dtype}, mode={self.mode},"
+            f"\nOperator: {self.op_name}  Performance Test (dtype={self.dtype}, mode={self.mode}, "
             f"level={self.level})\n"
         )
         col_names = [

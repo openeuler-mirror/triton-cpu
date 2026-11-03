@@ -22,6 +22,7 @@ from mlir.dialects.transform import structured, loop, vector, bufferization, ten
 
 ENABLE_FALLBACK = False
 
+
 def _enable_linalg_tiling_pipeline() -> bool:
     """Return whether the experimental linalg tiling pipeline is enabled."""
     return os.getenv("TRITON_SHARED_ENABLE_LINALG_TILING_PIPELINE", "0") == "1"
@@ -129,6 +130,119 @@ _STACK_PROMOTE_LIMIT = int(
     os.environ.get("TRITON_SHARED_STACK_PROMOTE_LIMIT", str(16 * 1024))
 )
 
+_OUTER_REDUCTION_WIDTH_THRESHOLD = 256
+_OUTER_REDUCTION_TILE_SIZE = 64
+
+
+def _add_outer_reduction_tiling_schedule():
+    """Add a schedule that tiles statically large dimension-zero reductions."""
+    any_op = transform.AnyOpType.get()
+    i64_type = IntegerType.get_signless(64)
+    param_i64_type = transform.ParamType.get(i64_type)
+
+    matcher_name = "large_outer_reduction_matcher"
+    matcher = transform.NamedSequenceOp(
+        matcher_name,
+        [any_op],
+        [any_op],
+        arg_attrs=[{"transform.readonly": UnitAttr.get()}],
+    )
+    with InsertionPoint(matcher.body):
+        candidate = matcher.body.arguments[0]
+        match_op = Operation.create(
+            "transform.match.structured",
+            results=[any_op],
+            operands=[candidate],
+            attributes={
+                "failure_propagation_mode": IntegerAttr.get(
+                    IntegerType.get_signless(32),
+                    int(transform.FailurePropagationMode.Propagate),
+                ),
+            },
+            regions=1,
+        )
+        body = match_op.regions[0].blocks.append(any_op)
+        struct = body.arguments[0]
+        with InsertionPoint(body):
+            transform.match_operation_name(struct, ["linalg.reduce"])
+            # Partial reduction tiling requires each result to have a single
+            # recognized combiner. Exclude tuple reductions such as argmax and
+            # Welford before applying the transform.
+            one = transform.ParamConstantOp(
+                param_i64_type,
+                IntegerAttr.get(i64_type, 1),
+            ).param
+            num_inputs = Operation.create(
+                "transform.match.structured.num_inputs",
+                results=[param_i64_type],
+                operands=[struct],
+            ).results[0]
+            transform.MatchParamCmpIOp(
+                num_inputs,
+                one,
+                transform.MatchCmpIPredicate.eq,
+            )
+            num_inits = Operation.create(
+                "transform.match.structured.num_inits",
+                results=[param_i64_type],
+                operands=[struct],
+            ).results[0]
+            transform.MatchParamCmpIOp(
+                num_inits,
+                one,
+                transform.MatchCmpIPredicate.eq,
+            )
+            Operation.create(
+                "transform.match.structured.body",
+                operands=[struct],
+                attributes={
+                    "reduction_position": IntegerAttr.get(i64_type, 0),
+                },
+            )
+            reduction_width = Operation.create(
+                "transform.match.structured.dim",
+                results=[param_i64_type],
+                operands=[struct],
+                attributes={"raw_dim_list": DenseI64ArrayAttr.get([0])},
+            ).results[0]
+            threshold = transform.ParamConstantOp(
+                param_i64_type,
+                IntegerAttr.get(i64_type, _OUTER_REDUCTION_WIDTH_THRESHOLD),
+            ).param
+            transform.MatchParamCmpIOp(
+                reduction_width,
+                threshold,
+                transform.MatchCmpIPredicate.gt,
+            )
+            Operation.create(
+                "transform.match.structured.yield",
+                operands=[struct],
+            )
+        transform.YieldOp([match_op.results[0]])
+
+    schedule = transform.NamedSequenceOp(
+        "reduction_tiling_schedule",
+        [any_op],
+        [any_op],
+        arg_attrs=[{"transform.readonly": UnitAttr.get()}],
+    )
+    with InsertionPoint(schedule.body):
+        reductions = transform.CollectMatchingOp(
+            [any_op],
+            schedule.bodyTarget,
+            FlatSymbolRefAttr.get(matcher_name),
+        )
+        structured.TileReductionUsingForOp(
+            [any_op],
+            any_op,
+            any_op,
+            any_op,
+            reductions.results[0],
+            tile_sizes=[_OUTER_REDUCTION_TILE_SIZE],
+        )
+        transform.YieldOp([schedule.bodyTarget])
+
+
 def _promote_buffers_to_stack(funcs):
     """memref.alloc -> memref.alloca for the small per-tile scratch buffers.
 
@@ -233,6 +347,7 @@ class CPUOptions:
     disable_kunpeng_llm: bool = False
     sme_matmul_k_tile : int = 32
     enable_sme_streaming_autovec: bool = False
+    enable_opt_o3: bool = False
     sanitize_overflow: bool = True
     vec_lib: Optional[str] = 'libsleef'
 
@@ -262,8 +377,8 @@ class CPUBackend(BaseBackend):
         super().__init__(target)
         # Cache get_cpu_features() - it calls into LLVM and costs ~150µs on aarch64.
         if CPUBackend._cpu_features_cache is None:
-            CPUBackend._cpu_features_cache = llvm.get_cpu_features()
             CPUBackend._cpu_arch_cache = llvm.get_cpu_tripple().split("-")[0]
+            CPUBackend._cpu_features_cache = set(llvm.get_cpu_features())
         self.cpu_features = CPUBackend._cpu_features_cache
         self.cpu_arch = CPUBackend._cpu_arch_cache
         # Only detect vscale on aarch64 with SVE; None means SVE unused
@@ -337,6 +452,9 @@ class CPUBackend(BaseBackend):
         )
         args['enable_sme_streaming_autovec'] = (
             os.environ.get("TRITON_SHARED_ENABLE_SME_STREAMING_AUTOVEC", "0") == "1"
+        )
+        args['enable_opt_o3'] = (
+            os.environ.get("TRITON_SHARED_ENABLE_OPT_O3", "0") == "1"
         )
         return CPUOptions(**args)
 
@@ -1090,6 +1208,13 @@ class CPUBackend(BaseBackend):
                     vector.ApplyTransferToScfPatternsOp(full_unroll=True)
                     vector.ApplyLowerShapeCastPatternsOp()
 
+                funcs = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                    "lower-outer-reduction-sve",
+                    options=f"vscale={self.sve_vscale}",
+                )
+
                 # 7) add lower_transpose
                 with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
                     vector.ApplyLowerContractionPatternsOp()
@@ -1206,6 +1331,13 @@ class CPUBackend(BaseBackend):
             )
                 
             with InsertionPoint(sequence.body):
+                transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    FlatSymbolRefAttr.get("reduction_tiling_schedule"),
+                    transform.FailurePropagationMode.Propagate,
+                    [sequence.bodyTarget],
+                )
+
                 # Apply pre-tiling linalg optimizations
                 opts = transform.IncludeOp(
                     [],
@@ -1295,6 +1427,7 @@ class CPUBackend(BaseBackend):
                 linalg_opts()
                 contraction_schedule()
                 main_type1("contraction_schedule", "contraction")
+                _add_outer_reduction_tiling_schedule()
                 vectorize_schedule()
                 main_type1("vectorize_schedule", "vectorize")
                 bufferize_schedule()
@@ -1706,8 +1839,42 @@ class CPUBackend(BaseBackend):
             )
                 
             with InsertionPoint(sequence.body):
+                # Normalize vector contractions while transfers still have
+                # tensor semantics, then hoist their invariant accumulator
+                # subsets into loop-carried vectors before bufferization.
+                with InsertionPoint(
+                    transform.ApplyPatternsOp(sequence.bodyTarget).patterns
+                ):
+                    vector.ApplyLowerMaskedTransfersPatternsOp()
+                    vector.ApplyTransferPermutationPatternsOp()
+                    vector.ApplyVectorReductionToContractPatternsOp()
+                with InsertionPoint(
+                    transform.ApplyPatternsOp(sequence.bodyTarget).patterns
+                ):
+                    vector.ApplyCastAwayVectorLeadingOneDimPatternsOp()
+                    vector.ApplyLowerContractionPatternsOp(
+                        lowering_strategy=vector.VectorContractLowering.OuterProduct
+                    )
+                    vector.ApplyLowerMasksPatternsOp()
+                    transform.ApplyCanonicalizationPatternsOp()
+                invariant = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    sequence.bodyTarget,
+                    "loop-invariant-code-motion",
+                )
+                hoisted = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    invariant.result,
+                    "loop-invariant-subset-hoisting",
+                )
+                # Subset hoisting adds temporary tensor loop arguments. Drop
+                # their now-unused yields before bufferization, otherwise the
+                # alias analysis may allocate/copy a dynamic accumulator tile.
+                canonical = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(), hoisted.result, "canonicalize"
+                )
                 buff = bufferization.OneShotBufferizeOp(
-                    sequence.bodyTarget, bufferize_function_boundaries=True,
+                    canonical.result, bufferize_function_boundaries=True,
                     allow_return_allocs_from_loops=True,
                     )
 
@@ -1874,11 +2041,23 @@ class CPUBackend(BaseBackend):
                     vector.ApplyTransferPermutationPatternsOp()
                     # Repeat lowerMultiReduction in case lowerContraction generated some multi reductions.
                     vector.ApplyLowerMultiReductionPatternsOp(lowering_strategy=vector.VectorMultiReductionLowering.InnerReduction)
-                    vector.ApplySplitTransferFullPartialPatternsOp(split_transfer_strategy=vector.VectorTransferSplit.VectorTransfer)
+                    # Do not split transfers back into vector.transfer_read
+                    # branches here: dynamically sized boundary buffers can
+                    # repeatedly match that split. The lower-transfer/SCF
+                    # patterns below lower their masks directly.
                     vector.ApplyLowerTransferPatternsOp()
                     # TODO: Check if full unroll false is still necessary with tiling.
                     vector.ApplyTransferToScfPatternsOp(full_unroll=True)
                     vector.ApplyLowerShapeCastPatternsOp()
+
+                funcs = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                    "lower-outer-reduction-sve",
+                    options=f"vscale={self.sve_vscale}",
+                )
+
+                with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
                     # TODO: CHECK if we still need that lowering strategy once we have auto tiling.
                     vector.ApplyLowerTransposePatternsOp()
 
@@ -1985,11 +2164,17 @@ class CPUBackend(BaseBackend):
                     funcs.result,
                     deduplicate=True,
                 )
+                tiled_reductions = transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    FlatSymbolRefAttr.get("reduction_tiling_schedule"),
+                    transform.FailurePropagationMode.Propagate,
+                    [module],
+                )
                 optimized_linalgs = transform.IncludeOp(
                     [transform.AnyOpType.get()],
                     FlatSymbolRefAttr.get("linalg_opts"),
                     transform.FailurePropagationMode.Suppress, # Flatten ew can emit failures for non-linalg ew ops, expected
-                    [module],
+                    [tiled_reductions],
                 )
                 optimized_linalgs = transform.IncludeOp(
                     [transform.AnyOpType.get()],
@@ -2058,6 +2243,7 @@ class CPUBackend(BaseBackend):
             
             with InsertionPoint(mod.body):
                 linalg_opts()
+                _add_outer_reduction_tiling_schedule()
                 tile_batch_matmul_sme()
                 tile_matmul_sme()
                 bufferize_schedule()
@@ -2071,7 +2257,7 @@ class CPUBackend(BaseBackend):
             return src + "\n" + str(mod)
 
     @timer
-    def _optimize_ttsharedir(self, src: str):
+    def _optimize_ttsharedir(self, src: str, options):
         # A backend instance is reused across kernels; do not reuse its SME choice.
         self._used_sme = False
         has_matmul = re.search(r"\blinalg\.(?:batch_)?matmul\b", src) is not None
@@ -2279,15 +2465,21 @@ class CPUBackend(BaseBackend):
         emits, which is what llc then reads.
         """
         if self._sme_pipeline_used():
+            features = "+sme,+dotprod,+v9a,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+sve,+sve2"
+            if "bf16" in self.cpu_features:
+                features += ",+bf16"
             return (
                 "-mtriple=aarch64-linux-gnu",
-                "-mattr=+sme,+dotprod,+v9a,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+sve,+sve2",
+                f"-mattr={features}",
             )
         if os.environ.get("TRITON_SHARED_FORCE_SVE_PIPELINE", "0") == "1" \
             or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
+            features = "+sve,+dotprod,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+spe"
+            if "bf16" in self.cpu_features:
+                features += ",+bf16"
             return (
                 "-mtriple=aarch64-linux-gnu",
-                "-mattr=+sve,+dotprod,+v8.5a,+v8.4a,+v8.3a,+v8.2a,+v8.1a,+spe",
+                f"-mattr={features}",
             )
         return ()
 
@@ -2302,6 +2494,7 @@ class CPUBackend(BaseBackend):
             Path(src_path).write_text(llir)
             opt_path = _get_llvm_bin_path("opt")
             if os.path.exists(opt_path):
+                use_o3 = options is not None and options.enable_opt_o3
                 #FIXME: should we add other opt optimizations too?
                 subprocess.check_call([
                     opt_path,
@@ -2316,7 +2509,8 @@ class CPUBackend(BaseBackend):
                       if options is not None
                       and options.enable_sme_streaming_autovec
                       and self._sme_pipeline_used() else []),
-                    "-passes=function(loop-mssa(loop-rotate,loop-idiom),instcombine<max-iterations=1;no-verify-fixpoint>,sroa),simplifycfg,dse,loop-vectorize",
+                    ("-passes=default<O3>" if use_o3 else
+                     "-passes=function(loop-mssa(loop-rotate,loop-idiom),instcombine<max-iterations=1;no-verify-fixpoint>,sroa),simplifycfg,dse,loop-vectorize"),
                     src_path,
                     "-o",
                     llir_path,
@@ -2356,7 +2550,7 @@ class CPUBackend(BaseBackend):
 
     def add_stages(self, stages, options):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
-        stages["ttsharedir"] = lambda src, metadata: self._optimize_ttsharedir(self._ttir_to_ttsharedir(src, options))
+        stages["ttsharedir"] = lambda src, metadata: self._optimize_ttsharedir(self._ttir_to_ttsharedir(src, options), options)
         stages["llir"] = lambda src, metadata: self._optimize_llir(self._ttsharedir_to_llir(src), options)
         stages["obj"] = lambda src, metadata: self._llir_to_bin(src, metadata, options)
 

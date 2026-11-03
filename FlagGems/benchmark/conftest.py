@@ -83,7 +83,7 @@ def pytest_addoption(parser):
         default="comprehensive",
         required=False,
         choices=[level.value for level in BenchLevel],
-        help="Specify the benchmark level: comprehensive, or core.",
+        help="Specify the benchmark level: comprehensive, core, or max.",
     )
 
     parser.addoption(

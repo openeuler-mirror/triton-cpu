@@ -299,14 +299,15 @@ def upsample_nearest2d_USE_INT32_IDX(args):
 
 
 def batch_norm_heur_block_m(args):
-    return min(4, triton.next_power_of_2(args["batch_dim"]))
+    # Keep the batch axis scalar to avoid large shuffle chains in CPU lowering.
+    return min(1, triton.next_power_of_2(args["batch_dim"]))
 
 
 def batch_norm_heur_block_n(args):
-    # A maximum of 16384 elements are loaded at once.
+    # A maximum of 256 elements are loaded at once.
     BLOCK_M = batch_norm_heur_block_m(args)
     BLOCK_N = triton.next_power_of_2(args["spatial_dim"])
-    return min(BLOCK_N, max(1, 2**14 // BLOCK_M))
+    return min(BLOCK_N, max(1, 2**8 // BLOCK_M))
 
 
 def vdot_heur_block_size(args):

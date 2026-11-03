@@ -72,4 +72,13 @@ def DoubleBufferLoopAllocations : Pass<"double-buffer-loop-allocations", "mlir::
   let constructor = "triton::createDoubleBufferLoopAllocationsPass()";
 }
 
+def LowerOuterReductionSVE : Pass<"lower-outer-reduction-sve"> {
+  let summary = "lower outer reductions and transposes in SVE-width chunks";
+  let constructor = "triton::createLowerOuterReductionSVEPass()";
+  let options = [
+      Option<"vscale", "vscale", "int64_t", /*default*/"1",
+             "runtime SVE vector length divided by 128 bits">,
+  ];
+}
+
 #endif

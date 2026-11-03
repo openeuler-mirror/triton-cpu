@@ -259,11 +259,28 @@ def topk_stage2_kernel(
         tl.int32
     )
 
-    sorted_chunk_x, sorted_chunk_index = argsort(
-        chunk_x_val, chunk_index_val, 0, descending=DESCENDING
-    )
-    tl.store(y_ptr + cols, sorted_chunk_x, mask=cols < k)
-    tl.store(index_ptr + cols, sorted_chunk_index, mask=cols < k)
+    # Pick the k best elements one at a time instead of bitonic-sorting the
+    # whole block.  On the CPU every bitonic stage's reshape to [n, 2, 2**j] is
+    # vectorized at full size and unrolled element by element, which increases the code
+    # size a lot. Now the loop stays a single scf.for of 1-D reductions.  `taken` (not
+    # a sentinel value) marks consumed and padded slots so inputs equal to +-inf are
+    # never re-selected.
+    taken = cols >= N
+    fill_val = float("-inf") if DESCENDING else float("inf")
+    for k_idx in range(k):
+        cand = tl.where(taken, fill_val, chunk_x_val)
+        if DESCENDING:
+            sel_val = tl.max(cand, axis=0)
+        else:
+            sel_val = tl.min(cand, axis=0)
+        sel_col = tl.min(
+            tl.where((~taken) & (chunk_x_val == sel_val), cols, BLOCK_SIZE), axis=0
+        )
+        hit = cols == sel_col
+        sel_index = tl.sum(tl.where(hit, chunk_index_val, 0), axis=0)
+        tl.store(y_ptr + k_idx, sel_val)
+        tl.store(index_ptr + k_idx, sel_index)
+        taken = taken | hit
 
 
 def topk(x, k, dim=-1, largest=True, sorted=True):

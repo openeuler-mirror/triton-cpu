@@ -270,7 +270,7 @@ def rms_norm_forward(x, normalized_shape, weight, eps=1e-5):
             BLOCK_SIZE = triton.next_power_of_2(N)
             rms_norm_kernel[M,](y, inv_rms, x, weight, N, 1, N, 1, N, eps, BLOCK_SIZE)
         else:
-            BLOCK_SIZE = 4096
+            BLOCK_SIZE = 256 if x.device.type == "cpu" else 4096
             rms_norm_loop_kernel[M,](y, inv_rms, x, weight, N, 1, N, 1, N, eps, BLOCK_SIZE)
 
     return y, inv_rms
@@ -294,13 +294,13 @@ def rms_norm_backward(dy, x, inv_rms, normalized_shape, weight, eps=1e-5):
                 x, dy, inv_rms, dx, weight, N, 1, N, 1, N, eps, BLOCK_SIZE
             )
         else:
-            BLOCK_SIZE = 4096
+            BLOCK_SIZE = 256 if x.device.type == "cpu" else 4096
             rms_norm_grad_dx_loop_kernel[M,](
                 x, dy, inv_rms, dx, weight, N, 1, N, 1, N, eps, BLOCK_SIZE
             )
 
     ROW_BLOCK_SIZE = 16
-    COL_BLOCK_SIZE = 256
+    COL_BLOCK_SIZE = 16 if x.device.type == "cpu" else 256
     row_block_num = triton.cdiv(M, ROW_BLOCK_SIZE)
     col_block_num = triton.cdiv(N, COL_BLOCK_SIZE)
 

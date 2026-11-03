@@ -118,6 +118,25 @@ def _generate_launcher(constants, signature, kernel_name):
     kernel_parameters = ', '.join(f"static_cast<{_ty_to_cpp(ty)}>(arg{i})" if ty[0] != "*" else f"0, &ptr_arg{i}" for i, ty in signature.items() if ty != "constexpr")
     kernel_parameters += ', ' if kernel_parameters else ''
 
+    parallel_loop = """#pragma omp parallel for schedule(static) num_threads(nthreads)
+  for (int64_t i = 0; i < N; ++i) {"""
+    parallel_end = ""
+    if os.environ.get("TRITON_SHARED_RESERVE_MASTER_THREAD", "0") == "1":
+        # Keep the caller's caches warm without increasing the maximum
+        # number of programs per worker.
+        parallel_loop = """#pragma omp parallel num_threads(nthreads)
+  {
+  int team_size = omp_get_num_threads();
+  int tid = omp_get_thread_num();
+  bool reserve_master = team_size > 1 &&
+      (N + team_size - 2) / (team_size - 1) == (N + team_size - 1) / team_size;
+  int workers = team_size - reserve_master;
+  int worker = tid - reserve_master;
+  int64_t start = worker >= 0 ? (N * worker) / workers : 0;
+  int64_t end = worker >= 0 ? (N * (worker + 1)) / workers : 0;
+  for (int64_t i = start; i < end; ++i) {"""
+        parallel_end = "\n  }"
+
     return f"""
 #ifdef _OPENMP
 #include <omp.h>
@@ -171,8 +190,7 @@ if (N > 1) {{
        c = __atomic_fetch_add(&next, chunk, __ATOMIC_RELAXED))
   for (int64_t i = c; i < c + chunk && i < N; ++i) {{
 #else
-#pragma omp parallel for schedule(static) num_threads(nthreads)
-  for (int64_t i = 0; i < N; ++i) {{
+{parallel_loop}
 #endif
     int x = i % gridX;
     int y = (i / gridX) % gridY;
@@ -182,7 +200,7 @@ if (N > 1) {{
 
     {kernel_name}({kernel_parameters}
                   gridX, gridY, gridZ, x, y, z);
-  }}
+  }}{parallel_end}
   return;
 }}
 #endif

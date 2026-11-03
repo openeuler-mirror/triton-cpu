@@ -131,14 +131,15 @@ def fused_add_rms_norm(x, residual, normalized_shape, weight, eps=1e-5):
     residual = residual.contiguous()
     weight = weight.contiguous()
 
+    MAX_BLOCK_SIZE = 256 if x.device.type == "cpu" else 4096
     with torch_device_fn.device(x.device):
-        if N < 4096:
+        if N < MAX_BLOCK_SIZE:
             BLOCK_SIZE = triton.next_power_of_2(N)
             fused_add_rms_norm_kernel[M,](
                 x, residual, weight, N, 1, N, 1, N, eps, BLOCK_SIZE
             )
         else:
-            BLOCK_SIZE = 4096
+            BLOCK_SIZE = MAX_BLOCK_SIZE
             fused_add_rms_norm_loop_kernel[M,](
                 x, residual, weight, N, 1, N, 1, N, eps, BLOCK_SIZE
             )
