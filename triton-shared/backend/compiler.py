@@ -324,6 +324,10 @@ class CPUOptions:
     sme_matmul_k_tile : int = 32
     enable_sme_streaming_autovec: bool = False
     enable_opt_o3: bool = False
+    # Opt-in SVE FEXPA exp2 lowering (triton-shared ExpandExp2Fexpa).  Only
+    # useful for kernels that use tl.exp2 and cannot call libm; set it as a
+    # launch kwarg on such kernels.
+    enable_fexpa_exp2: bool = False
     sanitize_overflow: bool = True
     vec_lib: Optional[str] = 'libsleef'
 
@@ -507,7 +511,7 @@ class CPUBackend(BaseBackend):
 
 
 
-    def _sve_transform(self, src: str) -> str:
+    def _sve_transform(self, src: str, options) -> str:
         enable_linalg_tiling_pipeline = _enable_linalg_tiling_pipeline()
 
         def linalg_opts():
@@ -617,7 +621,7 @@ class CPUBackend(BaseBackend):
                 ## get parent op
                 p = transform.get_parent_op(
                     transform.AnyOpType.get(),
-                    funcs.result, 
+                    funcs.result,
                     deduplicate=True,
                 )
                 ## include
@@ -627,7 +631,7 @@ class CPUBackend(BaseBackend):
                     transform.FailurePropagationMode.Propagate,
                     [p],
                 )
-                
+
                 ## cse
                 cse = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
@@ -638,7 +642,7 @@ class CPUBackend(BaseBackend):
                 with InsertionPoint(transform.ApplyPatternsOp(cse).patterns):
                     structured.apply_patterns_linalg_tiling_canonicalization()
                     loop.apply_patterns_scf_for_loop_canonicalization()
-                
+
                 ## match looplike
                 looplike = structured.MatchOp.__base__(
                     transform.AnyOpType.get(),
@@ -679,7 +683,7 @@ class CPUBackend(BaseBackend):
                 )
 
                 transform.YieldOp([])
-  
+
         def main_type2(include, name):
             sequence = transform.NamedSequenceOp(
                 "main_type2_" + name,
@@ -698,7 +702,7 @@ class CPUBackend(BaseBackend):
                 ## get parent op
                 p = transform.get_parent_op(
                     transform.AnyOpType.get(),
-                    funcs.result, 
+                    funcs.result,
                     deduplicate=True,
                 )
                 ## cse
@@ -717,11 +721,11 @@ class CPUBackend(BaseBackend):
                 ## include
                 sme = transform.IncludeOp(
                     [transform.AnyOpType.get()],
-                    include, 
+                    include,
                     transform.FailurePropagationMode.Propagate,
                     [can],
                 )
-                
+
                 cse = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
                     sme.result,
@@ -731,7 +735,7 @@ class CPUBackend(BaseBackend):
                 with InsertionPoint(transform.ApplyPatternsOp(cse).patterns):
                     structured.apply_patterns_linalg_tiling_canonicalization()
                     loop.apply_patterns_scf_for_loop_canonicalization()
-                
+
                 ## match looplike
                 looplike = structured.MatchOp.__base__(
                     transform.AnyOpType.get(),
@@ -772,8 +776,8 @@ class CPUBackend(BaseBackend):
                 )
 
                 transform.YieldOp([])
- 
- 
+
+
 
         def contraction_schedule():
             sequence = transform.NamedSequenceOp(
@@ -784,12 +788,12 @@ class CPUBackend(BaseBackend):
             )
 
             with InsertionPoint(sequence.body):
-                
+
                 matmuls = structured.MatchOp.match_op_names(
                     sequence.bodyTarget,
                     ["linalg.matmul"]
                 )
-                
+
                 tiled1 = structured.TileUsingForOp(
                     matmuls.result,
                     sizes=[2048, 256, 256],
@@ -877,7 +881,7 @@ class CPUBackend(BaseBackend):
                 arg_attrs = [{"transform.consumed": UnitAttr.get()}],
             )
             with InsertionPoint(sequence.body):
-                vec = structured.VectorizeChildrenAndApplyPatternsOp(sequence.bodyTarget, vectorize_padding=True, vectorize_nd_extract=True) 
+                vec = structured.VectorizeChildrenAndApplyPatternsOp(sequence.bodyTarget, vectorize_padding=True, vectorize_nd_extract=True)
                 transform.YieldOp([vec])
 
         def bufferize_schedule():
@@ -893,8 +897,8 @@ class CPUBackend(BaseBackend):
                     sequence.bodyTarget,
                     ["tensor.empty"]
                 )
-                
-                cast = transform.CastOp(transform.OperationType.get("tensor.empty"), matched.result)               
+
+                cast = transform.CastOp(transform.OperationType.get("tensor.empty"), matched.result)
                 alloc = bufferization.EmptyTensorToAllocTensorOp(cast.result)
                 oneshot = bufferization.OneShotBufferizeOp(
                     sequence.bodyTarget,
@@ -947,7 +951,7 @@ class CPUBackend(BaseBackend):
                 ## get parent op
                 p = transform.get_parent_op(
                     transform.AnyOpType.get(),
-                    funcs.result, 
+                    funcs.result,
                     deduplicate=True,
                 )
                 ## include
@@ -957,7 +961,7 @@ class CPUBackend(BaseBackend):
                     transform.FailurePropagationMode.Propagate,
                     [p],
                 )
-                
+
                 ## cse
                 cse = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
@@ -1035,7 +1039,7 @@ class CPUBackend(BaseBackend):
                 )
 
                 transform.YieldOp([])
- 
+
 
         def legalize_schedule():
             sequence = transform.NamedSequenceOp(
@@ -1050,9 +1054,9 @@ class CPUBackend(BaseBackend):
                     vscale=self.sve_vscale,
                 )
                 transform.YieldOp([sequence.bodyTarget])
- 
-           
-        
+
+
+
         def pipeline_schedule():
             sequence = transform.NamedSequenceOp(
                 "pipeline_schedule",
@@ -1220,9 +1224,9 @@ class CPUBackend(BaseBackend):
                     vscale_range=self.sve_vscale,
                 )
                 transform.YieldOp([sequence.bodyTarget])
- 
 
-        ## instead of using mlir-opt we embed the optimization passes in the transform dialect 
+
+        ## instead of using mlir-opt we embed the optimization passes in the transform dialect
         def opt():
             sequence = transform.NamedSequenceOp(
                 "opt",
@@ -1233,7 +1237,7 @@ class CPUBackend(BaseBackend):
 
             with InsertionPoint(sequence.body):
 
-                   
+
                 fp = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
                     sequence.bodyTarget,
@@ -1247,26 +1251,43 @@ class CPUBackend(BaseBackend):
                     "arith-expand",
                     options='include-f8e5m2=true include-f8e4m3fn=true'
                 )
- 
+
+                # NOTE: by default math.exp2 is NOT rewritten here (unlike
+                # the SME pipeline): llvm.exp2 reaches llc and is lowered to
+                # the libm vector call. With FEXPA enabled we rewrite it here
+                # into 1-ULP FEXPA sequences on SVE container chunks using
+                # a direct call to the upstream llvm.aarch64.sve.fexpa.x
+                # intrinsic plus standard vector.scalable.insert/extract
+                # staging (chunk-width =
+                # vscale_min * 4, the same vscale the function's vscale_range
+                # is derived from).
                 poly = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
                     fp2.result,
                     "test-math-polynomial-approximation",
                 )
 
-                p = transform.get_parent_op(
+                fexpa = transform.get_parent_op(
                     transform.AnyOpType.get(),
-                    poly.result, 
+                    poly.result,
                     deduplicate=True,
                 )
 
+                if options.enable_fexpa_exp2 and self.sve_vscale:
+                    fexpa = transform.ApplyRegisteredPassOp(
+                        transform.AnyOpType.get(),
+                        fexpa,
+                        "expand-exp2-fexpa",
+                        options=f"chunk-width={4 * self.sve_vscale}",
+                    )
+
                 tptr = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
-                    p,
+                    fexpa,
                     "tptr-to-llvm",
                 )
 
-                
+
                 cann = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
                     tptr.result,
@@ -1295,7 +1316,7 @@ class CPUBackend(BaseBackend):
                 [],
                 arg_attrs = [{"transform.readonly": UnitAttr.get()}],
             )
-                
+
             with InsertionPoint(sequence.body):
                 transform.IncludeOp(
                     [transform.AnyOpType.get()],
@@ -1332,39 +1353,39 @@ class CPUBackend(BaseBackend):
                     transform.FailurePropagationMode.Propagate,
                     [sequence.bodyTarget],
                 )
-                
+
                 include_legalize = transform.IncludeOp(
                     [],
                     FlatSymbolRefAttr.get("main_type1_legalize"),
                     transform.FailurePropagationMode.Propagate,
                     [sequence.bodyTarget],
                 )
-                
+
 
                 # NOTE: pipeline_schedule skipped - requires unimplemented
                 # isMicroKernel PDL native constraint
-                
+
                 include6 = transform.IncludeOp(
                     [],
                     FlatSymbolRefAttr.get("main_type2_loops"),
                     transform.FailurePropagationMode.Propagate,
                     [sequence.bodyTarget],
                 )
-                
+
                 funcs = structured.MatchOp.match_op_names(
                     transform.OperationType.get("func.func"),
                     sequence.bodyTarget,
                     ["func.func"]
                 )
- 
+
                 ## for each
                 foreach = transform.ForeachOp(
                     [],
                     funcs,
                 )
-                    
+
                 foreachBody = foreach.body.blocks.append(transform.OperationType.get("func.func"))
-                    
+
                 with InsertionPoint(foreachBody):
                     # passes for fp8
                     transform.IncludeOp(
@@ -1374,7 +1395,7 @@ class CPUBackend(BaseBackend):
                         [foreachBody.arguments[0]],
                     )
                     transform.YieldOp([])
-                
+
                 include7 = transform.IncludeOp(
                     [],
                     FlatSymbolRefAttr.get("main_type2_lower_to_llvm"),
@@ -1383,12 +1404,12 @@ class CPUBackend(BaseBackend):
                 )
 
                 transform.YieldOp([])
-                     
+
         with Context() as ctx, Location.unknown():
             mod = Module.create()
             ## add attributes to the module
             mod.operation.attributes["transform.with_named_sequence"] = UnitAttr.get()
-            
+
             with InsertionPoint(mod.body):
                 linalg_opts()
                 contraction_schedule()
@@ -1679,7 +1700,7 @@ class CPUBackend(BaseBackend):
                 for l in reversed(loops):
                     castedLoop = transform.CastOp(for_op_type, l)
                     outermost_peeled, remainder = loop.LoopPeelOp(for_op_type, for_op_type, castedLoop.result).results
-                # After peeling, matmuls in both the peeled loop and the remainder 
+                # After peeling, matmuls in both the peeled loop and the remainder
                 m_peeled = structured.MatchOp.match_op_names(
                     transform.AnyOpType.get(),
                     outermost_peeled,
@@ -1803,7 +1824,7 @@ class CPUBackend(BaseBackend):
                 [transform.AnyOpType.get()],
                 arg_attrs = [{"transform.consumed": UnitAttr.get()}],
             )
-                
+
             with InsertionPoint(sequence.body):
                 # Normalize vector contractions while transfers still have
                 # tensor semantics, then hoist their invariant accumulator
@@ -1899,7 +1920,7 @@ class CPUBackend(BaseBackend):
                     "convert-bufferization-to-memref",
                 )
                 transform.YieldOp([converted.result])
- 
+
         def arm_sme_lowering_schedule():
             sequence = transform.NamedSequenceOp(
                 "__arm_sme_lowering_schedule",
@@ -2047,7 +2068,7 @@ class CPUBackend(BaseBackend):
 
             with InsertionPoint(sequence.body):
 
-                   
+
                 fp = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
                     sequence.bodyTarget,
@@ -2061,7 +2082,7 @@ class CPUBackend(BaseBackend):
                     "arith-expand",
                     options='include-f8e5m2=true include-f8e4m3fn=true'
                 )
- 
+
                 # math.exp2 has no polynomial approximation of its own and
                 # would otherwise become a scalar exp2f libm call; inside the
                 # ZA-using kernel each such call also pays for the lazy ZA
@@ -2080,7 +2101,7 @@ class CPUBackend(BaseBackend):
 
                 p = transform.get_parent_op(
                     transform.AnyOpType.get(),
-                    poly.result, 
+                    poly.result,
                     deduplicate=True,
                 )
 
@@ -2090,7 +2111,7 @@ class CPUBackend(BaseBackend):
                     "tptr-to-llvm",
                 )
 
-                
+
                 cann = transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
                     tptr.result,
@@ -2111,7 +2132,7 @@ class CPUBackend(BaseBackend):
                 )
 
                 transform.YieldOp([])
-        
+
         def transform_main():
             sequence = transform.NamedSequenceOp(
                 "__transform_main",
@@ -2182,7 +2203,7 @@ class CPUBackend(BaseBackend):
                     funcs,
                 )
                 foreachBody = foreach.body.blocks.append(transform.OperationType.get("func.func"))
-                    
+
                 with InsertionPoint(foreachBody):
                     # passes for fp8
                     transform.IncludeOp(
@@ -2192,7 +2213,7 @@ class CPUBackend(BaseBackend):
                         [foreachBody.arguments[0]],
                     )
                     transform.YieldOp([])
- 
+
                 transform.IncludeOp(
                     [transform.AnyOpType.get()],
                     FlatSymbolRefAttr.get("__lower_to_llvm_schedule"),
@@ -2201,12 +2222,12 @@ class CPUBackend(BaseBackend):
                 )
 
                 transform.YieldOp([])
-        
-        
+
+
         with Context() as ctx, Location.unknown():
             mod = Module.create()
             mod.operation.attributes["transform.with_named_sequence"] = UnitAttr.get()
-            
+
             with InsertionPoint(mod.body):
                 linalg_opts()
                 _add_outer_reduction_tiling_schedule()
@@ -2236,7 +2257,7 @@ class CPUBackend(BaseBackend):
             self._used_sme = True
             return self._sme_transform(src, options)
         if (os.environ.get("TRITON_SHARED_FORCE_SVE_PIPELINE", "0") == "1"):
-            return self._sve_transform(src)
+            return self._sve_transform(src, options)
         if not self.cpu_arch == "aarch64":
             return src
 
@@ -2244,7 +2265,7 @@ class CPUBackend(BaseBackend):
             self._used_sme = True
             return self._sme_transform(src, options)
         if ("sve" in self.cpu_features):
-            return self._sve_transform(src)
+            return self._sve_transform(src, options)
 
         warnings.warn("Neither SME or SVE detected/enabled, skipping transform.")
         return src
@@ -2331,17 +2352,17 @@ class CPUBackend(BaseBackend):
                 if kernel_debug_dir:
                     os.makedirs(kernel_debug_dir, exist_ok=True)
                     Path(os.path.join(kernel_debug_dir, "00_input.mlir")).write_text(str(mod))
-                    
+
                     pm1 = ir.pass_manager(context)
                     triton_shared.to_llir.add_transform_interpreter(pm1)
                     pm1.run(mod)
                     Path(os.path.join(kernel_debug_dir, "01_after_transform_interpreter.mlir")).write_text(str(mod))
-                    
+
                     pm2 = ir.pass_manager(context)
                     triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm2)
                     pm2.run(mod)
                     Path(os.path.join(kernel_debug_dir, "02_after_erase_schedule.mlir")).write_text(str(mod))
-                    
+
                     pm_hoist = ir.pass_manager(context)
                     triton_shared.to_llir.add_hoist_static_allocs(pm_hoist)
                     pm_hoist.run(mod)
@@ -2355,12 +2376,12 @@ class CPUBackend(BaseBackend):
                     triton_shared.to_llir.add_promote_i1_to_i8(pm3)
                     pm3.run(mod)
                     Path(os.path.join(kernel_debug_dir, "03_after_convert_to_llvm.mlir")).write_text(str(mod))
-                    
+
                     pm4 = ir.pass_manager(context)
                     triton_shared.to_llir.add_canonicalizer(pm4)
                     pm4.run(mod)
                     Path(os.path.join(kernel_debug_dir, "04_after_canonicalize.mlir")).write_text(str(mod))
-                    
+
                     pm5 = ir.pass_manager(context)
                     triton_shared.to_llir.add_strip_debug_info(pm5)
                     pm5.run(mod)

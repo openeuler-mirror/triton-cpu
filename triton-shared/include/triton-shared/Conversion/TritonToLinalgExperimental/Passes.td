@@ -78,4 +78,31 @@ def LowerOuterReductionSVE : Pass<"lower-outer-reduction-sve"> {
   ];
 }
 
+def ExpandExp2Fexpa : Pass<"expand-exp2-fexpa", "mlir::ModuleOp"> {
+  let summary = "Expand math.exp2 on fixed-length f32 vectors into SVE FEXPA sequences";
+  let description = [{
+    Rewrites math.exp2 on fixed-length f32 vectors whose size is a multiple of
+    the chunk width into a 1-ULP-accurate FEXPA-based sequence per chunk of
+    `chunk-width` lanes:
+
+      clamp to [-126, 127], add 196735.0 (1.5 * 2^17 + 127), bitcast to i32,
+      a call to the upstream llvm.aarch64.sve.fexpa.x intrinsic (declared in
+      the module), then a correction polynomial built from fma.
+
+    Each chunk is moved in and out of the SVE domain with the standard
+    vector.scalable.insert / vector.scalable.extract operations (lowered to
+    llvm.vector.insert/extract), which reinterpret a fixed-length vector as
+    its `vector<[4]xf32>` SVE container register. The chunk width must
+    therefore fit into one SVE register, i.e.
+    it must be at most vscale_min * 4 lanes; the caller (e.g. the triton-shared
+    pipeline) picks the chunk width from the same vscale value that is used to
+    attach the vscale_range to the function.
+  }];
+  let constructor = "triton::createExpandExp2FexpaPass()";
+  let options = [
+      Option<"chunkWidth", "chunk-width", "int64_t", /*default*/"16",
+             "Number of f32 lanes per SVE container chunk (= vscale_min * 4)">,
+  ];
+}
+
 #endif
