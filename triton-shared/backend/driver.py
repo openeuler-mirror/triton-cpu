@@ -1,4 +1,5 @@
 import ctypes
+from contextlib import contextmanager
 import hashlib
 import tempfile
 import sysconfig
@@ -561,13 +562,26 @@ class CPUDeviceInterface:
         self.kernel_times = []
         self.last_start = 0
         self.use_hooks = False
-        triton.compiler.CompiledKernel.launch_enter_hook = None
-        triton.compiler.CompiledKernel.launch_exit_hook = None
 
     def enable_hook_timing(self):
         self.use_hooks = True
         triton.compiler.CompiledKernel.launch_enter_hook = lambda arg: self._enter_hook()
         triton.compiler.CompiledKernel.launch_exit_hook = lambda arg: self._exit_hook()
+
+    @contextmanager
+    def hook_timing(self):
+        # Keep launcher hooks and timing buffers local to this measurement.
+        previous_hooks = (triton.compiler.CompiledKernel.launch_enter_hook,
+                          triton.compiler.CompiledKernel.launch_exit_hook)
+        previous_state = self.use_hooks, self.kernel_times, self.last_start
+        self.kernel_times = []
+        try:
+            self.enable_hook_timing()
+            yield
+        finally:
+            (triton.compiler.CompiledKernel.launch_enter_hook,
+             triton.compiler.CompiledKernel.launch_exit_hook) = previous_hooks
+            self.use_hooks, self.kernel_times, self.last_start = previous_state
 
     def synchronize(self):
         pass
