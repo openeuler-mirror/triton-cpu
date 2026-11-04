@@ -47,6 +47,30 @@ void kunpeng_flash_attention_forward_f16(
     int64_t left_shift, int64_t right_shift, int64_t head_dim,
     float scale_log2);
 
+// As above, but K/V come from a paged cache (flash_attn_varlen_func): key j
+// of this sequence is row (j % page_size) of page page_table[j / page_size],
+//
+//   k + page_table[j / page_size] * k_page_stride + (j % page_size) * k_rs
+//
+// with page_table pointing at the first page of this sequence and k, v at
+// row 0 of the KV head.  q, o and lse address this sequence's rows of this
+// query head, as above; seqlen_q and seqlen_k are the sequence's own lengths.
+// Needs page_size > 0 and a non-null page_table.
+void kunpeng_flash_attention_varlen_forward_bf16(
+    const void *q, int64_t q_rs, const void *k, int64_t k_page_stride,
+    int64_t k_rs, const void *v, int64_t v_page_stride, int64_t v_rs, void *o,
+    int64_t o_rs, float *lse, const int32_t *page_table, int64_t page_size,
+    int64_t row_start, int64_t num_rows, int64_t seqlen_q, int64_t seqlen_k,
+    int64_t window_flags, int64_t left_shift, int64_t right_shift,
+    int64_t head_dim, float scale_log2);
+void kunpeng_flash_attention_varlen_forward_f16(
+    const void *q, int64_t q_rs, const void *k, int64_t k_page_stride,
+    int64_t k_rs, const void *v, int64_t v_page_stride, int64_t v_rs, void *o,
+    int64_t o_rs, float *lse, const int32_t *page_table, int64_t page_size,
+    int64_t row_start, int64_t num_rows, int64_t seqlen_q, int64_t seqlen_k,
+    int64_t window_flags, int64_t left_shift, int64_t right_shift,
+    int64_t head_dim, float scale_log2);
+
 // Called by the Triton launcher before every launch of a kernel that uses
 // this library: per-thread caches of packed inputs are dropped across
 // launches, because inputs may be rewritten in place between them.

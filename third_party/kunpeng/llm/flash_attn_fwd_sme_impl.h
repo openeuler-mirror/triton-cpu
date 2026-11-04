@@ -7,16 +7,16 @@
 
 // Make key tiles [t0, t1) of one head resident in the K/V tile cache.
 static inline void
-FN(ensure_tiles)(const fa_args a, fa_scratch s, const uint16_t *kb,
-                 const uint16_t *vb, int64_t t0,
+FN(ensure_tiles)(const fa_args a, fa_scratch s, const kv_map km,
+                 const kv_map vm, int64_t t0,
                  int64_t t1) __arm_streaming __arm_inout("za") {
   const int D = a.D;
   for (int64_t t = t0; t < t1; t++) {
     const int64_t slot = t % s.ntile;
     if (s.tag[slot] == t)
       continue;
-    pack_rows_u32(s.Kp + slot * L * D / 2, kb, a.k_rs, t * L, a.Sk, D / 2);
-    pack_v(s.Vp + slot * L * D, vb, a.v_rs, t * L, L, a.Sk, D);
+    pack_rows_u32(s.Kp + slot * L * D / 2, km, t * L, a.Sk, D / 2);
+    pack_v(s.Vp + slot * L * D, vm, t * L, L, a.Sk, D);
     s.tag[slot] = t;
   }
 }
@@ -377,7 +377,7 @@ __arm_locally_streaming __arm_new("za") static void FN(task)(
   const fa_scratch s = *sp;
   const int D = a.D, BM = a.block_m, NC = a.chunk_n;
   const int npair = D / 2;
-  const uint16_t *qb = a.q, *kb = a.k, *vb = a.v;
+  const kv_map qm = q_map(a), km = k_map(a), vm = v_map(a);
   uint16_t *ob = a.o;
 
   for (int64_t r0 = rbeg; r0 < rend; r0 += BM) {
@@ -394,13 +394,13 @@ __arm_locally_streaming __arm_new("za") static void FN(task)(
       const int64_t nr1 = rend - r1 < BM ? rend - r1 : BM;
       const int64_t hi1 = row_rb(a, r1 + nr1 - 1) + 1;
       const int64_t lo1 = row_lb(a, r1);
-      prefetch_rows(qb, a.q_rs, r1, r1 + nr1, a.Sq, D);
-      prefetch_rows(kb, a.k_rs, lo1 > hi ? lo1 : hi, hi1, a.Sk, D);
-      prefetch_rows(vb, a.v_rs, lo1 > hi ? lo1 : hi, hi1, a.Sk, D);
+      prefetch_rows(qm, r1, r1 + nr1, a.Sq, D);
+      prefetch_rows(km, lo1 > hi ? lo1 : hi, hi1, a.Sk, D);
+      prefetch_rows(vm, lo1 > hi ? lo1 : hi, hi1, a.Sk, D);
     }
 
     for (int rt = 0; rt < nrt; rt++) {
-      pack_rows_u32(s.Qp + (int64_t)rt * npair * L, qb, a.q_rs, r0 + rt * L,
+      pack_rows_u32(s.Qp + (int64_t)rt * npair * L, qm, r0 + rt * L,
                     a.Sq, npair);
       svst1_f32(svptrue_b32(), mrow + rt * L, svdup_f32(-INFINITY));
       svst1_f32(svptrue_b32(), lrow + rt * L, svdup_f32(0.0f));
@@ -414,7 +414,7 @@ __arm_locally_streaming __arm_new("za") static void FN(task)(
       const int nk = hi - c < NC ? (int)(hi - c) : NC;
       const int64_t t0 = c / L;
       const int first = c == lo, last = c + nk >= hi;
-      FN(ensure_tiles)(a, s, kb, vb, t0, t0 + nk / L);
+      FN(ensure_tiles)(a, s, km, vm, t0, t0 + nk / L);
       FN(s_gemm)(s, D, t0, nk / L, s.ST, nrt, BM);
       FN(softmax)(a, s.ST, s.Pp, s.OT, mrow, lrow, r0, nrt, c, nk, first, BM);
       if (last)
