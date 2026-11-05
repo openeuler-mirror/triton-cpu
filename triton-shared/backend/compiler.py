@@ -23,6 +23,11 @@ from mlir.dialects.transform import structured, loop, vector, bufferization, ten
 ENABLE_FALLBACK = False
 
 
+def _acl_opt_enabled() -> bool:
+    """Return whether the ACL optimization bundle is enabled."""
+    return os.environ.get("TRITON_SHARED_ENABLE_ACL_OPT", "1") != "0"
+
+
 def _enable_linalg_tiling_pipeline() -> bool:
     """Return whether the experimental linalg tiling pipeline is enabled."""
     return os.getenv("TRITON_SHARED_ENABLE_LINALG_TILING_PIPELINE", "0") == "1"
@@ -2578,7 +2583,12 @@ class CPUBackend(BaseBackend):
 
     @functools.lru_cache()
     def hash(self):
-        return self.target
+        # Normalize unset and explicit enablement to one cache identity while
+        # keeping ACL and linalg modes independent.
+        return (
+            f"{self.target}-acl={int(_acl_opt_enabled())}"
+            f"-linalg={int(_enable_linalg_tiling_pipeline())}"
+        )
 
     # The CPU backend does not use any extra python modules, return an empty dictionary
     def get_module_map(self) -> Dict[str, ModuleType]:
