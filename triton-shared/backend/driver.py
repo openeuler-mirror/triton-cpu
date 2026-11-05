@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import tempfile
 import sysconfig
@@ -360,6 +361,29 @@ PyMODINIT_FUNC PyInit___triton_shared_ref_cpu_kernel_launcher(void) {{
 """
 
 
+@functools.lru_cache(maxsize=1)
+def _launcher_implementation_hash():
+    """Hash launcher sources once so implementation changes expire the cache."""
+    backend = Path(__file__).resolve().parent
+    implementation = hashlib.sha256()
+    paths = [Path(__file__).resolve(), *sorted((backend / "include").rglob("*"))]
+    for path in paths:
+        if path.is_file():
+            implementation.update(path.relative_to(backend).as_posix().encode("utf-8") + b"\0")
+            implementation.update(hashlib.sha256(path.read_bytes()).digest())
+    return implementation.digest()
+
+
+def _launcher_cache_key(src, kernel_obj, kunpeng_llm_args=()):
+    """Include normalized ACL and linalg modes in the launcher cache key."""
+    acl_enabled = os.environ.get("TRITON_SHARED_ENABLE_ACL_OPT", "1") != "0"
+    linalg_enabled = os.environ.get("TRITON_SHARED_ENABLE_LINALG_TILING_PIPELINE", "0") == "1"
+    modes = bytes([acl_enabled, linalg_enabled])
+    # Preserve upstream's link-argument identity for Kunpeng LLM launchers.
+    link_flags = " ".join(kunpeng_llm_args).encode("utf-8")
+    return hashlib.md5(src.encode("utf-8") + kernel_obj + link_flags + modes + _launcher_implementation_hash()).hexdigest()
+
+
 def compile_module(launcher_src, kernel_placeholder_name):
     py_version = sys.version_info
     if platform.system() == "Windows":
@@ -409,8 +433,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
         # These flags change what the launcher links, so they are part of the
         # key.
         kunpeng_llm_args = _kunpeng_llm_launcher_args(kernel_obj)
-        key = hashlib.md5(src.encode("utf-8") + kernel_obj +
-                          " ".join(kunpeng_llm_args).encode("utf-8")).hexdigest()
+        key = _launcher_cache_key(src, kernel_obj, kunpeng_llm_args)
         _cached_key[0] = key
 
         # Second fast path: module already loaded (e.g. from a prior process run that

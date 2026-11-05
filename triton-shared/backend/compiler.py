@@ -23,6 +23,11 @@ from mlir.dialects.transform import structured, loop, vector, bufferization, ten
 ENABLE_FALLBACK = False
 
 
+def _acl_opt_enabled() -> bool:
+    """Return whether the ACL optimization bundle is enabled."""
+    return os.environ.get("TRITON_SHARED_ENABLE_ACL_OPT", "1") != "0"
+
+
 def _enable_linalg_tiling_pipeline() -> bool:
     """Return whether the experimental linalg tiling pipeline is enabled."""
     return os.getenv("TRITON_SHARED_ENABLE_LINALG_TILING_PIPELINE", "0") == "1"
@@ -546,6 +551,7 @@ class CPUBackend(BaseBackend):
 
 
     def _sve_transform(self, src: str, options) -> str:
+        acl_opt_enabled = _acl_opt_enabled()
         enable_linalg_tiling_pipeline = _enable_linalg_tiling_pipeline()
 
         def linalg_opts():
@@ -1387,6 +1393,19 @@ class CPUBackend(BaseBackend):
                     transform.FailurePropagationMode.Propagate,
                     [sequence.bodyTarget],
                 )
+
+                if acl_opt_enabled:
+                    # Match the buffered transpose before vector legalization.
+                    transpose_output_functions = structured.MatchOp.match_op_names(
+                        transform.AnyOpType.get(),
+                        sequence.bodyTarget,
+                        ["func.func"],
+                    )
+                    transform.ApplyRegisteredPassOp(
+                        transform.AnyOpType.get(),
+                        transpose_output_functions.result,
+                        "triton-cpu-direct-transpose-output",
+                    )
 
                 include_legalize = transform.IncludeOp(
                     [],
@@ -2578,7 +2597,12 @@ class CPUBackend(BaseBackend):
 
     @functools.lru_cache()
     def hash(self):
-        return self.target
+        # Normalize unset and explicit enablement to one cache identity while
+        # keeping ACL and linalg modes independent.
+        return (
+            f"{self.target}-acl={int(_acl_opt_enabled())}"
+            f"-linalg={int(_enable_linalg_tiling_pipeline())}"
+        )
 
     # The CPU backend does not use any extra python modules, return an empty dictionary
     def get_module_map(self) -> Dict[str, ModuleType]:
