@@ -51,6 +51,27 @@ def _armpl_is_available() -> bool:
         pass
     return False
 
+@functools.lru_cache(maxsize=None)
+def _kunpeng_llm_is_available() -> bool:
+    """Return True if kernels may be lowered to libkunpeng_llm.so calls.
+
+    Like libarmpl_lp64.so, the library is built into triton/_C (from
+    third_party/kunpeng/llm).  Its SME kernels need 512-bit streaming vectors,
+    i.e. the default SME vector length new threads get must be 64 bytes.
+    """
+    try:
+        import triton
+        import importlib.resources
+        lib = os.path.join(str(importlib.resources.files(triton).joinpath("_C")),
+                           "libkunpeng_llm.so")
+        if not os.path.exists(lib):
+            return False
+        with open("/proc/sys/abi/sme_default_vector_length") as f:
+            return int(f.read().strip()) == 64
+    except Exception:
+        return False
+
+
 def _get_triton_shared_opt_path() -> str:
     path = os.getenv("TRITON_SHARED_OPT_PATH", "")
     if path == "":
@@ -321,6 +342,9 @@ class CPUOptions:
     # Keep tl.dot on the linalg (SME/SVE) matmul lowering instead of turning
     # it into ArmPL BLAS calls.
     disable_armpl: bool = False
+    # Keep recognised kernels (flash-attention forward) as Triton code instead
+    # of replacing them by libkunpeng_llm.so calls.
+    disable_kunpeng_llm: bool = False
     sme_matmul_k_tile : int = 32
     enable_sme_streaming_autovec: bool = False
     enable_opt_o3: bool = False
@@ -421,6 +445,12 @@ class CPUBackend(BaseBackend):
         args['disable_armpl'] = (
             os.environ.get("TRITON_SHARED_DISABLE_ARMPL", "0") == "1"
         )
+        # Availability is part of the option (and so of the cache key): a
+        # cached kernel must not call into a library this machine cannot run.
+        args['disable_kunpeng_llm'] = (
+            os.environ.get("TRITON_SHARED_DISABLE_KUNPENG_LLM", "0") == "1"
+            or not _kunpeng_llm_is_available()
+        )
         args['sme_matmul_k_tile'] = int(
             os.environ.get("TRITON_SHARED_SME_MATMUL_K_TILE", "32")
         )
@@ -487,12 +517,16 @@ class CPUBackend(BaseBackend):
             _dump_ir_if_needed(kernel_debug_dir, [src_path])
             triton_shared_opt_path = _get_triton_shared_opt_path()
             try:
+                to_linalg_opts = []
                 if not options.disable_armpl and _armpl_is_available():
-                    cmd = [triton_shared_opt_path, src_path, "--triton-annotate-nontemporal-args",
-                           "--triton-to-linalg-experimental=enable-armpl=true"]
-                else:
-                    cmd = [triton_shared_opt_path, src_path, "--triton-annotate-nontemporal-args",
-                           "--triton-to-linalg-experimental"]
+                    to_linalg_opts.append("enable-armpl=true")
+                if not options.disable_kunpeng_llm:
+                    to_linalg_opts.append("enable-kunpeng-llm=true")
+                to_linalg = "--triton-to-linalg-experimental"
+                if to_linalg_opts:
+                    to_linalg += "=" + " ".join(to_linalg_opts)
+                cmd = [triton_shared_opt_path, src_path, "--triton-annotate-nontemporal-args",
+                       to_linalg]
                 # If mlir dump is enabled, pass option --mlir-print-ir-after-all to triton-shared
                 if os.environ.get("MLIR_ENABLE_DUMP", "0") == "1":
                     cmd.append("--mlir-print-ir-after-all")

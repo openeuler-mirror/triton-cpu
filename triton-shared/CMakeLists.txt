@@ -13,7 +13,7 @@ add_subdirectory(test)
 add_subdirectory(tools)
 
 if (TRITON_SHARED_BUILD_CPU_BACKEND)
-    add_triton_plugin(TritonShared ${CMAKE_CURRENT_SOURCE_DIR}/triton_shared.cc LINK_LIBS TritonSharedAnalysis TritonToLinalg TritonTilingExtIR TritonToArmPL)
+    add_triton_plugin(TritonShared ${CMAKE_CURRENT_SOURCE_DIR}/triton_shared.cc LINK_LIBS TritonSharedAnalysis TritonToLinalg TritonTilingExtIR TritonToArmPL TritonToKunpengLLM)
     target_link_libraries(TritonShared
         PRIVATE
         MLIRAffineToStandard
@@ -59,3 +59,9 @@ set(SLEEF_BUILD_SCALAR_LIB OFF CACHE BOOL "libsleefscalar will not be built." FO
 add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/sleef" sleef)
 # Override sleef's output directory with our own
 set_target_properties(sleef PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
+
+# libkunpeng_llm.so (third_party/kunpeng/llm): Kunpeng LLM kernels that the
+# TritonToKunpengLLM pass lowers recognised kernels to.
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  add_subdirectory("${CMAKE_SOURCE_DIR}/third_party/kunpeng/llm" kunpeng_llm)
+endif()
