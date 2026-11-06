@@ -10,6 +10,7 @@
 #include "triton-shared/Conversion/StructuredToMemref/StructuredToMemref.h"
 #include "triton-shared/Conversion/TritonArithToLinalg/TritonArithToLinalg.h"
 #include "triton-shared/Conversion/TritonToArmPL/ArmPLOpToFunctionPass.h"
+#include "triton-shared/Conversion/TritonToKunpengLLM/Passes.h"
 #include "triton-shared/Conversion/TritonPtrToMemref/TritonPtrToMemref.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/CollapseShape.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/FullTileRegionVersioning.h"
@@ -129,6 +130,10 @@ public:
   void runOnOperation() override {
     auto moduleOp = getOperation();
     PassManager pm(&getContext(), moduleOp.getOperationName());
+    // Whole-kernel library replacements run on the original Triton IR,
+    // before anything is lowered.
+    if (enableKunpengLLM)
+      pm.addPass(createTritonFlashAttentionToKunpengLLMPass());
     pm.addPass(createTritonToStructuredPass(enableMakeGatherScatterTensorPtr));
 
     // Erase dead code and fold constants created during lowering

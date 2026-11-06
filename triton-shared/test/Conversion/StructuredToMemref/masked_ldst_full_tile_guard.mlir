@@ -5,7 +5,7 @@
 //    mask), so the pass inserts a runtime guard `dim == 128` and copies the
 //    whole tile directly when it holds (fast path).
 //  * partial_tile has a static bound `idx < 96`, which can never be a full
-//    tile, so the store stages the full value before a bounded copy.
+//    tile, so no guard is inserted and the general fill + subview path is used.
 module {
   tt.func @masked_load_store_full_tile(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: i32) {
     %0 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<128x!tt.ptr<f32>>
@@ -70,7 +70,8 @@ module {
 // CHECK:           }
 // CHECK:           return
 
-// Static partial masks stage the complete value before copying [0:96] out.
+// Original path: the static bound folds away the guard, so no `arith.cmpi eq`
+// and no `scf.if` appear; only the plain fill + static `[96]` subview copy.
 // CHECK-LABEL:  func.func @masked_load_store_partial_tile
 // CHECK-SAME:   ([[PARAM_0_:%.+]]: memref<*xf32>, [[PARAM_1_:%.+]]: memref<*xf32>, [[PARAM_2_:%.+]]: i32, [[PARAM_3_:%.+]]: i32, [[PARAM_4_:%.+]]: i32, [[PARAM_5_:%.+]]: i32, [[PARAM_6_:%.+]]: i32, [[PARAM_7_:%.+]]: i32) {
 // CHECK-DAG:       [[CST_0_dot_000000_:%.+]] = arith.constant 0.000000e+00 : f32
@@ -82,11 +83,7 @@ module {
 // CHECK-DAG:       [[VAR_subview_1_:%.+]] = memref.subview [[RES_]][0] [96] [1] : memref<128xf32> to memref<96xf32, strided<[1]>>
 // CHECK:           memref.copy [[VAR_subview_]], [[VAR_subview_1_]] : memref<96xf32, strided<[1]>> to memref<96xf32, strided<[1]>>
 // CHECK:           [[VAR_0_:%.+]] = bufferization.to_tensor [[RES_]] restrict writable : memref<128xf32> to tensor<128xf32>
-// CHECK-NOT:       tensor.extract_slice
-// CHECK:           [[STAGING_:%.+]] = memref.alloc() : memref<128xf32>
-// CHECK:           bufferization.materialize_in_destination [[VAR_0_]] in writable [[STAGING_]] : (tensor<128xf32>, memref<128xf32>) -> ()
-// CHECK-DAG:       [[STAGING_SLICE_:%.+]] = memref.subview [[STAGING_]][0] [96] [1] : memref<128xf32> to memref<96xf32, strided<[1]>>
+// CHECK-DAG:       [[VAR_extracted_slice_:%.+]] = tensor.extract_slice [[VAR_0_]][0] [96] [1] : tensor<128xf32> to tensor<96xf32>
 // CHECK-DAG:       [[VAR_subview_2_:%.+]] = memref.subview [[VAR_reinterpret_cast_0_]][0] [96] [1] : memref<128xf32, strided<[1]>> to memref<96xf32, strided<[1]>>
-// CHECK:           memref.copy [[STAGING_SLICE_]], [[VAR_subview_2_]] : memref<96xf32, strided<[1]>> to memref<96xf32, strided<[1]>>
-// CHECK-NOT:       tensor.extract_slice
+// CHECK:           bufferization.materialize_in_destination [[VAR_extracted_slice_]] in writable [[VAR_subview_2_]] : (tensor<96xf32>, memref<96xf32, strided<[1]>>) -> ()
 // CHECK:           return

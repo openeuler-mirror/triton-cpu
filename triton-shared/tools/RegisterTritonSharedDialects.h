@@ -20,6 +20,7 @@
 #include "triton-shared/Conversion/TritonToLinalg/Passes.h"
 #include "triton-shared/Dialect/TPtr/IR/TPtrDialect.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/Passes.h"
+#include "triton-shared/Conversion/TritonToKunpengLLM/Passes.h"
 #include "triton-shared/Conversion/TritonToStructured/Passes.h"
 #include "triton-shared/Conversion/UnstructuredToMemref/Passes.h"
 #include "triton-shared/Conversion/TritonToUnstructured/Passes.h"
@@ -305,6 +306,7 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
   mlir::triton::gpu::registerTritonGPUPasses();
   mlir::triton::registerTritonToLinalgPass();
   mlir::triton::registerTritonToLinalgExperimentalPasses();
+  mlir::triton::registerTritonToKunpengLLMPasses();
   mlir::triton::registerTritonToStructuredPass();
   mlir::triton::registerTritonPtrToMemref();
   mlir::triton::registerUnstructuredToMemref();

@@ -14,6 +14,7 @@ add_triton_library(TritonToLinalgExperimental
   NontemporalLoads.cpp
   DoubleBufferLoopAllocations.cpp
   LowerOuterReductionSVE.cpp
+  ExpandExp2Fexpa.cpp
 
   DEPENDS
   TritonToLinalgExperimentalConversionPassIncGen
@@ -44,6 +45,7 @@ add_triton_library(TritonToLinalgExperimental
   UnstructuredToMemref
   TritonPtrToMemref
   TritonToArmPL
+  TritonToKunpengLLM
   TritonSharedUtils
 
   TritonArithToLinalg

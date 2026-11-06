@@ -14,6 +14,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/DialectConversion.h"
 
+#include <cstdlib>
+
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Conversion/MLIRTypes.h"
 #include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
@@ -104,6 +106,18 @@ struct ArmPLOpPattern : public OpRewritePattern<triton::DotOp> {
     bool integers = cType.getElementType().isInteger();
     double alpha = 1.0;
     double beta = isZeroTensor(op.getC(), integers) ? 0.0 : 1.0;
+
+    // Avoid packing and BLAS-call overhead for small accumulated output tiles.
+    constexpr int64_t kMinArmPLAccumulatedOutputElements = 64 * 64;
+    const char *aclOpt = std::getenv("TRITON_SHARED_ENABLE_ACL_OPT");
+    const bool aclOptEnabled =
+        !aclOpt || aclOpt[0] != '0' || aclOpt[1] != '\0';
+    // Gate only the added fallback; ACL=0 retains master's ArmPL matching.
+    if (aclOptEnabled && beta != 0.0 &&
+        (!cType.hasStaticShape() ||
+         cType.getNumElements() < kMinArmPLAccumulatedOutputElements))
+      return rewriter.notifyMatchFailure(
+          op, "small accumulated dot is not profitable for ArmPL");
 
     auto [aF32, aOrig] = upcastToF32IfNeeded(aSrc, loc, rewriter);
     auto [bF32, bOrig] = upcastToF32IfNeeded(bSrc, loc, rewriter);
