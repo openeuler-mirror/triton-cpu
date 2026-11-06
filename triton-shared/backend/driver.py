@@ -1,4 +1,3 @@
-import functools
 import hashlib
 import tempfile
 import sysconfig
@@ -49,14 +48,19 @@ _has_armpl = os.path.exists(_armpl_lib_path)
 # it.  Linked only into launchers whose kernel calls into it.
 _kunpeng_llm_lib_path = os.path.join(str(_triton_C_dir), "libkunpeng_llm.so")
 _KUNPENG_LLM_SYMBOL_PREFIX = b"kunpeng_flash_attention_forward_"
+_SPARSE_MLA_SYMBOL_PREFIX = b"kunpeng_sparse_mla_"
 
 
 def _kunpeng_llm_launcher_args(kernel_obj: bytes) -> list:
     """Extra launcher compile/link arguments for a kernel calling into
     libkunpeng_llm.so (none otherwise)."""
-    if _KUNPENG_LLM_SYMBOL_PREFIX not in kernel_obj or not os.path.exists(_kunpeng_llm_lib_path):
+    if not os.path.exists(_kunpeng_llm_lib_path):
         return []
-    return ["-DTRITON_SHARED_KUNPENG_LLM", "-lkunpeng_llm"]
+    if _SPARSE_MLA_SYMBOL_PREFIX in kernel_obj:
+        return ["-DTRITON_SHARED_KUNPENG_LLM", "-DTRITON_SHARED_SPARSE_MLA", "-lkunpeng_llm"]
+    if _KUNPENG_LLM_SYMBOL_PREFIX in kernel_obj:
+        return ["-DTRITON_SHARED_KUNPENG_LLM", "-lkunpeng_llm"]
+    return []
 
 # -------------------- Launcher ----------------------------
 def _ty_to_cpp(ty):
@@ -150,6 +154,9 @@ def _generate_launcher(constants, signature, kernel_name):
 #include <iostream>
 
 extern "C" {{
+#ifdef TRITON_SHARED_SPARSE_MLA
+  void kunpeng_sparse_mla_begin_launch(void);
+#endif
 #ifdef TRITON_SHARED_KUNPENG_LLM
   // libkunpeng_llm.so: drops per-thread caches of packed inputs from earlier
   // launches.
@@ -163,7 +170,9 @@ extern "C" {{
 
 static void _launch(int gridX, int gridY, int gridZ, int num_threads {', ' + arg_decls if arg_decls else ''}) {{
 int64_t N = (int64_t)gridX * gridY * gridZ;
-#ifdef TRITON_SHARED_KUNPENG_LLM
+#ifdef TRITON_SHARED_SPARSE_MLA
+kunpeng_sparse_mla_begin_launch();
+#elif defined(TRITON_SHARED_KUNPENG_LLM)
 kunpeng_llm_begin_launch();
 #endif
 
@@ -361,29 +370,6 @@ PyMODINIT_FUNC PyInit___triton_shared_ref_cpu_kernel_launcher(void) {{
 """
 
 
-@functools.lru_cache(maxsize=1)
-def _launcher_implementation_hash():
-    """Hash launcher sources once so implementation changes expire the cache."""
-    backend = Path(__file__).resolve().parent
-    implementation = hashlib.sha256()
-    paths = [Path(__file__).resolve(), *sorted((backend / "include").rglob("*"))]
-    for path in paths:
-        if path.is_file():
-            implementation.update(path.relative_to(backend).as_posix().encode("utf-8") + b"\0")
-            implementation.update(hashlib.sha256(path.read_bytes()).digest())
-    return implementation.digest()
-
-
-def _launcher_cache_key(src, kernel_obj, kunpeng_llm_args=()):
-    """Include normalized ACL and linalg modes in the launcher cache key."""
-    acl_enabled = os.environ.get("TRITON_SHARED_ENABLE_ACL_OPT", "1") != "0"
-    linalg_enabled = os.environ.get("TRITON_SHARED_ENABLE_LINALG_TILING_PIPELINE", "0") == "1"
-    modes = bytes([acl_enabled, linalg_enabled])
-    # Preserve upstream's link-argument identity for Kunpeng LLM launchers.
-    link_flags = " ".join(kunpeng_llm_args).encode("utf-8")
-    return hashlib.md5(src.encode("utf-8") + kernel_obj + link_flags + modes + _launcher_implementation_hash()).hexdigest()
-
-
 def compile_module(launcher_src, kernel_placeholder_name):
     py_version = sys.version_info
     if platform.system() == "Windows":
@@ -433,7 +419,8 @@ def compile_module(launcher_src, kernel_placeholder_name):
         # These flags change what the launcher links, so they are part of the
         # key.
         kunpeng_llm_args = _kunpeng_llm_launcher_args(kernel_obj)
-        key = _launcher_cache_key(src, kernel_obj, kunpeng_llm_args)
+        key = hashlib.md5(src.encode("utf-8") + kernel_obj +
+                          " ".join(kunpeng_llm_args).encode("utf-8")).hexdigest()
         _cached_key[0] = key
 
         # Second fast path: module already loaded (e.g. from a prior process run that

@@ -29,7 +29,8 @@ def TritonFlashAttentionToKunpengLLM
     are left untouched.
   }];
   let constructor = "triton::createTritonFlashAttentionToKunpengLLMPass()";
-  let dependentDialects = ["mlir::func::FuncDialect", "mlir::arith::ArithDialect"];
+  let dependentDialects = ["mlir::func::FuncDialect", "mlir::arith::ArithDialect",
+                          "mlir::LLVM::LLVMDialect"];
 }
 
 #endif
