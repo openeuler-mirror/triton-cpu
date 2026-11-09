@@ -48,22 +48,21 @@ module {
 // CHECK-DAG:       [[VAR_0_:%.+]] = arith.index_cast [[PARAM_2_]] : i32 to index
 // CHECK:           [[VAR_1_:%.+]] = arith.minsi [[VAR_0_]], [[CST_128_]] : index
 // CHECK:           [[VAR_2_:%.+]] = arith.maxsi [[VAR_1_]], [[CST_0_]] : index
+// CHECK:           [[RES_:%.+]] = memref.alloc() : memref<128xf32>
 // CHECK:           [[VAR_3_:%.+]] = arith.cmpi eq, [[VAR_2_]], [[CST_128_]] : index
 // CHECK:           scf.if [[VAR_3_]] {
-// CHECK:             [[RES_:%.+]] = memref.alloc() : memref<128xf32>
 // CHECK:             memref.copy [[VAR_reinterpret_cast_]], [[RES_]] : memref<128xf32, strided<[1]>> to memref<128xf32>
 // CHECK:             [[VAR_4_:%.+]] = bufferization.to_tensor [[RES_]] restrict writable : memref<128xf32> to tensor<128xf32>
 // CHECK:             bufferization.materialize_in_destination [[VAR_4_]] in writable [[VAR_reinterpret_cast_0_]] : (tensor<128xf32>, memref<128xf32, strided<[1]>>) -> ()
 // CHECK:           } else {
-// CHECK:             [[PARTIAL_RES_:%.+]] = memref.alloc() : memref<128xf32>
 // CHECK:             [[VAR_5_:%.+]] = arith.cmpi slt, [[VAR_2_]], [[CST_128_]] : index
 // CHECK:             scf.if [[VAR_5_]] {
-// CHECK:               linalg.fill ins([[CST_0_dot_000000_]] : f32) outs([[PARTIAL_RES_]] : memref<128xf32>)
+// CHECK:               linalg.fill ins([[CST_0_dot_000000_]] : f32) outs([[RES_]] : memref<128xf32>)
 // CHECK:             }
 // CHECK-DAG:         [[VAR_subview_:%.+]] = memref.subview [[VAR_reinterpret_cast_]][0] {{.}}[[VAR_2_]]{{.}} [1] : memref<128xf32, strided<[1]>> to memref<?xf32, strided<[1]>>
-// CHECK-DAG:         [[VAR_subview_1_:%.+]] = memref.subview [[PARTIAL_RES_]][0] {{.}}[[VAR_2_]]{{.}} [1] : memref<128xf32> to memref<?xf32, strided<[1]>>
+// CHECK-DAG:         [[VAR_subview_1_:%.+]] = memref.subview [[RES_]][0] {{.}}[[VAR_2_]]{{.}} [1] : memref<128xf32> to memref<?xf32, strided<[1]>>
 // CHECK:             memref.copy [[VAR_subview_]], [[VAR_subview_1_]] : memref<?xf32, strided<[1]>> to memref<?xf32, strided<[1]>>
-// CHECK:             [[VAR_6_:%.+]] = bufferization.to_tensor [[PARTIAL_RES_]] restrict writable : memref<128xf32> to tensor<128xf32>
+// CHECK:             [[VAR_6_:%.+]] = bufferization.to_tensor [[RES_]] restrict writable : memref<128xf32> to tensor<128xf32>
 // CHECK-DAG:         [[VAR_extracted_slice_:%.+]] = tensor.extract_slice [[VAR_6_]][0] {{.}}[[VAR_2_]]{{.}} [1] : tensor<128xf32> to tensor<?xf32>
 // CHECK-DAG:         [[VAR_subview_2_:%.+]] = memref.subview [[VAR_reinterpret_cast_0_]][0] {{.}}[[VAR_2_]]{{.}} [1] : memref<128xf32, strided<[1]>> to memref<?xf32, strided<[1]>>
 // CHECK:             bufferization.materialize_in_destination [[VAR_extracted_slice_]] in writable [[VAR_subview_2_]] : (tensor<?xf32>, memref<?xf32, strided<[1]>>) -> ()
