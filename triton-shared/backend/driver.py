@@ -48,7 +48,8 @@ _has_armpl = os.path.exists(_armpl_lib_path)
 # _triton_C_dir (from third_party/kunpeng/llm), so the -L/-rpath above cover
 # it.  Linked only into launchers whose kernel calls into it.
 _kunpeng_llm_lib_path = os.path.join(str(_triton_C_dir), "libkunpeng_llm.so")
-_KUNPENG_LLM_SYMBOL_PREFIX = b"kunpeng_flash_attention_forward_"
+# Covers both kunpeng_flash_attention_forward_* and the varlen entries.
+_KUNPENG_LLM_SYMBOL_PREFIX = b"kunpeng_flash_attention_"
 
 
 def _kunpeng_llm_launcher_args(kernel_obj: bytes) -> list:

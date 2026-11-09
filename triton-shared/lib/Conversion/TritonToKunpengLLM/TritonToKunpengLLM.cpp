@@ -22,6 +22,7 @@
 #include "triton-shared/Conversion/TritonToKunpengLLM/Passes.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -58,9 +59,11 @@ namespace {
 
 // Tile index variables: element (i, j) of a 2-D tensor, element i of a 1-D
 // tensor (whose lane maps to I or J depending on how it is expanded).
-const char kDimI = 0, kDimJ = 0;
+// KROW stands for the cache row a paged K/V tile reads key J from.
+const char kDimI = 0, kDimJ = 0, kDimKRow = 0;
 const void *const DIM_I = &kDimI;
 const void *const DIM_J = &kDimJ;
+const void *const DIM_KROW = &kDimKRow;
 
 struct Poly {
   using Mono = std::vector<const void *>; // sorted atoms, with repetition
@@ -179,7 +182,14 @@ static bool isFloatSplat(Value v, double x) {
 // names the index variable of a 1-D tensor.
 class PolyEval {
 public:
+  // Values standing for a polynomial that cannot be read off the IR, e.g. the
+  // cache row a paged K/V load gathers (bound to DIM_KROW once its structure
+  // has been checked), or a loop-carried affine counter.
+  llvm::DenseMap<Value, Poly> bound;
+
   std::optional<Poly> scalar(Value v) {
+    if (auto it = bound.find(v); it != bound.end())
+      return it->second;
     if (!v.getType().isIntOrIndex())
       return std::nullopt;
     if (auto c = getIntSplat(v))
@@ -201,6 +211,8 @@ public:
   }
 
   std::optional<Poly> tensor(Value v, const void *lane) {
+    if (auto it = bound.find(v); it != bound.end())
+      return it->second;
     auto ty = dyn_cast<RankedTensorType>(v.getType());
     if (!ty)
       return scalar(v);
@@ -222,6 +234,9 @@ public:
         return std::nullopt;
       return tensor(e.getSrc(), e.getAxis() == 1 ? DIM_I : DIM_J);
     }
+    // A boundary-checked block pointer computes its offsets in i64.
+    if (isa<arith::ExtSIOp, arith::IndexCastOp>(op))
+      return tensor(op->getOperand(0), lane);
     if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(op)) {
       auto a = tensor(op->getOperand(0), lane);
       auto b = tensor(op->getOperand(1), lane);
@@ -323,7 +338,10 @@ static bool collectCmps(Value cond, const void *lane, SmallVector<Cmp> &out) {
 }
 
 // `idx < bound` terms of a load/store mask: maps the index polynomial to the
-// bound polynomial.
+// bound polynomial.  A redundant `idx >= 0` is dropped: a boundary-checked
+// block pointer tests both ends of every dimension, and the indices here are
+// a tile offset (rowStart + I, or J) with rowStart a multiple of the block
+// size taken from a program id, so the lower test is always true.
 static std::optional<SmallVector<std::pair<Poly, Poly>>>
 evalBoundMask(PolyEval &pe, Value mask) {
   SmallVector<std::pair<Poly, Poly>> r;
@@ -340,6 +358,10 @@ evalBoundMask(PolyEval &pe, Value mask) {
       r.push_back({*l, *h});
     else if (c.pred == arith::CmpIPredicate::sgt)
       r.push_back({*h, *l});
+    else if (c.pred == arith::CmpIPredicate::sge && *h == Poly::cst(0))
+      continue; // idx >= 0
+    else if (c.pred == arith::CmpIPredicate::sle && *l == Poly::cst(0))
+      continue; // 0 <= idx
     else
       return std::nullopt;
   }
@@ -380,6 +402,13 @@ private:
 
   bool isTopLevel(const void *atom) const;
   bool topLevelPoly(const Poly &p) const;
+  // Reads a row-index mask term `idx < bound`, where idx must be X + I for a
+  // loop-invariant X, as a limit on rowStart + I: it returns the bound that
+  // rowStart + I is below.  Stores and loads may index the same rows from
+  // different origins -- a varlen kernel keeps lse for the whole batch but
+  // folds the sequence's first token into the Q and O base pointers -- and
+  // then state the same row limit in their own terms.
+  std::optional<Poly> rowBound(const Poly &idx, const Poly &bound) const;
   bool matchEpilogue();
   bool matchLoopChain();
   bool matchLoopBody(KeyLoop &kl);
@@ -387,9 +416,21 @@ private:
   bool matchQ();
   bool matchKV(KeyLoop &kl, const Poly &colStart);
   bool matchFrame();
+  bool matchElementKeyLoops();
+  bool matchBlockKeyLoops();
+  // The key index of element (.., 0) of a key loop's tile, as a polynomial in
+  // the loop's induction variable (counters already bound).
+  std::optional<Poly> colStartOf(scf::ForOp loop);
+  // Binds the loop's iter_args other than acc/m/l, which must be affine
+  // counters, to polynomials in its induction variable.
+  bool bindCounters(scf::ForOp loop);
+  // Recognises a paged key-row index in the loop body and binds it to
+  // DIM_KROW; sets `paged` on the first loop it is found in.
+  bool bindPagedRow(scf::ForOp loop, const Poly &colStart);
   Value materialize(OpBuilder &b, Location loc, const Poly &p);
 
   mutable triton::FuncOp func;
+  Block *body = nullptr; // the block the stores and key loops live in
   PolyEval pe;
 
   triton::StoreOp oStore, lseStore;
@@ -409,20 +450,37 @@ private:
   Poly qRs, kRs, vRs, oRs;
   std::optional<Poly> seqQ, seqK;
   Window win;
+  // Paged K/V (flash_attn_varlen_func): key j of this sequence is row
+  // (j % pageSize) of page pageTable[j / pageSize], so the K/V row it reads
+  // is pageTable[j / pageSize] * pageSize + j % pageSize.
+  bool paged = false;
+  Address pageTable;
+  int64_t pageSize = 0;
 };
 
 bool FlashAttentionMatcher::isTopLevel(const void *atom) const {
-  if (atom == DIM_I || atom == DIM_J)
+  if (atom == DIM_I || atom == DIM_J || atom == DIM_KROW)
     return false;
   Value v = Value::getFromOpaquePointer(atom);
   Block *entry = &func.getBody().front();
   if (auto ba = dyn_cast<BlockArgument>(v))
-    return ba.getOwner() == entry;
-  return v.getDefiningOp()->getBlock() == entry;
+    return ba.getOwner() == entry || ba.getOwner() == body;
+  Block *b = v.getDefiningOp()->getBlock();
+  return b == entry || b == body;
 }
 
 bool FlashAttentionMatcher::topLevelPoly(const Poly &p) const {
   return llvm::all_of(p.atoms(), [&](const void *a) { return isTopLevel(a); });
+}
+
+std::optional<Poly> FlashAttentionMatcher::rowBound(const Poly &idx,
+                                                    const Poly &bound) const {
+  auto s = idx.split(DIM_I);
+  if (!s || s->first != Poly::cst(1) || s->second.mentions(DIM_J) ||
+      !topLevelPoly(s->second) || !topLevelPoly(bound))
+    return std::nullopt;
+  // X + I < bound  <=>  rowStart + I < rowStart + bound - X
+  return rowStart + bound - s->second;
 }
 
 // Return the operand of commutative binary `op` that is not `x`.
@@ -512,8 +570,32 @@ static bool isZeroOrNaN(Value cond, Value l) {
 }
 
 bool FlashAttentionMatcher::match() {
-  if (func.isExternal() || !func.getBody().hasOneBlock())
-    return fail("not a single-block kernel");
+  if (func.isExternal())
+    return fail("not a kernel");
+  // Either a single block, or an entry block that branches on a guard (the
+  // "no query row in this program" early return of a varlen kernel) to a
+  // block that only returns and to the real body.
+  Region &region = func.getBody();
+  if (region.hasOneBlock()) {
+    body = &region.front();
+  } else {
+    Block *entry = &region.front();
+    auto br = dyn_cast<cf::CondBranchOp>(entry->getTerminator());
+    if (!br || region.getBlocks().size() != 3)
+      return fail("not a single block or a guarded body");
+    for (Block *succ : {br.getTrueDest(), br.getFalseDest()}) {
+      if (succ->getNumArguments())
+        return fail("guard successor takes arguments");
+      // One successor returns at once, the other is the body.
+      if (isa<triton::ReturnOp>(&succ->front()))
+        continue;
+      if (body)
+        return fail("neither guard successor returns at once");
+      body = succ;
+    }
+    if (!body)
+      return fail("guard has no body successor");
+  }
 
   // The kernel's only effects must be the output and lse stores.
   SmallVector<triton::StoreOp> stores;
@@ -541,7 +623,7 @@ bool FlashAttentionMatcher::match() {
     return fail("expected exactly two stores");
   for (auto st : stores) {
     auto ty = dyn_cast<RankedTensorType>(st.getValue().getType());
-    if (!ty || st.getOperation()->getBlock() != &func.getBody().front())
+    if (!ty || st.getOperation()->getBlock() != body)
       return fail("store not a top-level tensor store");
     if (ty.getRank() == 2)
       oStore = st;
@@ -611,9 +693,10 @@ bool FlashAttentionMatcher::matchEpilogue() {
   if (!mFinal)
     return fail("lse not m * scale + log(l)");
 
-  // acc, m and l are the results of the last key loop (in any order).
+  // acc, m and l are the results of the last key loop (in any order).  A loop
+  // may carry further values (a varlen kernel carries its block counter).
   auto loop = accFinal.getDefiningOp<scf::ForOp>();
-  if (!loop || loop.getNumResults() != 3 ||
+  if (!loop || loop.getNumResults() < 3 ||
       mFinal.getDefiningOp() != loop || lFinal.getDefiningOp() != loop)
     return fail("acc/m/l are not the results of a key loop");
   iAcc = cast<OpResult>(accFinal).getResultNumber();
@@ -627,13 +710,16 @@ bool FlashAttentionMatcher::matchEpilogue() {
 }
 
 bool FlashAttentionMatcher::matchLoopChain() {
-  // Walk back through loops whose inits are the previous loop's results.
+  // Walk back through loops whose acc/m/l inits are the previous loop's
+  // results.  The three must sit at the same positions in every loop of the
+  // chain; any further iter_args are checked as counters by the frame.
   while (true) {
     scf::ForOp first = loops.front().loop;
     auto inits = first.getInitArgs();
-    auto prev = inits[0].getDefiningOp<scf::ForOp>();
-    if (prev && prev.getNumResults() == 3 && inits[0] == prev.getResult(0) &&
-        inits[1] == prev.getResult(1) && inits[2] == prev.getResult(2)) {
+    auto prev = inits[iAcc].getDefiningOp<scf::ForOp>();
+    if (prev && prev.getNumResults() >= 3 &&
+        inits[iAcc] == prev.getResult(iAcc) &&
+        inits[iM] == prev.getResult(iM) && inits[iL] == prev.getResult(iL)) {
       loops.insert(loops.begin(), {prev});
       if (loops.size() > 2)
         return fail("more than two key loops");
@@ -645,7 +731,7 @@ bool FlashAttentionMatcher::matchLoopChain() {
     break;
   }
   for (auto &kl : loops) {
-    if (kl.loop->getBlock() != &func.getBody().front())
+    if (kl.loop->getBlock() != body)
       return fail("key loop not at top level");
     if (!matchLoopBody(kl))
       return false;
@@ -773,7 +859,7 @@ bool FlashAttentionMatcher::matchLoopBody(KeyLoop &kl) {
 // Q: [BM, DK] tile at rows rowStart + I, loop invariant.
 bool FlashAttentionMatcher::matchQ() {
   auto ld = qLoad.getDefiningOp<triton::LoadOp>();
-  if (!ld || ld->getBlock() != &func.getBody().front())
+  if (!ld || ld->getBlock() != body)
     return fail("Q is not a top-level load");
   if (getElementTypeOrSelf(ld.getType()) != elemTy)
     return fail("Q type != output type");
@@ -793,9 +879,11 @@ bool FlashAttentionMatcher::matchQ() {
   for (auto &[idx, bound] : *terms) {
     if (idx == Poly::atom(DIM_J) && bound == Poly::cst(D))
       dMasked = true;
-    else if (idx == rowStart + Poly::atom(DIM_I) && (!seqQ || bound == *seqQ))
-      seqQ = bound;
-    else
+    else if (auto sq = rowBound(idx, bound)) {
+      if (seqQ && *seqQ != *sq)
+        return fail("inconsistent Q row bound");
+      seqQ = *sq;
+    } else
       return fail("unexpected Q mask term");
   }
   if (D != DK && (!dMasked || !ld.getOther() ||
@@ -814,16 +902,28 @@ bool FlashAttentionMatcher::matchKV(KeyLoop &kl, const Poly &colStart) {
       vTy.getShape()[0] != BN || vTy.getShape()[1] != DK)
     return fail("K/V tiles have unexpected shapes");
 
+  // A paged cache gathers the K/V row of each key through a page table.
+  const bool isPaged = bindPagedRow(kl.loop, colStart);
+  if (paged && !isPaged)
+    return fail("only some key loops read a paged K/V cache");
+
   auto ka = evalAddress(pe, kl.kLoad.getPtr(), DIM_I);
   auto va = evalAddress(pe, kl.vLoad.getPtr(), DIM_I);
   if (!ka || !va)
     return fail("K/V address is not affine");
-  auto kt = splitTile(ka->offset, DIM_J, DIM_I);
-  auto vt = splitTile(va->offset, DIM_I, DIM_J);
+  // With a paged cache the tiles are indexed by the gathered cache row
+  // rather than by the key, and the key's whole contribution to the address
+  // is that row, so there is no colStart term to take out.  K is [DK, BN],
+  // so its key runs along J; V is [BN, DK], so its key runs along I.
+  const void *kRow = isPaged ? DIM_KROW : DIM_J;
+  const void *vRow = isPaged ? DIM_KROW : DIM_I;
+  Poly keyOff = isPaged ? Poly::cst(0) : colStart;
+  auto kt = splitTile(ka->offset, kRow, DIM_I);
+  auto vt = splitTile(va->offset, vRow, DIM_J);
   if (!kt || !vt)
     return fail("K/V are not row-major tiles");
-  Address kh{ka->base, kt->rest - colStart * kt->rowStride};
-  Address vh{va->base, vt->rest - colStart * vt->rowStride};
+  Address kh{ka->base, kt->rest - keyOff * kt->rowStride};
+  Address vh{va->base, vt->rest - keyOff * vt->rowStride};
   if (!topLevelPoly(kh.offset) || !topLevelPoly(vh.offset) ||
       !topLevelPoly(kt->rowStride) || !topLevelPoly(vt->rowStride) ||
       kh.base.getParentRegion() != &func.getBody() ||
@@ -986,58 +1086,7 @@ bool FlashAttentionMatcher::matchMask(KeyLoop &kl, const Poly &colStart,
 //   Lo = 0 or round_down(max(rowStart + left, 0))
 //   E  = max(E', Lo),  E' = [round_up](Sk or min(Sk, rowStart + BM + right))
 // they cover every key the mask admits for rows [rowStart, rowStart + BM).
-bool FlashAttentionMatcher::matchFrame() {
-  // Rows are rowStart + I as seen by the lse store; everything else is
-  // checked against that.
-  auto la = evalAddress(pe, lseStore.getPtr(), DIM_I);
-  if (!la)
-    return fail("lse address is not affine");
-  auto ls = la->offset.split(DIM_I);
-  if (!ls || ls->first != Poly::cst(1))
-    return fail("lse is not contiguous over rows");
-  rowStart = ls->second;
-  lse = {la->base, Poly::cst(0)};
-  if (!topLevelPoly(rowStart))
-    return fail("row start is not loop invariant");
-
-  // Output tile and row/head_dim bounds from the store masks.
-  auto oa = evalAddress(pe, oStore.getPtr(), DIM_I);
-  auto ot = oa ? splitTile(oa->offset, DIM_I, DIM_J) : std::nullopt;
-  if (!ot)
-    return fail("output is not a row-major tile");
-  o = {oa->base, ot->rest - rowStart * ot->rowStride};
-  oRs = ot->rowStride;
-  D = DK;
-  for (auto st : {oStore, lseStore}) {
-    auto terms = evalBoundMask(pe, st.getMask());
-    if (!terms)
-      return fail("store mask is not a conjunction of bounds");
-    for (auto &[idx, bound] : *terms) {
-      if (idx == rowStart + Poly::atom(DIM_I)) {
-        if (seqQ && *seqQ != bound)
-          return fail("inconsistent row bounds");
-        seqQ = bound;
-      } else if (st == oStore && idx == Poly::atom(DIM_J) && bound.getConst()) {
-        D = *bound.getConst();
-      } else {
-        return fail("unexpected store mask term");
-      }
-    }
-  }
-  if (D <= 0 || D > DK || D % 16 != 0 || D > 256)
-    return fail("unsupported head_dim");
-  if (D != DK) {
-    // The padded columns must not be stored.
-    auto terms = evalBoundMask(pe, oStore.getMask());
-    if (!terms || !llvm::any_of(*terms, [&](auto &t) {
-          return t.first == Poly::atom(DIM_J);
-        }))
-      return fail("padded head_dim is stored");
-  }
-
-  if (!matchQ())
-    return false;
-
+bool FlashAttentionMatcher::matchElementKeyLoops() {
   auto stepOf = [&](scf::ForOp l) { return getIntSplat(l.getStep()); };
   for (auto &kl : loops)
     if (stepOf(kl.loop) != BN)
@@ -1221,8 +1270,427 @@ bool FlashAttentionMatcher::matchFrame() {
     if (!matchKV(kl, cs))
       return false;
 
+  return true;
+}
+
+// Binds every iter_arg other than acc/m/l to a polynomial in the induction
+// variable.  Such an arg must be an affine counter: an integer starting at a
+// loop-invariant value and advancing by a constant every iteration, which is
+// how a varlen kernel carries the index of the key block it is on.
+bool FlashAttentionMatcher::bindCounters(scf::ForOp loop) {
+  auto step = getIntSplat(loop.getStep());
+  auto lb = pe.scalar(loop.getLowerBound());
+  if (!step || *step == 0 || !lb)
+    return fail("key loop step/lower bound is not affine");
+  Poly iv = Poly::atom(loop.getInductionVar());
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  for (unsigned i = 0, e = loop.getNumRegionIterArgs(); i < e; ++i) {
+    if (i == iAcc || i == iM || i == iL)
+      continue;
+    Value arg = loop.getRegionIterArg(i);
+    if (!arg.getType().isIntOrIndex())
+      return fail("extra iter_arg is not an integer counter");
+    auto init = pe.scalar(loop.getInitArgs()[i]);
+    if (!init || !topLevelPoly(*init))
+      return fail("counter init is not loop invariant");
+    // yield = arg + c, with c constant and a multiple of the step.
+    Value next = yield.getOperand(i);
+    std::optional<int64_t> c;
+    if (auto add = next.getDefiningOp<arith::AddIOp>()) {
+      if (Value o = otherOperand<arith::AddIOp>(next, arg))
+        c = getIntSplat(o);
+    } else if (auto sub = next.getDefiningOp<arith::SubIOp>()) {
+      if (sub.getLhs() == arg)
+        if (auto o = getIntSplat(sub.getRhs()))
+          c = -*o;
+    }
+    if (!c || *c % *step != 0)
+      return fail("extra iter_arg is not an affine counter");
+    // After n steps the induction variable is lb + n * step, so the counter
+    // is init + (c / step) * (iv - lb).
+    Poly k = Poly::cst(*c / *step);
+    pe.bound[arg] = *init + k * (iv - *lb);
+  }
+  return true;
+}
+
+// The key index tensor of a key loop is splat(colStart) + arange(0, BLOCK_N);
+// its polynomial over DIM_J is colStart + J.  Looking it up in the body
+// rather than deriving it from the loop bounds covers both an element-space
+// loop (colStart = induction variable) and a block-space one (colStart =
+// block index * BLOCK_N).  A wrong pick makes the mask and K/V checks fail
+// rather than miscompile, so requiring a unique candidate is enough.
+std::optional<Poly> FlashAttentionMatcher::colStartOf(scf::ForOp loop) {
+  std::optional<Poly> found;
+  for (Operation &op : loop.getBody()->without_terminator()) {
+    auto add = dyn_cast<arith::AddIOp>(&op);
+    if (!add)
+      continue;
+    auto ty = dyn_cast<RankedTensorType>(add.getType());
+    if (!ty || ty.getRank() != 1 || ty.getShape()[0] != BN ||
+        !ty.getElementType().isInteger())
+      continue;
+    auto p = pe.tensor(add.getResult(), DIM_J);
+    if (!p)
+      continue;
+    auto s = p->split(DIM_J);
+    if (!s || s->first != Poly::cst(1) || s->second.mentions(DIM_I))
+      continue;
+    if (found && *found != s->second)
+      return std::nullopt; // ambiguous
+    found = s->second;
+  }
+  return found;
+}
+
+// Key loops that walk key *blocks*, one per iteration, which is what a
+// varlen kernel generates:
+//
+//   for step in range(0, M):                 # diagonal blocks, masked
+//     n = n_block_max - 1 - step             # carried in an iter_arg
+//   for n in range(n_block_max - M - 1, n_block_min - 1, -1):
+//
+// with keys n * BLOCK_N .. n * BLOCK_N + BLOCK_N - 1, n_block_max =
+// min(cdiv(Sk, BN), cdiv(row + BM + right, BN)) and n_block_min =
+// max((row + left) / BN, 0).  (Triton normalises the descending loop to an
+// ascending one, so the direction is read off colStart, not the bounds.)
+// Both ends of the key range are therefore rounded out to whole blocks.
+bool FlashAttentionMatcher::matchBlockKeyLoops() {
+  // x from cdiv(x, BN) = (x + BN - 1) / BN, or from x / BN.
+  auto divByBN = [&](Value v, bool ceil) -> std::optional<Poly> {
+    auto div = v.getDefiningOp<arith::DivSIOp>();
+    if (!div || getIntSplat(div.getRhs()) != BN)
+      return std::nullopt;
+    if (!ceil)
+      return pe.scalar(div.getLhs());
+    auto add = div.getLhs().getDefiningOp<arith::AddIOp>();
+    if (!add)
+      return std::nullopt;
+    Value x = getIntSplat(add.getRhs()) == BN - 1   ? add.getLhs()
+              : getIntSplat(add.getLhs()) == BN - 1 ? add.getRhs()
+                                                    : Value();
+    return x ? pe.scalar(x) : std::nullopt;
+  };
+  // A key bound that is `blocks * BLOCK_N` for one SSA block count.
+  auto blockCount = [&](const Poly &p) -> Value {
+    if (p.terms.size() != 1)
+      return {};
+    auto &t = *p.terms.begin();
+    if (t.first.size() != 1 || t.second != BN)
+      return {};
+    return Value::getFromOpaquePointer(t.first[0]);
+  };
+
+  // Each loop's key index and the contiguous key interval it visits.
+  SmallVector<Poly> colStarts;
+  SmallVector<std::pair<Poly, Poly>> span;
+  for (auto &kl : loops) {
+    if (!bindCounters(kl.loop))
+      return false;
+    auto cs = colStartOf(kl.loop);
+    if (!cs)
+      return fail("no unique key index in the key loop");
+    auto step = getIntSplat(kl.loop.getStep());
+    auto lb = pe.scalar(kl.loop.getLowerBound());
+    auto ub = pe.scalar(kl.loop.getUpperBound());
+    auto sp = cs->split(kl.loop.getInductionVar().getAsOpaquePointer());
+    if (!step || !lb || !ub || !sp)
+      return fail("key loop bounds are not affine");
+    auto b = sp->first.getConst();
+    if (!b || (*b * *step != BN && *b * *step != -BN))
+      return fail("key loop does not advance by one key block");
+    // colStart = A + B * iv over iv in [lb, ub) step `step`; the step moves
+    // the window by exactly BLOCK_N, so the visited keys are contiguous and
+    // the last iteration is at ub - step.
+    const Poly &A = sp->second;
+    Poly B = Poly::cst(*b);
+    Poly lo = *b * *step > 0 ? A + B * *lb : A + B * *ub + Poly::cst(BN);
+    Poly hi = *b * *step > 0 ? A + B * *ub : A + B * *lb + Poly::cst(BN);
+    if (!topLevelPoly(lo) || !topLevelPoly(hi))
+      return fail("key range is not loop invariant");
+    colStarts.push_back(*cs);
+    span.push_back({lo, hi});
+  }
+
+  // Masks first: they provide Sk/Sq for the K/V mask checks.
+  bool first = true;
+  for (auto [kl, cs] : llvm::zip(loops, colStarts)) {
+    if (!kl.isMasked)
+      continue;
+    Window w;
+    if (!matchMask(kl, cs, w))
+      return false;
+    if (!first && (w.left.has_value() != win.left.has_value() ||
+                   w.right.has_value() != win.right.has_value() ||
+                   (w.left && *w.left != *win.left) ||
+                   (w.right && *w.right != *win.right) ||
+                   w.boundsSk != win.boundsSk ||
+                   (w.seqK && win.seqK && *w.seqK != *win.seqK)))
+      return fail("key loops use different masks");
+    if (first)
+      win = w;
+    first = false;
+  }
+  if (win.seqK)
+    seqK = win.seqK;
+
+  // The loops must cover one contiguous range [Lo, E).
+  Poly Lo = span[0].first, E = span[0].second;
+  unsigned iInterior = 0;
+  if (loops.size() == 2) {
+    if (span[0].first == span[1].second) {
+      Lo = span[1].first;
+      E = span[0].second;
+      iInterior = 1;
+    } else if (span[1].first == span[0].second) {
+      Lo = span[0].first;
+      E = span[1].second;
+      iInterior = 0;
+    } else {
+      return fail("key loops do not cover adjacent key ranges");
+    }
+  }
+
+  // E = cdiv(Sk, BN) * BN, or min(cdiv(Sk, BN), cdiv(eArg, BN)) * BN.
+  std::optional<Poly> eArg;
+  Value nbm = blockCount(E);
+  if (!nbm)
+    return fail("key range end is not a block count");
+  if (auto mn = nbm.getDefiningOp<arith::MinSIOp>()) {
+    auto a0 = divByBN(mn.getLhs(), /*ceil=*/true);
+    auto a1 = divByBN(mn.getRhs(), /*ceil=*/true);
+    if (!a0 || !a1)
+      return fail("E is not min(cdiv(Sk), cdiv(x))");
+    if (!seqK)
+      return fail("E = min(...) without a known Sk");
+    if (*a1 == *seqK)
+      std::swap(a0, a1);
+    if (*a0 != *seqK)
+      return fail("E is not min(Sk, x)");
+    eArg = a1;
+  } else {
+    auto sk = divByBN(nbm, /*ceil=*/true);
+    if (!sk)
+      return fail("E is not cdiv(Sk, BLOCK_N)");
+    if (seqK && *seqK != *sk)
+      return fail("E is not Sk");
+    seqK = sk;
+  }
+  if (!seqK || !topLevelPoly(*seqK))
+    return fail("Sk unknown");
+
+  // Lo = 0, or max(loArg / BN, 0) * BN.
+  std::optional<Poly> loArg;
+  if (!Lo.terms.empty()) {
+    Value nbmin = blockCount(Lo);
+    auto mx = nbmin ? nbmin.getDefiningOp<arith::MaxSIOp>() : nullptr;
+    if (!mx)
+      return fail("Lo is not max((row + shift) / BN, 0)");
+    auto a0 = pe.scalar(mx.getLhs()), a1 = pe.scalar(mx.getRhs());
+    Value x = a0 && *a0 == Poly::cst(0)   ? mx.getRhs()
+              : a1 && *a1 == Poly::cst(0) ? mx.getLhs()
+                                          : Value();
+    if (!x)
+      return fail("Lo is not max(x, 0)");
+    loArg = divByBN(x, /*ceil=*/false);
+    if (!loArg)
+      return fail("Lo is not max(x / BN, 0)");
+  }
+
+  // Coverage: Lo <= lb(rowStart) and E >= rb(rowStart + BM - 1) + 1.
+  if (win.left) {
+    if (!loArg || *loArg != rowStart + *win.left)
+      return fail("Lo does not match the left window bound");
+  } else if (loArg) {
+    return fail("Lo > 0 without a left window bound");
+  }
+  if (win.right) {
+    if (!eArg || *eArg != rowStart + Poly::cst(BM) + *win.right)
+      return fail("E does not match the right window bound");
+  } else if (eArg) {
+    return fail("E < Sk without a right window bound");
+  }
+  // E is rounded up to a whole block, so keys >= Sk are visited and every
+  // loop that can reach them has to mask them.
+  for (auto &kl : loops)
+    if (kl.isMasked && !win.boundsSk)
+      return fail("rounded-up key range is not masked by Sk");
+
+  if (loops.size() == 2 && !loops[iInterior].isMasked) {
+    // The keys the unmasked loop visits are not tested against the window,
+    // so they must be visible to every row of the block.  Its range ends
+    // where the masked loop starts, i.e. at E - K * BN with the masked loop's
+    // trip range min(E - Lo, K) blocks: the first branch of that min leaves
+    // the unmasked loop empty, and the second has to leave only keys j with
+    // j < Sk and j <= rowStart + right.  Rounding E up costs BN - 1 of that
+    // margin, and a right bound another BM, since E follows the *last* row.
+    KeyLoop &masked = loops[1 - iInterior];
+    if (!masked.isMasked)
+      return fail("neither key loop is masked");
+    auto lbm = pe.scalar(masked.loop.getLowerBound());
+    auto mn = masked.loop.getUpperBound().getDefiningOp<arith::MinSIOp>();
+    if (!mn || !lbm || *lbm != Poly::cst(0))
+      return fail("masked key loop trip range is not min(E - Lo, K)");
+    auto a0 = pe.scalar(mn.getLhs()), a1 = pe.scalar(mn.getRhs());
+    if (!a0 || !a1)
+      return fail("masked key loop trip range is not affine");
+    if (!a0->getConst())
+      std::swap(a0, a1);
+    auto K = a0->getConst();
+    if (!K || *a1 * Poly::cst(BN) != E - Lo)
+      return fail("masked key loop trip range is not min(E - Lo, K)");
+    int64_t need = (win.right ? BM : 0) + BN - 1;
+    if (win.left || *K * BN < need)
+      return fail("unmasked interior loop may see invisible keys");
+  }
+
+  for (auto [kl, cs] : llvm::zip(loops, colStarts))
+    if (!matchKV(kl, cs))
+      return false;
+  return true;
+}
+
+// A paged K/V cache addresses key j of the sequence through a page table:
+//
+//   row(j) = page_table[j / page_size] * page_size + j % page_size
+//
+// and then reads row(j) of the cache.  Recognising that whole expression and
+// binding it to DIM_KROW makes a paged K/V load a row-major tile indexed by
+// the cache row, which is what matchKV already knows how to check.  Returns
+// true if the loop reads K/V through such an index.
+bool FlashAttentionMatcher::bindPagedRow(scf::ForOp loop,
+                                         const Poly &colStart) {
+  Poly key = colStart + Poly::atom(DIM_J);
+  for (Operation &op : loop.getBody()->without_terminator()) {
+    auto add = dyn_cast<arith::AddIOp>(&op);
+    if (!add)
+      continue;
+    auto ty = dyn_cast<RankedTensorType>(add.getType());
+    if (!ty || ty.getRank() != 1 || ty.getShape()[0] != BN ||
+        !ty.getElementType().isInteger())
+      continue;
+    for (int i = 0; i < 2; ++i) {
+      auto mul = add->getOperand(i).getDefiningOp<arith::MulIOp>();
+      auto rem = add->getOperand(1 - i).getDefiningOp<arith::RemSIOp>();
+      if (!mul || !rem)
+        continue;
+      // page_block * page_size, either operand order
+      Value pageBlock = mul.getLhs();
+      auto ps = getIntSplat(mul.getRhs());
+      if (!ps) {
+        pageBlock = mul.getRhs();
+        ps = getIntSplat(mul.getLhs());
+      }
+      if (!ps || *ps <= 0 || getIntSplat(rem.getRhs()) != *ps)
+        continue;
+      auto remKey = pe.tensor(rem.getLhs(), DIM_J);
+      if (!remKey || *remKey != key)
+        continue;
+      // page_block = page_table[key / page_size]
+      auto load = pageBlock.getDefiningOp<triton::LoadOp>();
+      auto ap = load ? load.getPtr().getDefiningOp<triton::AddPtrOp>()
+                     : nullptr;
+      auto sp = ap ? ap.getPtr().getDefiningOp<triton::SplatOp>() : nullptr;
+      auto dv = ap ? ap.getOffset().getDefiningOp<arith::DivSIOp>() : nullptr;
+      if (!sp || !dv || getIntSplat(dv.getRhs()) != *ps)
+        continue;
+      auto divKey = pe.tensor(dv.getLhs(), DIM_J);
+      if (!divKey || *divKey != key)
+        continue;
+      // The page-table load may only be masked by the key range; keys past
+      // the end then read page 0, and are masked out of the scores anyway.
+      // Its mask is 1-D, so evalBoundMask names the lane DIM_I.
+      Poly keyLane = colStart + Poly::atom(DIM_I);
+      auto terms = evalBoundMask(pe, load.getMask());
+      if (!terms)
+        continue;
+      bool maskOk = true;
+      for (auto &[idx, bound] : *terms)
+        if (!(idx == keyLane && seqK && bound == *seqK))
+          maskOk = false;
+      if (!maskOk)
+        continue;
+      Address pt{sp.getSrc(), Poly::cst(0)};
+      if (paged && (pt.base != pageTable.base || pageSize != *ps))
+        return fail("key loops use different page tables");
+      paged = true;
+      pageTable = pt;
+      pageSize = *ps;
+      pe.bound[add.getResult()] = Poly::atom(DIM_KROW);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool FlashAttentionMatcher::matchFrame() {
+  // Rows are rowStart + I as seen by the lse store; everything else is
+  // checked against that.
+  auto la = evalAddress(pe, lseStore.getPtr(), DIM_I);
+  if (!la)
+    return fail("lse address is not affine");
+  auto ls = la->offset.split(DIM_I);
+  if (!ls || ls->first != Poly::cst(1))
+    return fail("lse is not contiguous over rows");
+  rowStart = ls->second;
+  lse = {la->base, Poly::cst(0)};
+  if (!topLevelPoly(rowStart))
+    return fail("row start is not loop invariant");
+
+  // Output tile and row/head_dim bounds from the store masks.
+  auto oa = evalAddress(pe, oStore.getPtr(), DIM_I);
+  auto ot = oa ? splitTile(oa->offset, DIM_I, DIM_J) : std::nullopt;
+  if (!ot)
+    return fail("output is not a row-major tile");
+  o = {oa->base, ot->rest - rowStart * ot->rowStride};
+  oRs = ot->rowStride;
+  D = DK;
+  for (auto st : {oStore, lseStore}) {
+    auto terms = evalBoundMask(pe, st.getMask());
+    if (!terms)
+      return fail("store mask is not a conjunction of bounds");
+    for (auto &[idx, bound] : *terms) {
+      if (st == oStore && idx == Poly::atom(DIM_J) && bound.getConst()) {
+        D = *bound.getConst();
+      } else if (auto sq = rowBound(idx, bound)) {
+        if (seqQ && *seqQ != *sq)
+          return fail("inconsistent row bounds");
+        seqQ = *sq;
+      } else {
+        return fail("unexpected store mask term");
+      }
+    }
+  }
+  if (D <= 0 || D > DK || D % 16 != 0 || D > 256)
+    return fail("unsupported head_dim");
+  if (D != DK) {
+    // The padded columns must not be stored.
+    auto terms = evalBoundMask(pe, oStore.getMask());
+    if (!terms || !llvm::any_of(*terms, [&](auto &t) {
+          return t.first == Poly::atom(DIM_J);
+        }))
+      return fail("padded head_dim is stored");
+  }
+
+  if (!matchQ())
+    return false;
+
+  // The key loops either step through keys (BLOCK_N at a time) or through
+  // key blocks (one at a time, the varlen form); the two are told apart by
+  // their step and checked separately.
+  auto unitStep = [&](KeyLoop &kl) {
+    auto s = getIntSplat(kl.loop.getStep());
+    return s && (*s == 1 || *s == -1);
+  };
+  if (llvm::all_of(loops, unitStep) ? !matchBlockKeyLoops()
+                                   : !matchElementKeyLoops())
+    return false;
+
   // Head bases and strides must be computable at the end of the kernel.
-  for (Address *a : {&q, &k, &v, &o, &lse})
+  SmallVector<Address *> bases = {&q, &k, &v, &o, &lse};
+  if (paged)
+    bases.push_back(&pageTable);
+  for (Address *a : bases)
     if (a->base.getParentRegion() != &func.getBody() ||
         !topLevelPoly(a->offset))
       return fail("head base is not loop invariant");
@@ -1277,7 +1745,7 @@ Value FlashAttentionMatcher::materialize(OpBuilder &b, Location loc,
 }
 
 void FlashAttentionMatcher::rewrite() {
-  auto ret = cast<triton::ReturnOp>(func.getBody().front().getTerminator());
+  auto ret = cast<triton::ReturnOp>(body->getTerminator());
   OpBuilder b(ret);
   Location loc = oStore.getLoc();
   auto i64 = b.getI64Type();
@@ -1296,17 +1764,39 @@ void FlashAttentionMatcher::rewrite() {
 
   Poly sq = seqQ ? *seqQ : rowStart + Poly::cst(BM);
   int64_t flags = (win.left ? 1 : 0) | (win.right ? 2 : 0);
-  SmallVector<Value> args = {
-      addr(q),   num(qRs), addr(k),   num(kRs),      addr(v),    num(vRs),
-      addr(o),   num(oRs), addr(lse), num(rowStart), c64(BM),    num(sq),
-      num(*seqK), c64(flags),
-      win.left ? num(*win.left) : c64(0), win.right ? num(*win.right) : c64(0),
-      c64(D)};
+  SmallVector<Value> args;
+  std::string name;
+  if (paged) {
+    // The cache row of key j is page_table[j / page_size] * page_size +
+    // j % page_size, so one page is page_size rows apart.
+    args = {addr(q),          num(qRs),
+            addr(k),          num(Poly::cst(pageSize) * kRs),
+            num(kRs),         addr(v),
+            num(Poly::cst(pageSize) * vRs),
+            num(vRs),         addr(o),
+            num(oRs),         addr(lse),
+            addr(pageTable),  c64(pageSize),
+            num(rowStart),    c64(BM),
+            num(sq),          num(*seqK),
+            c64(flags),
+            win.left ? num(*win.left) : c64(0),
+            win.right ? num(*win.right) : c64(0),
+            c64(D)};
+    name = elemTy.isBF16() ? "kunpeng_flash_attention_varlen_forward_bf16"
+                           : "kunpeng_flash_attention_varlen_forward_f16";
+  } else {
+    args = {addr(q),   num(qRs), addr(k),   num(kRs),      addr(v),    num(vRs),
+            addr(o),   num(oRs), addr(lse), num(rowStart), c64(BM),    num(sq),
+            num(*seqK), c64(flags),
+            win.left ? num(*win.left) : c64(0),
+            win.right ? num(*win.right) : c64(0),
+            c64(D)};
+    name = elemTy.isBF16() ? "kunpeng_flash_attention_forward_bf16"
+                           : "kunpeng_flash_attention_forward_f16";
+  }
   args.push_back(b.create<arith::ConstantOp>(
       loc, b.getF32FloatAttr(static_cast<float>(scaleLog2))));
 
-  std::string name = elemTy.isBF16() ? "kunpeng_flash_attention_forward_bf16"
-                                     : "kunpeng_flash_attention_forward_f16";
   auto module = func->getParentOfType<ModuleOp>();
   auto fnTy = b.getFunctionType(ValueRange(args).getTypes(), {});
   auto callee = module.lookupSymbol<func::FuncOp>(name);
@@ -1330,7 +1820,7 @@ void FlashAttentionMatcher::rewrite() {
   while (changed) {
     changed = false;
     SmallVector<Operation *> dead;
-    func.getBody().front().walk<WalkOrder::PostOrder>([&](Operation *op) {
+    body->walk<WalkOrder::PostOrder>([&](Operation *op) {
       if (op->getParentOp() == func.getOperation() && isOpTriviallyDead(op))
         dead.push_back(op);
     });
