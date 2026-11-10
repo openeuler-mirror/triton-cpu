@@ -5,6 +5,7 @@
 #include "triton-shared/Conversion/TritonToLinalgExperimental/LowerOuterReductionSVE.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -37,6 +38,12 @@ public:
       return failure();
 
     ArrayRef<int64_t> shape = sourceType.getShape();
+    // This lowering is designed for two-column outer reductions. Allowing an
+    // arbitrary number of columns creates vector<sveLanes * columns>
+    // intermediates. For example, 64 f32 columns with vscale=4 produces
+    // vector<1024xf32> shuffles whose LLVM legalization causes code explosion.
+    if (shape[1] != 2)
+      return failure();
     if (destType.getDimSize(0) != shape[1] ||
         op.getReductionDims().size() != 1 || op.getReductionDims().front() != 0)
       return failure();
@@ -128,6 +135,12 @@ public:
     if (sourceType.getRank() != 2 || sourceType.isScalable() || column < 0 ||
         column >= shape[1] || op.getSourceVectorType().getRank() != 1 ||
         op.getSourceVectorType().getDimSize(0) != shape[0])
+      return failure();
+
+    // Keep the fused form under the same two-column restriction as the direct
+    // outer-reduction lowering above. Wider shapes would construct the same
+    // oversized flatten-and-shuffle intermediates.
+    if (shape[1] != 2)
       return failure();
 
     Type elementType = sourceType.getElementType();
@@ -286,15 +299,65 @@ private:
   int64_t vscale;
 };
 
+/// Return true when applying this specialized pass would encounter an outer
+/// reduction with more than two columns. Such reductions must remain entirely
+/// on the standard vector-lowering path; partially rewriting the surrounding
+/// function can still expose their wide transposes to pathological lowering.
+static bool hasWideOuterReduction(Operation *root) {
+  WalkResult result = root->walk([&](vector::MultiDimReductionOp op) {
+    VectorType sourceType = op.getSourceVectorType();
+    if (sourceType.getRank() == 2 && sourceType.getDimSize(1) > 2 &&
+        op.getReductionDims().size() == 1 && op.getReductionDims().front() == 0)
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  if (result.wasInterrupted())
+    return true;
+
+  result = root->walk([&](vector::ReductionOp op) {
+    auto extract = op.getVector().getDefiningOp<vector::ExtractOp>();
+    if (!extract || extract.hasDynamicPosition() ||
+        extract.getStaticPosition().size() != 1)
+      return WalkResult::advance();
+    auto transpose = extract.getVector().getDefiningOp<vector::TransposeOp>();
+    if (!transpose || transpose.getPermutation() != ArrayRef<int64_t>({1, 0}))
+      return WalkResult::advance();
+
+    VectorType sourceType = transpose.getSourceVectorType();
+    if (sourceType.getRank() == 2 && sourceType.getDimSize(1) > 2)
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  return result.wasInterrupted();
+}
+
 class LowerOuterReductionSVEPass
     : public LowerOuterReductionSVEBase<LowerOuterReductionSVEPass> {
-  void runOnOperation() override {
+  LogicalResult lowerFunction(Operation *target) {
+    if (hasWideOuterReduction(target))
+      return success();
+
     RewritePatternSet patterns(&getContext());
     patterns.add<LowerOuterReductionPattern>(&getContext(), vscale);
     patterns.add<FuseTransposeReductionPattern>(&getContext(), vscale);
     patterns.add<ChunkTransposePattern>(&getContext(), vscale);
     patterns.add<LowerNativeTransposePattern>(&getContext(), vscale);
-    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
+    return applyPatternsGreedily(target, std::move(patterns));
+  }
+
+  void runOnOperation() override {
+    Operation *root = getOperation();
+    if (auto module = dyn_cast<ModuleOp>(root)) {
+      for (func::FuncOp func : module.getOps<func::FuncOp>()) {
+        if (failed(lowerFunction(func))) {
+          signalPassFailure();
+          return;
+        }
+      }
+      return;
+    }
+
+    if (failed(lowerFunction(root)))
       signalPassFailure();
   }
 };
