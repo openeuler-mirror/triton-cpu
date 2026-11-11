@@ -12,6 +12,9 @@ namespace triton {
 std::unique_ptr<OperationPass<ModuleOp>>
 createTritonFlashAttentionToKunpengLLMPass();
 
+std::unique_ptr<OperationPass<ModuleOp>>
+createTritonFlashMLAToKunpengLLMPass();
+
 #define GEN_PASS_DECL
 #define GEN_PASS_REGISTRATION
 #include "triton-shared/Conversion/TritonToKunpengLLM/Passes.h.inc"

@@ -347,8 +347,8 @@ class CPUOptions:
     # Keep tl.dot on the linalg (SME/SVE) matmul lowering instead of turning
     # it into ArmPL BLAS calls.
     disable_armpl: bool = False
-    # Keep recognised kernels (flash-attention forward) as Triton code instead
-    # of replacing them by libkunpeng_llm.so calls.
+    # Keep recognised kernels (flash-attention forward, flash-MLA decode) as
+    # Triton code instead of replacing them by libkunpeng_llm.so calls.
     disable_kunpeng_llm: bool = False
     sme_matmul_k_tile : int = 32
     enable_sme_streaming_autovec: bool = False
