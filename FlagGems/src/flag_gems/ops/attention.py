@@ -140,7 +140,7 @@ SMALL_HEAD_DIM_CONFIGS = [
     for s in [2, 3, 4]
     for w in [4, 8]
 ]
-configs += SMALL_HEAD_DIM_CONFIGS
+configs = SMALL_HEAD_DIM_CONFIGS + configs
 
 
 @libentry()
