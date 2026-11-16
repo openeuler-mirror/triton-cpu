@@ -25,7 +25,6 @@
 #include "triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.h"
 
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -130,24 +129,11 @@ public:
 
   void runOnOperation() override {
     auto moduleOp = getOperation();
-    // Extend the existing Kunpeng whole-kernel pass, as for PR #297.
-    // Run recognition before choosing the remaining lowering pipeline.
-    if (enableKunpengLLM) {
-      PassManager nativePM(&getContext(), moduleOp.getOperationName());
-      nativePM.addPass(createTritonFlashAttentionToKunpengLLMPass());
-      if (failed(runPipeline(nativePM, moduleOp))) {
-        signalPassFailure();
-        return;
-      }
-    }
-    bool useArmPL = enableArmPL;
-    moduleOp.walk([&](func::CallOp call) {
-      // Keep the outlined sparse fallback on ordinary Triton lowering.
-      // ArmPL cannot lower its BF16 conversion graph.
-      if (call.getCallee() == "kunpeng_sparse_mla_forward_bf16")
-        useArmPL = false;
-    });
     PassManager pm(&getContext(), moduleOp.getOperationName());
+    // Whole-kernel library replacements run on the original Triton IR,
+    // before anything is lowered.
+    if (enableKunpengLLM)
+      pm.addPass(createTritonFlashAttentionToKunpengLLMPass());
     pm.addPass(createTritonToStructuredPass(enableMakeGatherScatterTensorPtr));
 
     // Erase dead code and fold constants created during lowering
@@ -165,7 +151,7 @@ public:
     // If ArmPL is enabled, convert tt.dot to tts.armpl_matmul/gemv BEFORE
     // TritonArithToLinalg so that the default MatmulConverter never sees
     // tt.dot ops that should go through ArmPL.
-    if (useArmPL)
+    if (enableArmPL)
       pm.addPass(createTritonDotToArmPLOpPass());
 
     pm.addPass(createTritonArithToLinalgPass(/*tensorPtrToLinalg=*/true));
@@ -173,7 +159,7 @@ public:
     // Lower ArmPL matmul/gemv ops to func.call @cblas_* if ArmPL is enabled.
     // Must run BEFORE StructuredToMemref because the ArmPL ops have
     // tensor operands, and ArmPLOpToFunction does its own bufferization.
-    if (useArmPL)
+    if (enableArmPL)
       pm.addPass(createArmPLOpToFunctionPass());
 
     // Version boundary-masked regions before the masks turn into scratch
