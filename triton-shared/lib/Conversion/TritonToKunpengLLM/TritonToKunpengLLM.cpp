@@ -49,6 +49,7 @@ namespace mlir {
 namespace triton {
 
 #define GEN_PASS_DEF_TRITONFLASHATTENTIONTOKUNPENGLLM
+#define GEN_PASS_DEF_TRITONFLASHMLATOKUNPENGLLM
 #include "triton-shared/Conversion/TritonToKunpengLLM/Passes.h.inc"
 
 namespace {
@@ -186,6 +187,16 @@ public:
   // cache row a paged K/V load gathers (bound to DIM_KROW once its structure
   // has been checked), or a loop-carried affine counter.
   llvm::DenseMap<Value, Poly> bound;
+  // When set, integer tensors outside the understood op set (loads, loop
+  // iter args, ...) become opaque atoms instead of failing the evaluation.
+  // Used by the flash-MLA matcher, whose gather addresses are built from
+  // loaded page indices; identity of those values is still checked (the same
+  // SSA value gives the same atom), so this stays sound.
+  bool atomizeUnknownTensors = false;
+  // Optional hook consulted before atomizing; lets the flash-MLA matcher
+  // resolve ops it has verified structurally (e.g. offs_n % BLOCK_N -> the
+  // key lane).
+  std::function<std::optional<Poly>(Operation *, const void *)> tensorHook;
 
   std::optional<Poly> scalar(Value v) {
     if (auto it = bound.find(v); it != bound.end())
@@ -248,6 +259,11 @@ public:
         return *a - *b;
       return *a * *b;
     }
+    if (tensorHook)
+      if (auto h = tensorHook(op, lane))
+        return *h;
+    if (atomizeUnknownTensors)
+      return Poly::atom(v);
     return std::nullopt;
   }
 };
@@ -503,6 +519,36 @@ static Value rowVector(Value v) {
   if (!e || e.getAxis() != 1)
     return {};
   return e.getSrc();
+}
+
+// Look through splat/broadcast/expand_dims down to the defining scalar.
+static Value scalarSource(Value v) {
+  Operation *op = v.getDefiningOp();
+  if (auto s = dyn_cast_or_null<triton::SplatOp>(op))
+    return s.getSrc();
+  if (auto b = dyn_cast_or_null<triton::BroadcastOp>(op))
+    return scalarSource(b.getSrc());
+  if (auto e = dyn_cast_or_null<triton::ExpandDimsOp>(op))
+    return scalarSource(e.getSrc());
+  return {};
+}
+
+// Peel broadcast/expand_dims off a broadcast mask down to the 1-D condition.
+static Value maskCondition(Value v) {
+  Operation *op = v.getDefiningOp();
+  while (op && (isa<triton::BroadcastOp>(op) || isa<triton::ExpandDimsOp>(op))) {
+    v = op->getOperand(0);
+    op = v.getDefiningOp();
+  }
+  return v;
+}
+
+// cond (1-D, possibly broadcast/expanded) is `offs_n < splat(seqlen)`.
+static bool isOffsLtSeqLen(Value cond, Value offsN, Value seqLoad) {
+  auto cmp = dyn_cast_or_null<arith::CmpIOp>(cond.getDefiningOp());
+  return cmp && cmp.getPredicate() == arith::CmpIPredicate::slt &&
+         cmp.getLhs() == offsN &&
+         scalarSource(cmp.getRhs()) == seqLoad;
 }
 
 static bool isReduce(Value v, Value src, bool isMax) {
@@ -1831,6 +1877,775 @@ void FlashAttentionMatcher::rewrite() {
   }
 }
 
+//===----------------------------------------------------------------------===//
+// Flash-MLA decode matcher
+//===----------------------------------------------------------------------===//
+
+// Recognise the FlagGems flash-MLA decode kernel (one program = BLOCK_H
+// query heads of one batch at a single query position, s_q == 1) and replace
+// its body by a call to kunpeng_flash_mla_bf16:
+//
+//   kunpeng_flash_mla_bf16(q, q_hs, kv, kv_rs, block_table, seqlen, o,
+//                          o_hs, num_heads, page_size, dv, d, scale)
+//
+// (see third_party/kunpeng/llm/kunpeng_llm.h).  The kernel has the shape
+//
+//   q_nope, q_pe = split loads of Q [BLOCK_H, d]      (no mask: EVEN_H)
+//   acc = 0, l = 0, m = -inf, offs = arange(BLOCK_N)
+//   for i in [0, seqlen // BLOCK_N):                  (one page per iter)
+//     page  = load(block_table + i)                   (offs // PAGE)
+//     kvloc = page * PAGE + offs % PAGE
+//     ckv   = load(kv + kvloc * kv_rs + arange(DV))   (gather, no mask)
+//     kpe   = load(kv + kvloc * kv_rs + DV + I)       (gather, no mask)
+//     s     = dot(q_pe, kpe, dot(q_nope, trans(ckv), 0)) * scale
+//     m' = max(m, rowmax(s)); alpha = exp(m - m')
+//     p = exp(s - m'); acc = acc * alpha + dot(trunc(p), ckv)
+//     l = l * alpha + rowsum(p); offs += BLOCK_N
+//   if seqlen % BLOCK_N != 0:                         (masked tail page)
+//     ... one more step with masked loads and select(mask, s, -inf) ...
+//   o = trunc(acc / l)
+//
+// All addresses are checked as integer polynomials over top-level atoms, the
+// page-table indirection and the softmax data flow structurally; a kernel
+// that computes anything else is left untouched and keeps running as generic
+// Triton code.
+class FlashMLAMatcher {
+public:
+  explicit FlashMLAMatcher(triton::FuncOp f) : func(f) {}
+
+  bool match();
+  void rewrite();
+
+private:
+  bool fail(const Twine &why) {
+    LLVM_DEBUG(llvm::dbgs() << "[kunpeng-llm] " << func.getName()
+                            << ": no flash-mla match: " << why << "\n");
+    return false;
+  }
+
+  bool matchEpilogue();
+  bool matchLoop();
+  bool matchTail();
+  bool matchFrame();
+  // One online-softmax step (loop body or tail region).  oAcc/oL/oM are the
+  // yield operand positions of the step's outputs; oM may be -1 when the
+  // running max is not yielded (the tail keeps it local).  Sets
+  // stepCkvLoad / stepKpeLoad / stepPageLoad / btRow.
+  bool matchStep(Block &block, Value inAcc, Value inL, Value inM, Value offsN,
+                 bool masked, unsigned oAcc, unsigned oL, unsigned oM);
+  bool checkPageLoad(triton::LoadOp pageLoad, Value offsN, bool masked);
+  bool checkGatherLoads(bool masked);
+
+  triton::FuncOp func;
+  PolyEval pe;
+
+  triton::StoreOp oStore;
+  Type elemTy;
+  int64_t BH = 0, DV = 0, DKPE = 0, BN = 0, D = 0;
+
+  scf::ForOp loop;
+  scf::IfOp tailIf;
+  unsigned iAcc, iL, iM, iOffs;
+  Value offsIter; // the loop's offs_n iter arg
+  Value accOut, lOut;
+
+  triton::LoadOp qNopeLoad, qPeLoad, seqLoad;
+  Value scaleVal;
+
+  // Per-step state
+  triton::LoadOp stepCkvLoad, stepKpeLoad, stepPageLoad;
+  Value btRow;
+  Value offsLane; // offs_n value of the step being matched (hook target)
+
+  // Frame results
+  Value qBase, kvBase, oBase, btBase;
+  Poly qOff, oOff, qRs, oRs, kvRs, btOff;
+  bool kvSet = false;
+};
+
+// The only store is o = trunc(acc / l[:, None]); acc and l come from the key
+// loop, optionally through the tail scf.if.
+bool FlashMLAMatcher::matchEpilogue() {
+  auto oTy = dyn_cast<RankedTensorType>(oStore.getValue().getType());
+  if (!oTy || oTy.getRank() != 2 || !oTy.getElementType().isBF16())
+    return fail("output is not a 2-D bf16 tensor");
+  elemTy = oTy.getElementType();
+  BH = oTy.getShape()[0];
+  DV = oTy.getShape()[1];
+  if (BH % 16 != 0 || BH < 16 || BH > 128 || DV % 16 != 0 || DV <= 0 ||
+      DV > 1024)
+    return fail("unsupported BLOCK_H / head_dim_v");
+
+  auto trunc = oStore.getValue().getDefiningOp<arith::TruncFOp>();
+  if (!trunc)
+    return fail("output not truncated from fp32");
+  auto div = trunc.getIn().getDefiningOp<arith::DivFOp>();
+  if (!div)
+    return fail("output is not acc / l");
+  lOut = rowVector(div.getRhs());
+  if (!lOut)
+    return fail("output is not divided by a row vector");
+  accOut = div.getLhs();
+
+  tailIf = accOut.getDefiningOp<scf::IfOp>();
+  if (tailIf) {
+    if (!tailIf.thenBlock() || !tailIf.elseBlock() ||
+        tailIf.getNumResults() != 2)
+      return fail("tail is not a two-result if");
+    if (lOut.getDefiningOp() != tailIf)
+      return fail("acc/l do not both come from the tail if");
+    if (tailIf->getBlock() != &func.getBody().front())
+      return fail("tail if is not at top level");
+    // The key loop feeds the tail; it is the only top-level scf.for.
+    loop = nullptr;
+    bool multi = false;
+    for (Operation &op : func.getBody().front()) {
+      if (auto f = dyn_cast<scf::ForOp>(&op)) {
+        if (loop)
+          multi = true;
+        loop = f;
+      }
+    }
+    if (!loop || multi)
+      return fail("cannot identify the single top-level key loop");
+    return true;
+  }
+  loop = accOut.getDefiningOp<scf::ForOp>();
+  if (!loop || lOut.getDefiningOp() != loop)
+    return fail("acc/l are not results of a key loop");
+  return true;
+}
+
+// The key loop: for i in [0, seqlen // BLOCK_N) step 1, iterating
+// (acc, l, m, offs_n) with the canonical inits.
+bool FlashMLAMatcher::matchLoop() {
+  if (loop->getBlock() != &func.getBody().front())
+    return fail("key loop not at top level");
+  auto lb = getIntSplat(loop.getLowerBound());
+  auto step = getIntSplat(loop.getStep());
+  if (!lb || *lb != 0 || !step || *step != 1)
+    return fail("key loop bounds are not for i in [0, n) step 1");
+
+  // Upper bound: seqlen // BLOCK_N.
+  auto ubDiv = loop.getUpperBound().getDefiningOp<arith::DivSIOp>();
+  if (!ubDiv)
+    return fail("key loop upper bound is not seqlen // BLOCK_N");
+  seqLoad = ubDiv.getLhs().getDefiningOp<triton::LoadOp>();
+  if (!seqLoad || !seqLoad->getBlock() ||
+      seqLoad->getBlock() != &func.getBody().front() || seqLoad.getMask())
+    return fail("seqlen is not an unmasked top-level scalar load");
+  if (!seqLoad.getType().isInteger())
+    return fail("seqlen is not an integer");
+  auto bn = getIntSplat(ubDiv.getRhs());
+  if (!bn)
+    return fail("key loop upper bound divisor is not constant");
+  BN = *bn;
+
+  // Iter args: acc = 0, l = 0, m = -inf, offs_n = arange(0, BLOCK_N).
+  if (loop.getNumRegionIterArgs() != 4)
+    return fail("key loop does not have exactly four iter args");
+  bool hasAcc = false, hasL = false, hasM = false, hasOffs = false;
+  for (unsigned i = 0; i < 4; ++i) {
+    Value arg = loop.getRegionIterArg(i);
+    Value init = loop.getInitArgs()[i];
+    auto ty = dyn_cast<RankedTensorType>(arg.getType());
+    if (!ty)
+      return fail("key loop iter arg is not a tensor");
+    if (ty.getRank() == 2 && ty.getShape()[0] == BH &&
+        ty.getShape()[1] == DV && ty.getElementType().isF32() &&
+        isFloatSplat(init, 0.0) && !hasAcc) {
+      iAcc = i;
+      hasAcc = true;
+    } else if (ty.getRank() == 1 && ty.getShape()[0] == BH &&
+               ty.getElementType().isF32() && isFloatSplat(init, 0.0) &&
+               !hasL) {
+      iL = i;
+      hasL = true;
+    } else if (ty.getRank() == 1 && ty.getShape()[0] == BH &&
+               ty.getElementType().isF32() && isFloatSplat(init, -INFINITY) &&
+               !hasM) {
+      iM = i;
+      hasM = true;
+    } else if (ty.getRank() == 1 && ty.getShape()[0] == BN &&
+               ty.getElementType().isInteger() && !hasOffs) {
+      auto mr = init.getDefiningOp<triton::MakeRangeOp>();
+      if (!mr || mr.getStart() != 0 || mr.getEnd() != BN)
+        return fail("offs_n init is not arange(0, BLOCK_N)");
+      iOffs = i;
+      hasOffs = true;
+    } else {
+      return fail("unexpected key loop iter arg");
+    }
+  }
+  offsIter = loop.getRegionIterArg(iOffs);
+
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  auto offsAdd = yield->getOperand(iOffs).getDefiningOp<arith::AddIOp>();
+  if (!offsAdd || offsAdd.getLhs() != offsIter ||
+      getIntSplat(offsAdd.getRhs()) != BN)
+    return fail("offs_n is not incremented by BLOCK_N");
+
+  if (!matchStep(*loop.getBody(), loop.getRegionIterArg(iAcc),
+                 loop.getRegionIterArg(iL), loop.getRegionIterArg(iM),
+                 offsIter, /*masked=*/false, iAcc, iL, iM))
+    return false;
+
+  if (tailIf) {
+    if (!matchTail())
+      return false;
+  } else {
+    // Without a tail region the kernel cannot handle seqlen % BLOCK_N keys,
+    // which the library would happily process: require the tail to exist.
+    return fail("kernel has no masked tail chunk");
+  }
+  return true;
+}
+
+// One online-softmax step over one chunk of BN keys.
+bool FlashMLAMatcher::matchStep(Block &block, Value inAcc, Value inL,
+                                Value inM, Value offsN, bool masked,
+                                unsigned oAcc, unsigned oL, unsigned oM) {
+  offsLane = offsN;
+  auto yield = cast<scf::YieldOp>(block.getTerminator());
+  Value accN = yield->getOperand(oAcc), lN = yield->getOperand(oL);
+  Value mN;
+  if (oM != (unsigned)-1) {
+    mN = yield->getOperand(oM);
+    Value rmax = otherOperand<arith::MaxNumFOp>(mN, inM);
+    if (!rmax)
+      rmax = otherOperand<arith::MaximumFOp>(mN, inM);
+    if (!rmax)
+      return fail("m' is not max(m, rowmax(S))");
+  }
+
+  // acc' = dot(trunc(p), ckv, acc * alpha)
+  auto pv = accN.getDefiningOp<triton::DotOp>();
+  if (!pv)
+    return fail("acc' is not a dot");
+  auto pTrunc = pv.getA().getDefiningOp<arith::TruncFOp>();
+  if (!pTrunc || getElementTypeOrSelf(pTrunc.getType()) != elemTy)
+    return fail("P is not truncated to the input type");
+  Value p = pTrunc.getIn();
+
+  stepCkvLoad = pv.getB().getDefiningOp<triton::LoadOp>();
+  if (!stepCkvLoad || stepCkvLoad->getBlock() != &block)
+    return fail("V is not loaded in the step");
+  auto ckvTy = dyn_cast<RankedTensorType>(stepCkvLoad.getType());
+  if (!ckvTy || ckvTy.getShape()[0] != BN || ckvTy.getShape()[1] != DV ||
+      ckvTy.getElementType() != elemTy)
+    return fail("V tile has an unexpected shape");
+
+  Value alpha;
+  if (auto accMul = pv.getC().getDefiningOp<arith::MulFOp>()) {
+    for (int i = 0; i < 2 && !alpha; ++i) {
+      if (accMul->getOperand(i) == inAcc)
+        alpha = rowVector(accMul->getOperand(1 - i));
+    }
+  }
+  if (!alpha)
+    return fail("acc is not rescaled by acc * row vector");
+  auto aExp = alpha.getDefiningOp<math::ExpOp>();
+  auto aSub =
+      aExp ? aExp.getOperand().getDefiningOp<arith::SubFOp>() : nullptr;
+  if (!aSub)
+    return fail("alpha is not exp(m - m')");
+  if (oM != (unsigned)-1) {
+    if (!((aSub.getLhs() == inM && aSub.getRhs() == mN) ||
+          (aSub.getRhs() == inM && aSub.getLhs() == mN)))
+      return fail("alpha does not use the yielded running max");
+  } else {
+    mN = aSub.getLhs() == inM ? aSub.getRhs() : aSub.getLhs();
+    if (aSub.getLhs() != inM && aSub.getRhs() != inM)
+      return fail("alpha does not use the running max");
+    if (!mN.getDefiningOp<arith::MaxNumFOp>() &&
+        !mN.getDefiningOp<arith::MaximumFOp>())
+      return fail("tail running max is not a maximum");
+    Value rmax = otherOperand<arith::MaxNumFOp>(mN, inM);
+    if (!rmax)
+      rmax = otherOperand<arith::MaximumFOp>(mN, inM);
+    if (!rmax)
+      return fail("tail running max is not max(m, rowmax(S))");
+  }
+
+  // l' = l * alpha + rowsum(P)
+  bool lok = false;
+  if (auto lAdd = lN.getDefiningOp<arith::AddFOp>()) {
+    for (int i = 0; i < 2 && !lok; ++i) {
+      Value a = lAdd->getOperand(i), b = lAdd->getOperand(1 - i);
+      auto lmul = a.getDefiningOp<arith::MulFOp>();
+      if (lmul && isReduce(b, p, false) &&
+          ((lmul->getOperand(0) == inL && lmul->getOperand(1) == alpha) ||
+           (lmul->getOperand(0) == alpha && lmul->getOperand(1) == inL)))
+        lok = true;
+    }
+  }
+  if (!lok)
+    return fail("l' is not l * alpha + rowsum(P)");
+
+  // P = exp(S - m'); S = select(mask, qk, -inf) or qk;
+  // qk = dot(q_pe, k_pe, dot(q_nope, trans(ckv), 0)) * scale
+  auto pExp = p.getDefiningOp<math::ExpOp>();
+  auto pSub =
+      pExp ? pExp.getOperand().getDefiningOp<arith::SubFOp>() : nullptr;
+  if (!pSub || rowVector(pSub.getRhs()) != mN)
+    return fail("P is not exp(S - m')");
+  Value sSel = pSub.getLhs();
+  Value s = sSel;
+  if (masked) {
+    auto sel = sSel.getDefiningOp<arith::SelectOp>();
+    if (!sel || !isFloatSplat(sel.getFalseValue(), -INFINITY))
+      return fail("tail does not select -inf for masked keys");
+    s = sel.getTrueValue();
+    if (!isOffsLtSeqLen(maskCondition(sel.getCondition()), offsN, seqLoad))
+      return fail("tail mask is not offs_n < seqlen");
+  }
+  auto qkMul = s.getDefiningOp<arith::MulFOp>();
+  if (!qkMul)
+    return fail("S is not scaled");
+  Value dot2;
+  for (int i = 0; i < 2 && !dot2; ++i) {
+    if (qkMul->getOperand(i).getDefiningOp<triton::DotOp>()) {
+      dot2 = qkMul->getOperand(i);
+      scaleVal = scalarSource(qkMul->getOperand(1 - i));
+    }
+  }
+  if (!dot2)
+    return fail("S is not a scaled dot");
+  if (!scaleVal || !scaleVal.getType().isF32() ||
+      (!scaleVal.isa<BlockArgument>() &&
+       scaleVal.getDefiningOp()->getBlock() != &func.getBody().front()))
+    return fail("scale is not an entry-block f32 scalar");
+
+  // m' source: rowmax over the (masked) scores.
+  Value rmax;
+  if (oM != (unsigned)-1) {
+    rmax = otherOperand<arith::MaxNumFOp>(mN, inM);
+    if (!rmax)
+      rmax = otherOperand<arith::MaximumFOp>(mN, inM);
+  } else {
+    if (auto mx = mN.getDefiningOp<arith::MaxNumFOp>()) {
+      if (mx->getOperand(0) == inM)
+        rmax = mx->getOperand(1);
+      else if (mx->getOperand(1) == inM)
+        rmax = mx->getOperand(0);
+    }
+    if (!rmax)
+      if (auto mx = mN.getDefiningOp<arith::MaximumFOp>()) {
+        if (mx->getOperand(0) == inM)
+          rmax = mx->getOperand(1);
+        else if (mx->getOperand(1) == inM)
+          rmax = mx->getOperand(0);
+      }
+  }
+  if (!rmax || !isReduce(rmax, sSel, /*isMax=*/true))
+    return fail("m' is not max(m, rowmax(S))");
+
+  auto d2 = dot2.getDefiningOp<triton::DotOp>();
+  stepKpeLoad = d2.getB().getDefiningOp<triton::LoadOp>();
+  qPeLoad = d2.getA().getDefiningOp<triton::LoadOp>();
+  if (!stepKpeLoad || stepKpeLoad->getBlock() != &block || !qPeLoad)
+    return fail("K_pe is not loaded in the step / q_pe is not a load");
+  auto kpeTy = dyn_cast<RankedTensorType>(stepKpeLoad.getType());
+  DKPE = kpeTy ? kpeTy.getShape()[0] : 0;
+  if (!kpeTy || kpeTy.getRank() != 2 || kpeTy.getShape()[1] != BN ||
+      kpeTy.getElementType() != elemTy || DKPE <= 0)
+    return fail("K_pe tile has an unexpected shape");
+  auto d1 = d2.getC().getDefiningOp<triton::DotOp>();
+  if (!d1 || !isFloatSplat(d1.getC(), 0.0))
+    return fail("S is not dot(q_pe, k_pe, dot(q_nope, K^T))");
+  qNopeLoad = d1.getA().getDefiningOp<triton::LoadOp>();
+  auto trans = d1.getB().getDefiningOp<triton::TransOp>();
+  if (!qNopeLoad || !trans ||
+      trans.getSrc() != Value(stepCkvLoad.getResult()))
+    return fail("S is not dot(q_nope, trans(ckv)) + dot(q_pe, k_pe)");
+
+  // The page-table load: the only 1-D [BLOCK_N] integer load of the step.
+  triton::LoadOp page = nullptr;
+  block.walk([&](triton::LoadOp ld) {
+    auto ty = dyn_cast<RankedTensorType>(ld.getType());
+    if (ty && ty.getRank() == 1 && ty.getShape()[0] == BN &&
+        ty.getElementType().isInteger())
+      page = ld;
+  });
+  if (!page)
+    return fail("no page-table load in the step");
+  stepPageLoad = page;
+  if (!checkPageLoad(page, offsN, masked))
+    return false;
+  if (!checkGatherLoads(masked))
+    return false;
+  return true;
+}
+
+// page = load(block_table_row + offs_n // BLOCK_N); the tail loads it with
+// the offs_n < seqlen mask.
+bool FlashMLAMatcher::checkPageLoad(triton::LoadOp pageLoad, Value offsN,
+                                    bool masked) {
+  auto add = pageLoad.getPtr().getDefiningOp<triton::AddPtrOp>();
+  if (!add)
+    return fail("page address is not affine");
+  Value base = scalarSource(add.getPtr());
+  if (!base || !base.getType().isa<triton::PointerType>())
+    return fail("page address base is not a scalar pointer");
+  if (btRow) {
+    if (btRow != base)
+      return fail("tail reads a different page table row");
+  }
+  btRow = base;
+  auto div = add.getOffset().getDefiningOp<arith::DivSIOp>();
+  if (!div || div.getLhs() != offsN ||
+      getIntSplat(div.getRhs()) != BN)
+    return fail("page index is not offs_n // BLOCK_N");
+  if (!masked) {
+    if (pageLoad.getMask() || pageLoad.getOther())
+      return fail("interior page load is masked");
+    return true;
+  }
+  if (!pageLoad.getMask())
+    return fail("tail page load has no mask");
+  if (!isOffsLtSeqLen(pageLoad.getMask(), offsN, seqLoad))
+    return fail("tail page mask is not offs_n < seqlen");
+  auto other = getIntSplat(pageLoad.getOther());
+  if (!other || *other != 0)
+    return fail("tail page load other is not 0");
+  return true;
+}
+
+// ckv = load(kv + kvloc * kv_rs + J) and kpe = load(kv + kvloc * kv_rs +
+// DV + I), with kvloc = page * BLOCK_N + offs_n % BLOCK_N; the tail loads
+// zero beyond seqlen.
+bool FlashMLAMatcher::checkGatherLoads(bool masked) {
+  Value pageVal = stepPageLoad.getResult();
+  auto va = evalAddress(pe, stepCkvLoad.getPtr(), DIM_I);
+  if (!va)
+    return fail("V address is not affine");
+  auto vt = splitTile(va->offset, DIM_I, DIM_J);
+  if (!vt)
+    return fail("V is not a row-major tile");
+  // With offs_n % BLOCK_N resolved to the key lane, the row stride of the
+  // gather is exactly kv_rs and the tile offset remainder is
+  // kv_rs * page * BLOCK_N.
+  Poly pageTerm = vt->rest;
+  Poly kvRsCand = vt->rowStride;
+  if (pageTerm != kvRsCand * Poly::cst(BN) * Poly::atom(pageVal))
+    return fail("V row stride does not match the gathered key rows");
+  if (!kvSet) {
+    kvSet = true;
+    kvBase = va->base;
+    kvRs = kvRsCand;
+  } else {
+    if (kvBase != va->base || kvRs != kvRsCand)
+      return fail("tail gathers from a different kv cache");
+  }
+
+  auto ka = evalAddress(pe, stepKpeLoad.getPtr(), DIM_I);
+  if (!ka || ka->base != kvBase)
+    return fail("K_pe address is not affine over the kv cache");
+  auto kr = ka->offset.split(DIM_I);
+  if (!kr || kr->first != Poly::cst(1))
+    return fail("K_pe row part is not DV + I");
+  auto kc = kr->second.split(DIM_J);
+  if (!kc || kc->first != kvRsCand ||
+      kc->second != Poly::cst(DV) + pageTerm)
+    return fail("K_pe is not the rope part of the same key rows");
+
+  auto checkMask = [&](triton::LoadOp ld, int axis) {
+    if (!masked) {
+      if (ld.getMask() || ld.getOther())
+        return fail("interior gather load is masked");
+      return true;
+    }
+    if (!ld.getMask())
+      return fail("tail gather load is unmasked");
+    if (!isOffsLtSeqLen(maskCondition(ld.getMask()), loop.getResult(iOffs),
+                        seqLoad))
+      return fail("tail gather mask is not offs_n < seqlen");
+    auto other = getFloatSplat(ld.getOther());
+    if (!other || *other != 0.0)
+      return fail("tail gather load other is not 0");
+    return true;
+  };
+  if (!checkMask(stepCkvLoad, /*axis=*/1) || !checkMask(stepKpeLoad, /*axis=*/0))
+    return false;
+  return true;
+}
+
+// The masked tail: one more softmax step over the final partial page.
+bool FlashMLAMatcher::matchTail() {
+  auto cond = tailIf.getCondition().getDefiningOp<arith::CmpIOp>();
+  auto rem =
+      cond ? cond.getLhs().getDefiningOp<arith::RemSIOp>() : nullptr;
+  if (!cond || cond.getPredicate() != arith::CmpIPredicate::ne || !rem ||
+      rem.getLhs() != Value(seqLoad) || getIntSplat(rem.getRhs()) != BN)
+    return fail("tail condition is not seqlen % BLOCK_N != 0");
+
+  // Identify the acc/l result positions by type.
+  unsigned oAcc = 2, oL = 2;
+  for (unsigned i = 0; i < 2; ++i) {
+    Type ty = tailIf.getResult(i).getType();
+    if (ty == accOut.getType())
+      oAcc = i;
+    else if (ty == lOut.getType())
+      oL = i;
+  }
+  if (oAcc == 2 || oL == 2 || oAcc == oL)
+    return fail("tail results are not acc/l");
+
+  triton::LoadOp qNopePrev = qNopeLoad, qPePrev = qPeLoad;
+  if (!matchStep(*tailIf.thenBlock(), loop.getResult(iAcc),
+                 loop.getResult(iL), loop.getResult(iM),
+                 loop.getResult(iOffs), /*masked=*/true, oAcc, oL,
+                 /*oM=*/-1))
+    return false;
+  // The tail must consume the same query tiles as the interior loop.
+  if (qNopeLoad != qNopePrev || qPeLoad != qPePrev)
+    return fail("tail uses different Q tiles");
+
+  auto elseYield =
+      cast<scf::YieldOp>(tailIf.elseBlock()->getTerminator());
+  if (elseYield->getOperand(oAcc) != loop.getResult(iAcc) ||
+      elseYield->getOperand(oL) != loop.getResult(iL))
+    return fail("tail else does not yield the loop values unchanged");
+  return true;
+}
+
+// Q tiles, seqlen load and the output tile: addresses as top-level
+// polynomials, shapes consistent, no masks (EVEN_H).
+bool FlashMLAMatcher::matchFrame() {
+  // Q = [q_nope | q_pe], one [BH, D] row-major tile per program.
+  auto qa = evalAddress(pe, qNopeLoad.getPtr(), DIM_I);
+  if (!qa)
+    return fail("Q address is not affine");
+  auto qt = splitTile(qa->offset, DIM_I, DIM_J);
+  if (!qt)
+    return fail("Q is not a row-major tile");
+  auto pa = evalAddress(pe, qPeLoad.getPtr(), DIM_I);
+  if (!pa)
+    return fail("Q_pe address is not affine");
+  auto pt = splitTile(pa->offset, DIM_I, DIM_J);
+  if (!pt)
+    return fail("Q_pe is not a row-major tile");
+  qBase = qa->base;
+  qRs = qt->rowStride;
+  qOff = qt->rest;
+  if (pa->base != qBase || pt->rowStride != qRs ||
+      pt->rest != qOff + Poly::cst(DV))
+    return fail("q_nope / q_pe are not consecutive tiles of one Q tile");
+  auto qNopeTy = dyn_cast<RankedTensorType>(qNopeLoad.getType());
+  auto qPeTy = dyn_cast<RankedTensorType>(qPeLoad.getType());
+  if (!qNopeTy || !qPeTy || qNopeTy.getShape()[0] != BH ||
+      qNopeTy.getShape()[1] != DV || qPeTy.getShape()[0] != BH ||
+      qPeTy.getShape()[1] != DKPE)
+    return fail("Q tiles have unexpected shapes");
+  D = DV + DKPE;
+  if (qNopeLoad.getMask() || qPeLoad.getMask())
+    return fail("Q loads are masked (EVEN_H required)");
+  if (qNopeLoad->getBlock() != &func.getBody().front() ||
+      qPeLoad->getBlock() != &func.getBody().front())
+    return fail("Q is not loaded at top level");
+
+  // Output tile.
+  auto oa = evalAddress(pe, oStore.getPtr(), DIM_I);
+  if (!oa)
+    return fail("output address is not affine");
+  auto ot = splitTile(oa->offset, DIM_I, DIM_J);
+  if (!ot)
+    return fail("output is not a row-major tile");
+  oBase = oa->base;
+  oRs = ot->rowStride;
+  oOff = ot->rest;
+  if (oStore.getMask())
+    return fail("output store is masked (EVEN_H required)");
+
+  // All bases must be plain function arguments and all offsets/strides
+  // loop-invariant (top-level) polynomials.
+  for (Value v : {qBase, kvBase, oBase, btBase}) {
+    if (!v || !v.isa<BlockArgument>())
+      return fail("head base is not a function argument");
+  }
+  for (Poly *p : {&qOff, &oOff, &qRs, &oRs, &kvRs, &btOff}) {
+    for (auto *a : p->atoms()) {
+      Value v = Value::getFromOpaquePointer(a);
+      Block *entry = &func.getBody().front();
+      bool top = isa<BlockArgument>(v)
+                     ? cast<BlockArgument>(v).getOwner() == entry
+                     : v.getDefiningOp()->getBlock() == entry;
+      if (!top)
+        return fail("head offset or stride is not loop invariant");
+    }
+  }
+
+  // Library contract on the block sizes.
+  if (BN % 16 != 0 || BN < 16 || BN > 512)
+    return fail("unsupported page size / BLOCK_N");
+  if (D % 16 != 0 || D <= DV || D > 1024)
+    return fail("unsupported head_dim");
+  return true;
+}
+
+bool FlashMLAMatcher::match() {
+  if (func.isExternal() || !func.getBody().hasOneBlock())
+    return fail("not a single-block kernel");
+  pe.atomizeUnknownTensors = true;
+  // offs_n % BLOCK_N is the key lane (verified structurally in matchStep);
+  // resolve it to the lane index so the gather addresses evaluate cleanly.
+  // Installed up front: BN and offsLane are filled in while matching.
+  pe.tensorHook = [&](Operation *op, const void *lane) -> std::optional<Poly> {
+    if (auto r = dyn_cast<arith::RemSIOp>(op))
+      if (r.getLhs() == offsLane && getIntSplat(r.getRhs()) == BN)
+        return Poly::atom(lane);
+    return std::nullopt;
+  };
+
+  // The kernel's only effect must be the output store (no lse in MLA).
+  SmallVector<triton::StoreOp> stores;
+  bool otherEffects = false;
+  func.walk([&](Operation *op) {
+    if (auto st = dyn_cast<triton::StoreOp>(op)) {
+      stores.push_back(st);
+      return;
+    }
+    if (isa<triton::LoadOp>(op) || op == func.getOperation() ||
+        op->hasTrait<OpTrait::IsTerminator>())
+      return;
+    if (isa<CallOpInterface>(op))
+      otherEffects = true;
+    if (auto me = dyn_cast<MemoryEffectOpInterface>(op)) {
+      if (!me.hasNoEffect() && !me.onlyHasEffect<MemoryEffects::Read>())
+        otherEffects = true;
+    } else if (!op->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) {
+      otherEffects = true;
+    }
+  });
+  if (otherEffects)
+    return fail("side effects other than the output store");
+  if (stores.size() != 1)
+    return fail("expected exactly one store");
+  oStore = stores[0];
+
+  if (!matchEpilogue())
+    return false;
+  if (!matchLoop())
+    return false;
+
+  // btRow: the batch's page-table row; walk the addptr chain for the offset.
+  Value b = btRow;
+  btOff = Poly::cst(0);
+  while (auto ap = b.getDefiningOp<triton::AddPtrOp>()) {
+    auto o = pe.scalar(ap.getOffset());
+    if (!o)
+      return fail("page table row offset is not affine");
+    btOff = *o + btOff;
+    b = ap.getPtr();
+  }
+  btBase = b;
+  if (!matchFrame())
+    return false;
+  LLVM_DEBUG(llvm::dbgs() << "[kunpeng-llm] " << func.getName()
+                          << ": matched flash-mla (BLOCK_H=" << BH
+                          << ", BLOCK_N=" << BN << ", d=" << D
+                          << ", dv=" << DV << ")\n");
+  return true;
+}
+
+void FlashMLAMatcher::rewrite() {
+  auto ret = cast<triton::ReturnOp>(func.getBody().front().getTerminator());
+  OpBuilder b(ret);
+  Location loc = oStore.getLoc();
+  auto i64 = b.getI64Type();
+  DenseMap<const void *, Value> widened;
+
+  // Same widening/materialization as the flash-attention rewrite.
+  auto atom64 = [&](const void *a) -> Value {
+    Value &v64 = widened[a];
+    if (!v64) {
+      Value v = Value::getFromOpaquePointer(a);
+      if (v.getType().isIndex())
+        v64 = b.create<arith::IndexCastOp>(loc, i64, v);
+      else if (v.getType().getIntOrFloatBitWidth() < 64)
+        v64 = b.create<arith::ExtSIOp>(loc, i64, v);
+      else
+        v64 = v;
+    }
+    return v64;
+  };
+  auto emit = [&](const Poly &p) -> Value {
+    Value sum;
+    int64_t constant = 0;
+    for (auto &[mono, c] : p.terms) {
+      if (mono.empty()) {
+        constant = c;
+        continue;
+      }
+      Value t;
+      for (auto *a : mono)
+        t = t ? b.create<arith::MulIOp>(loc, t, atom64(a)) : atom64(a);
+      if (c == -1 && sum) {
+        sum = b.create<arith::SubIOp>(loc, sum, t);
+        continue;
+      }
+      if (c != 1)
+        t = b.create<arith::MulIOp>(
+            loc, t, b.create<arith::ConstantIntOp>(loc, c, 64));
+      sum = sum ? b.create<arith::AddIOp>(loc, sum, t) : t;
+    }
+    Value cst = b.create<arith::ConstantIntOp>(loc, constant, 64);
+    if (!sum)
+      return cst;
+    return constant ? b.create<arith::AddIOp>(loc, sum, cst) : sum;
+  };
+  auto addr = [&](Value base, const Poly &off) -> Value {
+    Value p = base;
+    if (!off.terms.empty())
+      p = b.create<triton::AddPtrOp>(loc, p.getType(), p, emit(off));
+    return b.create<triton::PtrToIntOp>(loc, i64, p);
+  };
+  auto c64 = [&](int64_t c) {
+    return b.create<arith::ConstantIntOp>(loc, c, 64);
+  };
+
+  SmallVector<Value> args = {addr(qBase, qOff), emit(qRs),
+                             addr(kvBase, Poly::cst(0)), emit(kvRs),
+                             addr(btBase, btOff), emit(Poly::atom(Value(seqLoad))),
+                             addr(oBase, oOff),   emit(oRs),
+                             c64(BH),             c64(BN),
+                             c64(DV),             c64(D),
+                             scaleVal};
+
+  std::string name = "kunpeng_flash_mla_bf16";
+  auto module = func->getParentOfType<ModuleOp>();
+  auto fnTy = b.getFunctionType(ValueRange(args).getTypes(), {});
+  auto callee = module.lookupSymbol<func::FuncOp>(name);
+  if (!callee) {
+    OpBuilder mb(module.getBodyRegion());
+    mb.setInsertionPointToStart(module.getBody());
+    callee = mb.create<func::FuncOp>(module.getLoc(), name, fnTy);
+    callee.setPrivate();
+  }
+  b.create<func::CallOp>(loc, callee, args);
+
+  LLVM_DEBUG(llvm::dbgs() << "[kunpeng-llm] " << func.getName()
+                          << ": replaced by " << name << " (BLOCK_H=" << BH
+                          << ", BLOCK_N=" << BN << ", d=" << D
+                          << ", dv=" << DV << ")\n");
+
+  // Drop the Triton implementation: the store, then everything dead.
+  oStore.erase();
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    SmallVector<Operation *> dead;
+    func.getBody().front().walk<WalkOrder::PostOrder>([&](Operation *op) {
+      if (op->getParentOp() == func.getOperation() && isOpTriviallyDead(op))
+        dead.push_back(op);
+    });
+    for (Operation *op : llvm::reverse(dead)) {
+      op->erase();
+      changed = true;
+    }
+  }
+}
+
 struct TritonFlashAttentionToKunpengLLMPass
     : public impl::TritonFlashAttentionToKunpengLLMBase<
           TritonFlashAttentionToKunpengLLMPass> {
@@ -1843,11 +2658,28 @@ struct TritonFlashAttentionToKunpengLLMPass
   }
 };
 
+struct TritonFlashMLAToKunpengLLMPass
+    : public impl::TritonFlashMLAToKunpengLLMBase<
+          TritonFlashMLAToKunpengLLMPass> {
+  void runOnOperation() override {
+    getOperation().walk([](triton::FuncOp f) {
+      FlashMLAMatcher m(f);
+      if (m.match())
+        m.rewrite();
+    });
+  }
+};
+
 } // namespace
 
 std::unique_ptr<OperationPass<ModuleOp>>
 createTritonFlashAttentionToKunpengLLMPass() {
   return std::make_unique<TritonFlashAttentionToKunpengLLMPass>();
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createTritonFlashMLAToKunpengLLMPass() {
+  return std::make_unique<TritonFlashMLAToKunpengLLMPass>();
 }
 
 } // namespace triton

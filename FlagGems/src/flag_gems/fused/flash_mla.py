@@ -184,23 +184,28 @@ def flash_mla(
     o = torch.empty([b * s_q, h_q, dv], dtype=q.dtype, device=device)
     # FIXME: Add fixed major number for CPU condition
     if device == 'cpu':
-        major = 8
+        # One program per batch: every head block of a batch then walks the
+        # same (paged) keys exactly once, instead of re-gathering them per
+        # head block.  Pairs with the kunpeng_llm flash-MLA kernel, which
+        # packs a batch's K/V pages once for all of its heads.
+        BLOCK_H = triton.next_power_of_2(head_num)
+        num_stages = 2
     else:
         major, _ = torch_device_fn.get_device_capability(device)
-    if major == 9:
-        BLOCK_H = 64
-        num_stages = 3
-    elif major == 8:
-        BLOCK_H = 32
-        num_stages = 2
-    elif major == 7 and vendor_name == "iluvatar":
-        BLOCK_H = 32
-        num_stages = 1
-    elif major == 3 and vendor_name == "mthreads":
-        BLOCK_H = 32
-        num_stages = 1
-    else:
-        error.backend_not_support(device)
+        if major == 9:
+            BLOCK_H = 64
+            num_stages = 3
+        elif major == 8:
+            BLOCK_H = 32
+            num_stages = 2
+        elif major == 7 and vendor_name == "iluvatar":
+            BLOCK_H = 32
+            num_stages = 1
+        elif major == 3 and vendor_name == "mthreads":
+            BLOCK_H = 32
+            num_stages = 1
+        else:
+            error.backend_not_support(device)
     BLOCK_N = 64
     grid = (
         triton.cdiv(head_num, BLOCK_H),

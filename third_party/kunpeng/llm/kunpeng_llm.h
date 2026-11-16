@@ -71,6 +71,34 @@ void kunpeng_flash_attention_varlen_forward_f16(
     int64_t window_flags, int64_t left_shift, int64_t right_shift,
     int64_t head_dim, float scale_log2);
 
+// Flash-MLA decode forward (multi-head latent attention with paged KV) for
+// one (batch, head block) program with a single query position (s_q == 1):
+//
+//   o[h] = sum over keys j < seqlen of
+//          softmax_j(scale * q[h] . k[j]) * v[j]
+//
+// with q[h] a d-element row (the first dv elements are the latent value
+// part, the remaining d - dv the rope part; k[j] is the matching d-element
+// key row), v[j] the first dv elements of key row j, and softmax over all
+// seqlen keys (a decode step sees every cached key, no mask).
+//
+// Key rows are gathered through the batch's page table: key j of page p is
+// kv + (p * page_size + j % page_size) * kv_rs, where p = block_table[j /
+// page_size] and kv rows are kv_rs elements apart with d contiguous.  q and
+// o point at head 0 of the batch's head block (the head-block offset is
+// already folded in by the caller), heads are q_hs / o_hs elements apart,
+// and the head_dim elements of a row are contiguous.  scale is the softmax
+// scale; inputs and o are bf16, accumulation is fp32.  No lse is produced.
+//
+// Needs num_heads, page_size, d and dv multiples of 16 (num_heads <= 128,
+// page_size <= 512, dv <= d <= 1024) and 512-bit SME vectors; aborts with a
+// message otherwise or if scratch memory cannot be allocated.
+void kunpeng_flash_mla_bf16(const void *q, int64_t q_hs, const void *kv,
+                            int64_t kv_rs, const int32_t *block_table,
+                            int64_t seqlen, void *o, int64_t o_hs,
+                            int64_t num_heads, int64_t page_size, int64_t dv,
+                            int64_t d, float scale);
+
 // Called by the Triton launcher before every launch of a kernel that uses
 // this library: per-thread caches of packed inputs are dropped across
 // launches, because inputs may be rewritten in place between them.

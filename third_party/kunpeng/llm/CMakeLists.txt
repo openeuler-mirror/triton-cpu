@@ -23,7 +23,7 @@ if (NOT KUNPENG_LLM_HAVE_SME_COMPILER)
   return()
 endif()
 
-add_library(kunpeng_llm SHARED flash_attn_fwd_sme.c)
+add_library(kunpeng_llm SHARED flash_attn_fwd_sme.c flash_mla_sme.c)
 target_compile_options(kunpeng_llm PRIVATE -O3 -march=armv9-a+sme+sve2+bf16)
 target_link_options(kunpeng_llm PRIVATE -rtlib=compiler-rt)
 target_link_libraries(kunpeng_llm PRIVATE m)
