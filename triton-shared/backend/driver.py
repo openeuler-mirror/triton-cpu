@@ -1,4 +1,6 @@
+import ctypes
 import functools
+from contextlib import contextmanager
 import hashlib
 import tempfile
 import sysconfig
@@ -12,6 +14,7 @@ _LAUNCHER_MODULE_CACHE: dict = {}
 
 import os, subprocess, tempfile, platform
 import importlib
+import importlib.resources
 import importlib.util
 import sys
 
@@ -41,21 +44,31 @@ except AttributeError:
 # needed.  When absent (non-Arm or non-ArmPL builds) the flag is omitted to
 # avoid a link error.
 _armpl_lib_path = os.path.join(str(_triton_C_dir), "libarmpl_lp64.so")
-_has_armpl = os.path.exists(_armpl_lib_path)
+# A file may exist without being loadable on this host.
+try:
+    ctypes.CDLL(_armpl_lib_path)
+    _has_armpl = True
+except OSError:
+    _has_armpl = False
 
 # libkunpeng_llm.so holds the kernels the TritonToKunpengLLM pass lowers
 # recognised Triton kernels to.  Like libarmpl_lp64.so it is built into
 # _triton_C_dir (from third_party/kunpeng/llm), so the -L/-rpath above cover
 # it.  Linked only into launchers whose kernel calls into it.
 _kunpeng_llm_lib_path = os.path.join(str(_triton_C_dir), "libkunpeng_llm.so")
-_KUNPENG_LLM_SYMBOL_PREFIX = b"kunpeng_flash_attention_forward_"
+# kunpeng_flash_attention_ covers both the forward and the varlen entries.
+_KUNPENG_LLM_SYMBOL_PREFIXES = (
+    b"kunpeng_flash_attention_",
+    b"kunpeng_flash_mla_",
+)
 _SPARSE_MLA_SYMBOL_PREFIX = b"kunpeng_sparse_mla_"
-
 
 def _kunpeng_llm_launcher_args(kernel_obj: bytes) -> list:
     """Extra launcher compile/link arguments for a kernel calling into
     libkunpeng_llm.so (none otherwise)."""
-    if not os.path.exists(_kunpeng_llm_lib_path):
+    if not os.path.exists(_kunpeng_llm_lib_path) or not any(
+        prefix in kernel_obj for prefix in _KUNPENG_LLM_SYMBOL_PREFIXES
+    ):
         return []
     if _SPARSE_MLA_SYMBOL_PREFIX in kernel_obj:
         return ["-DTRITON_SHARED_KUNPENG_LLM", "-DTRITON_SHARED_SPARSE_MLA", "-lkunpeng_llm"]
@@ -625,13 +638,26 @@ class CPUDeviceInterface:
         self.kernel_times = []
         self.last_start = 0
         self.use_hooks = False
-        triton.compiler.CompiledKernel.launch_enter_hook = None
-        triton.compiler.CompiledKernel.launch_exit_hook = None
 
     def enable_hook_timing(self):
         self.use_hooks = True
         triton.compiler.CompiledKernel.launch_enter_hook = lambda arg: self._enter_hook()
         triton.compiler.CompiledKernel.launch_exit_hook = lambda arg: self._exit_hook()
+
+    @contextmanager
+    def hook_timing(self):
+        # Keep launcher hooks and timing buffers local to this measurement.
+        previous_hooks = (triton.compiler.CompiledKernel.launch_enter_hook,
+                          triton.compiler.CompiledKernel.launch_exit_hook)
+        previous_state = self.use_hooks, self.kernel_times, self.last_start
+        self.kernel_times = []
+        try:
+            self.enable_hook_timing()
+            yield
+        finally:
+            (triton.compiler.CompiledKernel.launch_enter_hook,
+             triton.compiler.CompiledKernel.launch_exit_hook) = previous_hooks
+            self.use_hooks, self.kernel_times, self.last_start = previous_state
 
     def synchronize(self):
         pass

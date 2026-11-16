@@ -2,6 +2,7 @@
 #define TRITON_STRUCTURED_TO_MEMREF_CONVERSION_PASSES_H
 
 #include "triton-shared/Conversion/StructuredToMemref/StructuredToMemref.h"
+#include "triton-shared/Conversion/StructuredToMemref/DirectTransposeOutput.h"
 
 namespace mlir {
 namespace triton {

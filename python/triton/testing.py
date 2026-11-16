@@ -2,7 +2,7 @@ import functools
 import os
 import subprocess
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List
 from . import language as tl
 from . import runtime
@@ -92,7 +92,8 @@ def do_bench_cudagraph(fn, rep=20, grad_to_none=None, quantiles=None, return_mod
         return _summarize_statistics(torch.tensor(ret), quantiles, return_mode)
 
 
-def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean"):
+def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_mode="mean",
+             measure_time_with_hooks=False):
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
     the 20-th and 80-th performance percentile.
@@ -107,7 +108,10 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
     :type grad_to_none: torch.tensor, optional
     :param quantiles: Performance percentile to return in addition to the median.
     :type quantiles: list[float], optional
-    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all" Default is "mean".    :type return_mode: str
+    :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all" Default is "mean".
+    :type return_mode: str
+    :param measure_time_with_hooks: Use CPU launcher hooks to measure kernel execution time.
+    :type measure_time_with_hooks: bool
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
     import torch
@@ -130,32 +134,34 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None, quantiles=None, return_m
     di.synchronize()
     estimate_ms = start_event.elapsed_time(end_event) / 5
 
-    # compute number of warmup and repeat
-    n_warmup = max(1, int(warmup / estimate_ms))
-    n_repeat = max(1, int(rep / estimate_ms))
-    start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
-    end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
-    # Warm-up
-    for _ in range(n_warmup):
-        fn()
-    # Benchmark
-    for i in range(n_repeat):
-        # we don't want `fn` to accumulate gradient values
-        # if it contains a backward pass. So we clear the
-        # provided gradients
-        if grad_to_none is not None:
-            for x in grad_to_none:
-                x.grad = None
-        # we clear the L2 cache before each run
-        cache.zero_()
-        # record time of `fn`
-        start_event[i].record()
-        fn()
-        end_event[i].record()
-    # Record clocks
-    di.synchronize()
-    times = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
-    return _summarize_statistics(times, quantiles, return_mode)
+    # CPU launch hooks exclude the Python dispatch overhead from timed events.
+    with di.hook_timing() if measure_time_with_hooks else nullcontext():
+        # compute number of warmup and repeat
+        n_warmup = max(1, int(warmup / estimate_ms))
+        n_repeat = max(1, int(rep / estimate_ms))
+        start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+        end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+        # Warm-up
+        for _ in range(n_warmup):
+            fn()
+        # Benchmark
+        for i in range(n_repeat):
+            # we don't want `fn` to accumulate gradient values
+            # if it contains a backward pass. So we clear the
+            # provided gradients
+            if grad_to_none is not None:
+                for x in grad_to_none:
+                    x.grad = None
+            # we clear the L2 cache before each run
+            cache.zero_()
+            # record time of `fn`
+            start_event[i].record()
+            fn()
+            end_event[i].record()
+        # Record clocks
+        di.synchronize()
+        times = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)], dtype=torch.float)
+        return _summarize_statistics(times, quantiles, return_mode)
 
 
 def assert_close(x, y, atol=None, rtol=None, err_msg=''):

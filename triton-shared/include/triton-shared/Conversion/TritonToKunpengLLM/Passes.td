@@ -33,4 +33,36 @@ def TritonFlashAttentionToKunpengLLM
                           "mlir::LLVM::LLVMDialect"];
 }
 
+def TritonFlashMLAToKunpengLLM
+    : Pass<"triton-flash-mla-to-kunpeng-llm", "mlir::ModuleOp"> {
+  let summary = "Replace a flash-MLA decode kernel by a libkunpeng_llm call";
+  let description = [{
+    Recognises Triton kernels whose program computes BLOCK_H query heads of
+    one batch at a single query position (s_q == 1) over a paged KV cache
+    (multi-head latent attention decode, the FlagGems flash_mla kernel):
+
+      page = load(block_table + i); kvloc = page * PAGE + offs % PAGE
+      S = (dot(q_pe, k_pe, dot(q_nope, trans(ckv), 0))) * scale
+      m' = max(m, rowmax(S)); P = exp(S - m')
+      l' = l * exp(m - m') + rowsum(P)
+      acc' = acc * exp(m - m') + dot(trunc(P), ckv)
+      o = acc' / l'
+
+    over one key loop of seqlen // PAGE whole pages plus one masked tail
+    chunk for seqlen % PAGE keys, and replaces the whole kernel body by one
+    call to kunpeng_flash_mla_bf16 per program.
+
+    The match is checked semantically where it can be: load/store addresses
+    are evaluated as integer polynomials over SSA values and tensor indices,
+    the page-table indirection and the online-softmax data flow are verified
+    structurally, and the output must be the kernel's only store.  Kernels
+    that do anything else are left untouched.  The per-program scheduling
+    (which programs share packed K/V pages, and the dynamic work hand-out of
+    the launcher) is described in third_party/kunpeng/llm/flash_mla_sme.c and
+    triton-shared/backend/driver.py.
+  }];
+  let constructor = "triton::createTritonFlashMLAToKunpengLLMPass()";
+  let dependentDialects = ["mlir::func::FuncDialect", "mlir::arith::ArithDialect"];
+}
+
 #endif

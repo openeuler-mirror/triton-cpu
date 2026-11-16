@@ -347,8 +347,8 @@ class CPUOptions:
     # Keep tl.dot on the linalg (SME/SVE) matmul lowering instead of turning
     # it into ArmPL BLAS calls.
     disable_armpl: bool = False
-    # Keep recognised kernels (flash-attention forward) as Triton code instead
-    # of replacing them by libkunpeng_llm.so calls.
+    # Keep recognised kernels (flash-attention forward, flash-MLA decode) as
+    # Triton code instead of replacing them by libkunpeng_llm.so calls.
     disable_kunpeng_llm: bool = False
     sme_matmul_k_tile : int = 32
     enable_sme_streaming_autovec: bool = False
@@ -551,6 +551,7 @@ class CPUBackend(BaseBackend):
 
 
     def _sve_transform(self, src: str, options) -> str:
+        acl_opt_enabled = _acl_opt_enabled()
         enable_linalg_tiling_pipeline = _enable_linalg_tiling_pipeline()
 
         def linalg_opts():
@@ -1392,6 +1393,19 @@ class CPUBackend(BaseBackend):
                     transform.FailurePropagationMode.Propagate,
                     [sequence.bodyTarget],
                 )
+
+                if acl_opt_enabled:
+                    # Match the buffered transpose before vector legalization.
+                    transpose_output_functions = structured.MatchOp.match_op_names(
+                        transform.AnyOpType.get(),
+                        sequence.bodyTarget,
+                        ["func.func"],
+                    )
+                    transform.ApplyRegisteredPassOp(
+                        transform.AnyOpType.get(),
+                        transpose_output_functions.result,
+                        "triton-cpu-direct-transpose-output",
+                    )
 
                 include_legalize = transform.IncludeOp(
                     [],

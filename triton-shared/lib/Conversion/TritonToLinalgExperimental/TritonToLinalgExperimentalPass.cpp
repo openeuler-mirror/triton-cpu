@@ -132,8 +132,10 @@ public:
     PassManager pm(&getContext(), moduleOp.getOperationName());
     // Whole-kernel library replacements run on the original Triton IR,
     // before anything is lowered.
-    if (enableKunpengLLM)
+    if (enableKunpengLLM) {
       pm.addPass(createTritonFlashAttentionToKunpengLLMPass());
+      pm.addPass(createTritonFlashMLAToKunpengLLMPass());
+    }
     pm.addPass(createTritonToStructuredPass(enableMakeGatherScatterTensorPtr));
 
     // Erase dead code and fold constants created during lowering
