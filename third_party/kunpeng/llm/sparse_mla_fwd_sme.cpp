@@ -5,21 +5,10 @@
 #include <algorithm>
 #include <arm_sme.h>
 #include <arm_sve.h>
-#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <memory>
-#include <mutex>
-#include <vector>
-
-// This state belongs only to sparse MLA. Flash attention has its own launch
-// counter and cache lifecycle in its separate implementation.
-static std::atomic<uint64_t> sparse_mla_launch_epoch{1};
-
-extern "C" __attribute__((visibility("default"))) void
-kunpeng_sparse_mla_begin_launch(void) {
-  sparse_mla_launch_epoch.fetch_add(1, std::memory_order_relaxed);
-}
+#include <new>
 
 __attribute__((always_inline)) static inline uint16_t
 bf16(float f) __arm_streaming_compatible {
@@ -104,27 +93,47 @@ static void pack_pairs(const uint16_t *const *src, uint16_t *dst, int pairs,
   auto pg = svptrue_b32();
   for (int p = 0; p < pairs; p += 32) {
     for (int r = 0; r < 16; ++r) {
-      svld1_hor_za32(0, r, pg, reinterpret_cast<const uint32_t *>(src[r]) + p);
-      svld1_hor_za32(1, r, pg,
-                     reinterpret_cast<const uint32_t *>(src[r]) + p + 16);
+      svld1_hor_za32(0, r, pg, src[r] + 2 * p);
+      svld1_hor_za32(1, r, pg, src[r] + 2 * (p + 16));
     }
     for (int c = 0; c < 16; ++c) {
-      svst1_ver_za32(0, c, pg,
-                     reinterpret_cast<uint32_t *>(dst + (p + c) * pair_stride));
-      svst1_ver_za32(
-          1, c, pg,
-          reinterpret_cast<uint32_t *>(dst + (p + c + 16) * pair_stride));
+      svst1_ver_za32(0, c, pg, dst + (p + c) * pair_stride);
+      svst1_ver_za32(1, c, pg, dst + (p + c + 16) * pair_stride);
     }
   }
 }
+
+template <typename T> struct ScratchBuffer {
+  std::unique_ptr<T[]> data;
+  size_t capacity = 0;
+
+  bool reserve(size_t size) {
+    if (size <= capacity)
+      return true;
+    std::unique_ptr<T[]> buffer(new (std::nothrow) T[size]);
+    if (!buffer)
+      return false;
+    data.swap(buffer);
+    capacity = size;
+    return true;
+  }
+};
+
 struct KVCache {
-  uint64_t epoch = 0;
   const uint16_t *source = nullptr;
   int rows = 0;
-  std::vector<uint16_t> key, value;
-  bool valid = false;
+  ScratchBuffer<uint16_t> packed;
 };
-__arm_locally_streaming __arm_new("za") static bool pack_dense(
+
+// Each worker only reuses packed KV from its current launch.
+static thread_local KVCache dense_cache;
+
+extern "C" __attribute__((visibility("default"))) void
+kunpeng_sparse_mla_begin_launch(void) {
+  dense_cache.source = nullptr;
+}
+
+__arm_locally_streaming __arm_new("za") static void pack_dense(
     const uint16_t *kv, uint16_t *packed, uint16_t *values, int rows) {
   const uint16_t *ptr[16];
   for (int t = 0; t < rows; t += 16) {
@@ -140,12 +149,10 @@ __arm_locally_streaming __arm_new("za") static bool pack_dense(
       svst1_u16(ph, values + d * rows + p * 64, svzip1_u16(a, b));
       svst1_u16(ph, values + d * rows + p * 64 + 32, svzip2_u16(a, b));
     }
-  return true;
 }
-__arm_locally_streaming __arm_new("za") static bool prepare(
+__arm_locally_streaming __arm_new("za") static void prepare(
     const uint16_t *q, const uint16_t *kv, const int32_t *ids, uint16_t *qp,
-    uint16_t *kp, uint16_t *vp, int keys, int row, const uint16_t *dense,
-    int dense_rows) {
+    uint16_t *kp, uint16_t *vp, int keys, int row, bool use_dense) {
   auto ph = svptrue_b16();
 
   const uint16_t *rows[16];
@@ -154,8 +161,8 @@ __arm_locally_streaming __arm_new("za") static bool prepare(
       rows[r] = q + (h + r) * 576;
     pack_pairs(rows, qp + (h / 32) * 32 * 576 + (h % 32) * 2, 288);
   }
-  if (dense)
-    return true;
+  if (use_dense)
+    return;
   for (int t = 0; t < keys; t += 16) {
     for (int r = 0; r < 16; ++r)
       rows[r] =
@@ -170,7 +177,6 @@ __arm_locally_streaming __arm_new("za") static bool prepare(
       svst1_u16(ph, vp + d * keys + p * 64, svzip1_u16(v0, v1));
       svst1_u16(ph, vp + d * keys + p * 64 + 32, svzip2_u16(v0, v1));
     }
-  return true;
 }
 __arm_locally_streaming __arm_new("za") static bool probabilities(
     float *scores, uint16_t *pp, float *den, float *logs, const int32_t *ids,
@@ -226,12 +232,13 @@ __arm_locally_streaming __arm_new("za") static bool probabilities(
                             svcmpeq_n_u32(pg, hi, 0));                        \
     if (svptest_any(pg, svorr_b_z(pg, lost_x, lost_y)))                        \
       return false;                                                          \
-    auto pair = svorr_u32_x(pg, lo, svlsl_n_u32_x(pg, hi, 16));                \
-    svst1_u32(pg,                                                              \
-              reinterpret_cast<uint32_t *>(pp + (h / 32) * 32 * keys +         \
-                                           (t + c + offset) / 2 * 64 +         \
-                                           (h % 32) * 2),                      \
-              pair);                                                           \
+    auto x16 = svreinterpret_u16_u32(lo);                                      \
+    auto y16 = svreinterpret_u16_u32(hi);                                      \
+    auto pair = svzip1_u16(svuzp1_u16(x16, x16),                               \
+                           svuzp1_u16(y16, y16));                              \
+    auto *dest = pp + (h / 32) * 32 * keys +                                   \
+                 (t + c + offset) / 2 * 64 + (h % 32) * 2;                     \
+    svst1_u16(svptrue_b16(), dest, pair);                                      \
   }
         PACK_PROB(0, 0);
         PACK_PROB(1, 16);
@@ -286,92 +293,74 @@ kunpeng_sparse_mla_forward_bf16(const uint16_t *q, const uint16_t *kv,
   asm("rdsvl %0, #1" : "=r"(vl));
   if (vl != 64)
     return 1;
-  int keys = std::min(topk, (row / 32 + 1) * 32);
-  if (row < 0 || row >= query_rows || keys <= 0 || keys % 32)
+  if (row < 0 || row >= query_rows || topk <= 0 || topk > 4096 ||
+      topk % 32)
     return 1;
+  int keys = 32 * std::min(topk / 32, row / 32 + 1);
   bool any = false;
-  for (int t = 0; t < std::min(keys, 32); ++t)
+  for (int t = 0; t < 32; ++t)
     any |= ids[t] >= 0 && ids[t] <= row;
   if (!any)
     return 1; // Preserve the original online-softmax NaN behavior.
-  try {
-    thread_local std::vector<uint16_t> storage;
-    thread_local std::vector<float> floats;
-    size_t packed_size = 64 * 576 + keys * 576 + 512 * keys + 64 * keys;
-    if (storage.size() < packed_size)
-      storage.resize(packed_size);
-    size_t float_size = 64 * keys + 64 * 512 + 128;
-    if (floats.size() < float_size)
-      floats.resize(float_size);
-    auto qp = storage.data(), kp = qp + 64 * 576, vp = kp + keys * 576,
-         pp = vp + 512 * keys;
-    auto scores = floats.data(), result = scores + 64 * keys,
-         den = result + 64 * 512, logs = den + 64;
-    thread_local std::shared_ptr<const KVCache> cache;
-    static std::mutex shared_mutex;
-    static std::shared_ptr<const KVCache> shared_cache;
-    thread_local std::vector<unsigned char> seen;
-    thread_local std::vector<int32_t> ordered;
-    // A permutation of a complete key prefix can reuse packed dense tiles.
-    // Detect duplicates and gaps; arbitrary sparse selections keep their order.
-    bool dense_set =
-        query_rows > row && query_rows % 32 == 0 && query_rows <= 2048;
-    int count = 0, maximum = -1;
-    if (dense_set) {
-      seen.assign(query_rows, 0);
-      for (int t = 0; t < keys; ++t)
-        if (ids[t] >= 0 && ids[t] <= row) {
-          int id = ids[t];
-          if (seen[id])
-            dense_set = false;
-          seen[id] = 1;
-          ++count;
-          maximum = std::max(maximum, id);
-        }
-      dense_set = dense_set && maximum + 1 == count;
-    }
-    const uint16_t *dense = nullptr;
-    const int32_t *active_ids = ids;
-    uint64_t epoch = sparse_mla_launch_epoch.load(std::memory_order_relaxed);
-    if (dense_set && epoch) {
-      if (!cache || cache->epoch != epoch || cache->source != kv ||
-          cache->rows != query_rows) {
-        std::lock_guard<std::mutex> lock(shared_mutex);
-        if (!shared_cache || shared_cache->epoch != epoch ||
-            shared_cache->source != kv || shared_cache->rows != query_rows) {
-          auto next = std::make_shared<KVCache>();
-          next->key.resize(query_rows * 576);
-          next->value.resize(query_rows * 512);
-          next->valid =
-              pack_dense(kv, next->key.data(), next->value.data(), query_rows);
-          next->source = kv;
-          next->rows = query_rows;
-          next->epoch = epoch;
-          shared_cache = std::move(next);
-        }
-        cache = shared_cache;
-      }
-      if (!cache->valid)
-        return 1;
-      keys = (count + 31) / 32 * 32;
-      ordered.resize(keys);
-      for (int t = 0; t < keys; ++t)
-        ordered[t] = t < count ? t : -1;
-      active_ids = ordered.data();
-      dense = cache->key.data();
-    }
-    if (!prepare(q, kv, active_ids, qp, kp, vp, keys, row, dense, query_rows))
-      return 1;
-    multiply(qp, dense ? dense : kp, scores, 64, keys, 576);
-    if (!probabilities(scores, pp, den, logs, active_ids, keys, row, scale))
-      return 1;
-    multiply(pp, dense ? cache->value.data() : vp, result, 64, 512, keys,
-             dense ? query_rows : keys);
-    if (!finite_results(result, size_t(64) * 512))
-      return 1;
-    finish(result, den, logs, out, lse);
-    return 0;
-  } catch (...) {
+
+  thread_local ScratchBuffer<uint16_t> storage;
+  thread_local ScratchBuffer<float> floats;
+  size_t packed_size = 64 * 576 + keys * (576 + 512 + 64);
+  size_t float_size = 64 * keys + 64 * 512 + 128;
+  if (!storage.reserve(packed_size) || !floats.reserve(float_size))
     return 1;
+  auto qp = storage.data.get(), kp = qp + 64 * 576, vp = kp + keys * 576,
+       pp = vp + 512 * keys;
+  auto scores = floats.data.get(), result = scores + 64 * keys,
+       den = result + 64 * 512, logs = den + 64;
+
+  constexpr int max_dense_rows = 2048;
+  thread_local unsigned char seen[max_dense_rows];
+  thread_local int32_t ordered[max_dense_rows];
+  // A permutation of a complete key prefix can reuse packed dense tiles.
+  // Detect duplicates and gaps; arbitrary sparse selections keep their order.
+  bool dense_set = query_rows % 32 == 0 && query_rows <= max_dense_rows;
+  int count = 0, maximum = -1;
+  if (dense_set) {
+    std::fill_n(seen, query_rows, 0);
+    for (int t = 0; t < keys; ++t)
+      if (ids[t] >= 0 && ids[t] <= row) {
+        int id = ids[t];
+        if (seen[id])
+          dense_set = false;
+        seen[id] = 1;
+        ++count;
+        maximum = std::max(maximum, id);
+      }
+    dense_set = dense_set && maximum + 1 == count;
   }
+  const int32_t *active_ids = ids;
+  const uint16_t *packed_keys = kp, *packed_values = vp;
+  if (dense_set) {
+    auto &cache = dense_cache;
+    if (cache.source != kv || cache.rows != query_rows) {
+      if (!cache.packed.reserve(query_rows * (576 + 512)))
+        return 1;
+      auto *data = cache.packed.data.get();
+      pack_dense(kv, data, data + query_rows * 576, query_rows);
+      cache.source = kv;
+      cache.rows = query_rows;
+    }
+    keys = (count + 31) / 32 * 32;
+    for (int t = 0; t < keys; ++t)
+      ordered[t] = t < count ? t : -1;
+    active_ids = ordered;
+    packed_keys = cache.packed.data.get();
+    packed_values = packed_keys + query_rows * 576;
+  }
+  prepare(q, kv, active_ids, qp, kp, vp, keys, row, dense_set);
+  multiply(qp, packed_keys, scores, 64, keys, 576);
+  if (!probabilities(scores, pp, den, logs, active_ids, keys, row, scale))
+    return 1;
+  multiply(pp, packed_values, result, 64, 512, keys,
+           dense_set ? query_rows : keys);
+  if (!finite_results(result, size_t(64) * 512))
+    return 1;
+  finish(result, den, logs, out, lse);
+  return 0;
 }
