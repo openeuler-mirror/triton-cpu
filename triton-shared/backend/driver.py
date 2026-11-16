@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import tempfile
 import sysconfig
@@ -368,6 +369,19 @@ PyMODINIT_FUNC PyInit___triton_shared_ref_cpu_kernel_launcher(void) {{
   return m;
 }}
 """
+
+
+@functools.lru_cache(maxsize=1)
+def _launcher_implementation_hash():
+    """Hash launcher sources once so implementation changes expire the cache."""
+    backend = Path(__file__).resolve().parent
+    implementation = hashlib.sha256()
+    paths = [Path(__file__).resolve(), *sorted((backend / "include").rglob("*"))]
+    for path in paths:
+        if path.is_file():
+            implementation.update(path.relative_to(backend).as_posix().encode("utf-8") + b"\0")
+            implementation.update(hashlib.sha256(path.read_bytes()).digest())
+    return implementation.digest()
 
 
 def compile_module(launcher_src, kernel_placeholder_name):
