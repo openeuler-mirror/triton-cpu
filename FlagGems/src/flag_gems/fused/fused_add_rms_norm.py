@@ -24,6 +24,7 @@ def fused_add_rms_norm_kernel(
     N,  # number of columns in in_ptr
     eps,  # epsilon to avoid division by zero
     BLOCK_SIZE: tl.constexpr,
+    EVEN_N: tl.constexpr,
 ):
     if tl.constexpr(input_ptr.dtype.element_ty == tl.float16) or tl.constexpr(
         input_ptr.dtype.element_ty == tl.bfloat16
@@ -36,22 +37,50 @@ def fused_add_rms_norm_kernel(
     input_ptr += pid * in_stride_r
     residual_ptr += pid * r_stride_r
 
-    mask = tl.arange(0, BLOCK_SIZE) < N
-    cols = tl.arange(0, BLOCK_SIZE)
-    x = tl.load(input_ptr + cols * in_stride_c, mask, other=0.0).to(cdtype)
-    r = tl.load(residual_ptr + cols * r_stride_c, mask, other=0.0).to(cdtype)
+    if EVEN_N:
+        # N == BLOCK_SIZE: all accesses are unmasked, so the whole row lives
+        # in registers and the streaming hints lower to non-temporal
+        # loads/stores on CPU (no write-allocate traffic, single DRAM pass).
+        cols = tl.arange(0, BLOCK_SIZE)
+        x = tl.load(
+            input_ptr + cols * in_stride_c, eviction_policy="evict_first"
+        ).to(cdtype)
+        r = tl.load(
+            residual_ptr + cols * r_stride_c, eviction_policy="evict_first"
+        ).to(cdtype)
 
-    x += r
-    # write back to residual
-    tl.store(residual_ptr + cols * r_stride_c, x, mask=mask)
+        x += r
+        # write back to residual
+        tl.store(
+            residual_ptr + cols * r_stride_c, x, eviction_policy="evict_first"
+        )
 
-    var = tl.sum(x * x / N, axis=0)
-    rrms = 1 / tl.sqrt(var + eps)
+        var = tl.sum(x * x) / N
+        rrms = 1 / tl.sqrt(var + eps)
 
-    w = tl.load(w_ptr + tl.arange(0, BLOCK_SIZE), mask=mask, other=0.0)
-    y = (x * rrms * w).to(cdtype)
-    # write back to input
-    tl.store(input_ptr + cols * in_stride_c, y, mask=mask)
+        w = tl.load(w_ptr + cols)
+        y = (x * rrms * w).to(cdtype)
+        # write back to input
+        tl.store(
+            input_ptr + cols * in_stride_c, y, eviction_policy="evict_first"
+        )
+    else:
+        mask = tl.arange(0, BLOCK_SIZE) < N
+        cols = tl.arange(0, BLOCK_SIZE)
+        x = tl.load(input_ptr + cols * in_stride_c, mask, other=0.0).to(cdtype)
+        r = tl.load(residual_ptr + cols * r_stride_c, mask, other=0.0).to(cdtype)
+
+        x += r
+        # write back to residual
+        tl.store(residual_ptr + cols * r_stride_c, x, mask=mask)
+
+        var = tl.sum(x * x) / N
+        rrms = 1 / tl.sqrt(var + eps)
+
+        w = tl.load(w_ptr + tl.arange(0, BLOCK_SIZE), mask=mask, other=0.0)
+        y = (x * rrms * w).to(cdtype)
+        # write back to input
+        tl.store(input_ptr + cols * in_stride_c, y, mask=mask)
 
 
 @libentry()
@@ -131,15 +160,16 @@ def fused_add_rms_norm(x, residual, normalized_shape, weight, eps=1e-5):
     residual = residual.contiguous()
     weight = weight.contiguous()
 
-    MAX_BLOCK_SIZE = 256 if x.device.type == "cpu" else 4096
+    MAX_BLOCK_SIZE = 2048 if x.device.type == "cpu" else 4096
     with torch_device_fn.device(x.device):
-        if N < MAX_BLOCK_SIZE:
+        if N <= MAX_BLOCK_SIZE:
             BLOCK_SIZE = triton.next_power_of_2(N)
             fused_add_rms_norm_kernel[M,](
-                x, residual, weight, N, 1, N, 1, N, eps, BLOCK_SIZE
+                x, residual, weight, N, 1, N, 1, N, eps, BLOCK_SIZE,
+                EVEN_N=BLOCK_SIZE == N,
             )
         else:
-            BLOCK_SIZE = MAX_BLOCK_SIZE
+            BLOCK_SIZE = 4096
             fused_add_rms_norm_loop_kernel[M,](
                 x, residual, weight, N, 1, N, 1, N, eps, BLOCK_SIZE
             )
