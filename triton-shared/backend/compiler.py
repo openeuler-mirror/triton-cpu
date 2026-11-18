@@ -139,7 +139,20 @@ _OUTER_REDUCTION_WIDTH_THRESHOLD = 256
 _OUTER_REDUCTION_TILE_SIZE = 64
 
 
-def _add_outer_reduction_tiling_schedule():
+def _outer_reduction_tiling_enabled(src: str, options) -> bool:
+    """Keep tiling enabled unless a public kernel name is explicitly excluded."""
+    excluded = options.disable_outer_reduction_tiling_kernels
+    if not excluded:
+        return True
+    kernel_names = re.findall(
+        r'^\s*func\.func\s+(?:public\s+)?@([\w.$-]+)\s*\(',
+        src,
+        re.MULTILINE,
+    )
+    return not any(name in excluded for name in kernel_names)
+
+
+def _add_outer_reduction_tiling_schedule(enable_tiling=True):
     """Add a schedule that tiles statically large dimension-zero reductions."""
     any_op = transform.AnyOpType.get()
     i64_type = IntegerType.get_signless(64)
@@ -232,19 +245,20 @@ def _add_outer_reduction_tiling_schedule():
         arg_attrs=[{"transform.readonly": UnitAttr.get()}],
     )
     with InsertionPoint(schedule.body):
-        reductions = transform.CollectMatchingOp(
-            [any_op],
-            schedule.bodyTarget,
-            FlatSymbolRefAttr.get(matcher_name),
-        )
-        structured.TileReductionUsingForOp(
-            [any_op],
-            any_op,
-            any_op,
-            any_op,
-            reductions.results[0],
-            tile_sizes=[_OUTER_REDUCTION_TILE_SIZE],
-        )
+        if enable_tiling:
+            reductions = transform.CollectMatchingOp(
+                [any_op],
+                schedule.bodyTarget,
+                FlatSymbolRefAttr.get(matcher_name),
+            )
+            structured.TileReductionUsingForOp(
+                [any_op],
+                any_op,
+                any_op,
+                any_op,
+                reductions.results[0],
+                tile_sizes=[_OUTER_REDUCTION_TILE_SIZE],
+            )
         transform.YieldOp([schedule.bodyTarget])
 
 
@@ -344,6 +358,8 @@ class CPUOptions:
     max_num_imprecise_acc_default: int = 0
     enable_fast_math: bool = False
     disable_machine_scheduler: bool = False
+    # Environment-selected kernels; part of the compilation cache identity.
+    disable_outer_reduction_tiling_kernels: Tuple[str, ...] = ()
     # Keep tl.dot on the linalg (SME/SVE) matmul lowering instead of turning
     # it into ArmPL BLAS calls.
     disable_armpl: bool = False
@@ -438,6 +454,16 @@ class CPUBackend(BaseBackend):
     def parse_options(self, opts) -> Any:
         args = {'arch': self.target.arch}
         args.update({k: opts[k] for k in CPUOptions.__dataclass_fields__.keys() if k in opts})
+        # Read once per compilation and include the normalized selection in
+        # CPUOptions.hash(). Set this before starting the process: JIT runtime
+        # caches may otherwise retain an already-loaded kernel.
+        args['disable_outer_reduction_tiling_kernels'] = tuple(sorted({
+            name.strip()
+            for name in os.environ.get(
+                "TRITON_SHARED_DISABLE_OUTER_REDUCTION_TILING_KERNELS", ""
+            ).split(",")
+            if name.strip()
+        }))
         # CI can trade machine scheduling quality for shorter compile time. Keep
         # the choice in CPUOptions so scheduled and unscheduled objects never
         # share a compilation-cache entry.
@@ -1467,7 +1493,9 @@ class CPUBackend(BaseBackend):
                 linalg_opts()
                 contraction_schedule()
                 main_type1("contraction_schedule", "contraction")
-                _add_outer_reduction_tiling_schedule()
+                _add_outer_reduction_tiling_schedule(
+                    enable_tiling=_outer_reduction_tiling_enabled(src, options)
+                )
                 vectorize_schedule()
                 main_type1("vectorize_schedule", "vectorize")
                 bufferize_schedule()
@@ -2283,7 +2311,9 @@ class CPUBackend(BaseBackend):
 
             with InsertionPoint(mod.body):
                 linalg_opts()
-                _add_outer_reduction_tiling_schedule()
+                _add_outer_reduction_tiling_schedule(
+                    enable_tiling=_outer_reduction_tiling_enabled(src, options)
+                )
                 tile_batch_matmul_sme()
                 tile_matmul_sme()
                 bufferize_schedule()
