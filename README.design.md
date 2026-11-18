@@ -242,6 +242,7 @@ Placement rule for a change:
 | `TRITON_SHARED_FORCE_SME_PIPELINE` | Exercise SME scheduling during tests and debugging | The backend warns when the payload has no matmul |
 | `TRITON_SHARED_SME_MATMUL_K_TILE` | Set the SME matmul K tile | Values affect the schedule and belong in the compilation key |
 | `TRITON_SHARED_ENABLE_SME_STREAMING_AUTOVEC` | Allow scalable autovectorization in streaming mode | The default remains conservative and explicit |
+| `TRITON_SHARED_DISABLE_OUTER_REDUCTION_TILING_KERNELS` | Skip outer-reduction tiling for comma-separated exact kernel names | Unset preserves tiling; the normalized selection participates in the compilation key |
 | `TRITON_SHARED_DISABLE_MACHINE_SCHEDULER` | Trade scheduling quality for compile-time reduction | Scheduled and unscheduled objects must never share a cache entry |
 | `TRITON_SHARED_DUMP_PATH`, `MLIR_ENABLE_DUMP` | Expose per-stage and per-pass artifacts | Diagnosis must not change semantic pipeline decisions |
 | `TRITON_PRINT_COMPILE_TIME` | Report time spent in backend stages | Measurement must remain observational |
