@@ -63,16 +63,15 @@ _KUNPENG_LLM_SYMBOL_PREFIXES = (
 )
 _SPARSE_MLA_SYMBOL_PREFIX = b"kunpeng_sparse_mla_"
 
+
 def _kunpeng_llm_launcher_args(kernel_obj: bytes) -> list:
     """Extra launcher compile/link arguments for a kernel calling into
     libkunpeng_llm.so (none otherwise)."""
-    if not os.path.exists(_kunpeng_llm_lib_path) or not any(
-        prefix in kernel_obj for prefix in _KUNPENG_LLM_SYMBOL_PREFIXES
-    ):
+    if not os.path.exists(_kunpeng_llm_lib_path):
         return []
     if _SPARSE_MLA_SYMBOL_PREFIX in kernel_obj:
         return ["-DTRITON_SHARED_KUNPENG_LLM", "-DTRITON_SHARED_SPARSE_MLA", "-lkunpeng_llm"]
-    if _KUNPENG_LLM_SYMBOL_PREFIX in kernel_obj:
+    if any(prefix in kernel_obj for prefix in _KUNPENG_LLM_SYMBOL_PREFIXES):
         return ["-DTRITON_SHARED_KUNPENG_LLM", "-lkunpeng_llm"]
     return []
 
@@ -184,9 +183,7 @@ extern "C" {{
 
 static void _launch(int gridX, int gridY, int gridZ, int num_threads {', ' + arg_decls if arg_decls else ''}) {{
 int64_t N = (int64_t)gridX * gridY * gridZ;
-#ifdef TRITON_SHARED_SPARSE_MLA
-kunpeng_sparse_mla_begin_launch();
-#elif defined(TRITON_SHARED_KUNPENG_LLM)
+#if defined(TRITON_SHARED_KUNPENG_LLM) && !defined(TRITON_SHARED_SPARSE_MLA)
 kunpeng_llm_begin_launch();
 #endif
 
@@ -210,6 +207,10 @@ if (N > 1) {{
     chunk = (chunk + 1) / 2;
   int64_t next = 0;
 #pragma omp parallel num_threads(nthreads)
+  {{
+#ifdef TRITON_SHARED_SPARSE_MLA
+  kunpeng_sparse_mla_begin_launch();
+#endif
   for (int64_t c = __atomic_fetch_add(&next, chunk, __ATOMIC_RELAXED); c < N;
        c = __atomic_fetch_add(&next, chunk, __ATOMIC_RELAXED))
   for (int64_t i = c; i < c + chunk && i < N; ++i) {{
@@ -224,9 +225,17 @@ if (N > 1) {{
 
     {kernel_name}({kernel_parameters}
                   gridX, gridY, gridZ, x, y, z);
-  }}{parallel_end}
+  }}
+#ifdef TRITON_SHARED_KUNPENG_LLM
+  }}
+#else
+{parallel_end}
+#endif
   return;
 }}
+#endif
+#ifdef TRITON_SHARED_SPARSE_MLA
+kunpeng_sparse_mla_begin_launch();
 #endif
 for (int64_t i = 0; i < N; ++i) {{
   int x = i % gridX;
@@ -397,6 +406,15 @@ def _launcher_implementation_hash():
     return implementation.digest()
 
 
+def _launcher_cache_key(src, kernel_obj, kunpeng_llm_args=()):
+    """Include normalized ACL and linalg modes in the launcher cache key."""
+    acl_enabled = os.environ.get("TRITON_SHARED_ENABLE_ACL_OPT", "1") != "0"
+    linalg_enabled = os.environ.get("TRITON_SHARED_ENABLE_LINALG_TILING_PIPELINE", "0") == "1"
+    modes = bytes([acl_enabled, linalg_enabled])
+    link_flags = " ".join(kunpeng_llm_args).encode("utf-8")
+    return hashlib.md5(src.encode("utf-8") + kernel_obj + link_flags + modes + _launcher_implementation_hash()).hexdigest()
+
+
 def compile_module(launcher_src, kernel_placeholder_name):
     py_version = sys.version_info
     if platform.system() == "Windows":
@@ -446,8 +464,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
         # These flags change what the launcher links, so they are part of the
         # key.
         kunpeng_llm_args = _kunpeng_llm_launcher_args(kernel_obj)
-        key = hashlib.md5(src.encode("utf-8") + kernel_obj +
-                          " ".join(kunpeng_llm_args).encode("utf-8")).hexdigest()
+        key = _launcher_cache_key(src, kernel_obj, kunpeng_llm_args)
         _cached_key[0] = key
 
         # Second fast path: module already loaded (e.g. from a prior process run that
