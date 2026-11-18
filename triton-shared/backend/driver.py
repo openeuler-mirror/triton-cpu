@@ -215,7 +215,10 @@ if (N > 1) {{
 
     {kernel_name}({kernel_parameters}
                   gridX, gridY, gridZ, x, y, z);
-  }}{parallel_end}
+  }}
+#ifndef TRITON_SHARED_KUNPENG_LLM
+{parallel_end}
+#endif
   return;
 }}
 #endif
