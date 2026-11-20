@@ -128,6 +128,10 @@ void kunpeng_llm_begin_launch(void) {
   atomic_fetch_add_explicit(&launch_epoch, 1, memory_order_relaxed);
 }
 
+uint64_t kunpeng_llm_get_launch_epoch(void) {
+  return atomic_load_explicit(&launch_epoch, memory_order_relaxed);
+}
+
 static __thread fa_scratch tls_scratch;
 
 // Ceiling on the per-thread K/V tile cache.  Consecutive calls on a thread
