@@ -60,8 +60,8 @@ _kunpeng_llm_lib_path = os.path.join(str(_triton_C_dir), "libkunpeng_llm.so")
 _KUNPENG_LLM_SYMBOL_PREFIXES = (
     b"kunpeng_flash_attention_",
     b"kunpeng_flash_mla_",
+    b"kunpeng_sparse_mla_",
 )
-_SPARSE_MLA_SYMBOL_PREFIX = b"kunpeng_sparse_mla_"
 
 
 def _kunpeng_llm_launcher_args(kernel_obj: bytes) -> list:
@@ -69,8 +69,6 @@ def _kunpeng_llm_launcher_args(kernel_obj: bytes) -> list:
     libkunpeng_llm.so (none otherwise)."""
     if not os.path.exists(_kunpeng_llm_lib_path):
         return []
-    if _SPARSE_MLA_SYMBOL_PREFIX in kernel_obj:
-        return ["-DTRITON_SHARED_KUNPENG_LLM", "-DTRITON_SHARED_SPARSE_MLA", "-lkunpeng_llm"]
     if any(prefix in kernel_obj for prefix in _KUNPENG_LLM_SYMBOL_PREFIXES):
         return ["-DTRITON_SHARED_KUNPENG_LLM", "-lkunpeng_llm"]
     return []
@@ -167,9 +165,6 @@ def _generate_launcher(constants, signature, kernel_name):
 #include <iostream>
 
 extern "C" {{
-#ifdef TRITON_SHARED_SPARSE_MLA
-  void kunpeng_sparse_mla_begin_launch(void);
-#endif
 #ifdef TRITON_SHARED_KUNPENG_LLM
   // libkunpeng_llm.so: drops per-thread caches of packed inputs from earlier
   // launches.
@@ -183,7 +178,7 @@ extern "C" {{
 
 static void _launch(int gridX, int gridY, int gridZ, int num_threads {', ' + arg_decls if arg_decls else ''}) {{
 int64_t N = (int64_t)gridX * gridY * gridZ;
-#if defined(TRITON_SHARED_KUNPENG_LLM) && !defined(TRITON_SHARED_SPARSE_MLA)
+#ifdef TRITON_SHARED_KUNPENG_LLM
 kunpeng_llm_begin_launch();
 #endif
 
@@ -207,10 +202,6 @@ if (N > 1) {{
     chunk = (chunk + 1) / 2;
   int64_t next = 0;
 #pragma omp parallel num_threads(nthreads)
-  {{
-#ifdef TRITON_SHARED_SPARSE_MLA
-  kunpeng_sparse_mla_begin_launch();
-#endif
   for (int64_t c = __atomic_fetch_add(&next, chunk, __ATOMIC_RELAXED); c < N;
        c = __atomic_fetch_add(&next, chunk, __ATOMIC_RELAXED))
   for (int64_t i = c; i < c + chunk && i < N; ++i) {{
@@ -226,16 +217,11 @@ if (N > 1) {{
     {kernel_name}({kernel_parameters}
                   gridX, gridY, gridZ, x, y, z);
   }}
-#ifdef TRITON_SHARED_KUNPENG_LLM
-  }}
-#else
+#if !defined(TRITON_SHARED_KUNPENG_LLM)
 {parallel_end}
 #endif
   return;
 }}
-#endif
-#ifdef TRITON_SHARED_SPARSE_MLA
-kunpeng_sparse_mla_begin_launch();
 #endif
 for (int64_t i = 0; i < N; ++i) {{
   int x = i % gridX;
