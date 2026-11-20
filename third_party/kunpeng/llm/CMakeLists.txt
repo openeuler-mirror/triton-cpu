@@ -23,10 +23,12 @@ if (NOT KUNPENG_LLM_HAVE_SME_COMPILER)
   return()
 endif()
 
-add_library(kunpeng_llm SHARED flash_attn_fwd_sme.c flash_mla_sme.c)
+add_library(kunpeng_llm SHARED flash_attn_fwd_sme.c flash_mla_sme.c sparse_mla_fwd_sme.cpp)
 target_compile_options(kunpeng_llm PRIVATE -O3 -march=armv9-a+sme+sve2+bf16)
 target_link_options(kunpeng_llm PRIVATE -rtlib=compiler-rt)
 target_link_libraries(kunpeng_llm PRIVATE m)
 set_target_properties(kunpeng_llm PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
   C_VISIBILITY_PRESET default)
+
+target_compile_features(kunpeng_llm PRIVATE cxx_std_17)

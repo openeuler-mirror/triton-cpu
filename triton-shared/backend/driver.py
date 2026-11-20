@@ -60,17 +60,18 @@ _kunpeng_llm_lib_path = os.path.join(str(_triton_C_dir), "libkunpeng_llm.so")
 _KUNPENG_LLM_SYMBOL_PREFIXES = (
     b"kunpeng_flash_attention_",
     b"kunpeng_flash_mla_",
+    b"kunpeng_sparse_mla_",
 )
 
 
 def _kunpeng_llm_launcher_args(kernel_obj: bytes) -> list:
     """Extra launcher compile/link arguments for a kernel calling into
     libkunpeng_llm.so (none otherwise)."""
-    if not os.path.exists(_kunpeng_llm_lib_path) or not any(
-        prefix in kernel_obj for prefix in _KUNPENG_LLM_SYMBOL_PREFIXES
-    ):
+    if not os.path.exists(_kunpeng_llm_lib_path):
         return []
-    return ["-DTRITON_SHARED_KUNPENG_LLM", "-lkunpeng_llm"]
+    if any(prefix in kernel_obj for prefix in _KUNPENG_LLM_SYMBOL_PREFIXES):
+        return ["-DTRITON_SHARED_KUNPENG_LLM", "-lkunpeng_llm"]
+    return []
 
 # -------------------- Launcher ----------------------------
 def _ty_to_cpp(ty):
@@ -396,7 +397,6 @@ def _launcher_cache_key(src, kernel_obj, kunpeng_llm_args=()):
     acl_enabled = os.environ.get("TRITON_SHARED_ENABLE_ACL_OPT", "1") != "0"
     linalg_enabled = os.environ.get("TRITON_SHARED_ENABLE_LINALG_TILING_PIPELINE", "0") == "1"
     modes = bytes([acl_enabled, linalg_enabled])
-    # Preserve upstream's link-argument identity for Kunpeng LLM launchers.
     link_flags = " ".join(kunpeng_llm_args).encode("utf-8")
     return hashlib.md5(src.encode("utf-8") + kernel_obj + link_flags + modes + _launcher_implementation_hash()).hexdigest()
 

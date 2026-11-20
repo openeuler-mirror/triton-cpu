@@ -6,6 +6,7 @@ add_triton_library(TritonToKunpengLLM
 
   LINK_LIBS PUBLIC
   MLIRArithDialect
+  MLIRLLVMDialect
   MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRMathDialect

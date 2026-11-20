@@ -27,6 +27,8 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/TypeUtilities.h"
@@ -275,7 +277,8 @@ struct Address {
   Poly offset;
 };
 
-static std::optional<Address> evalAddress(PolyEval &pe, Value ptr,
+template <typename Evaluator>
+static std::optional<Address> evalAddress(Evaluator &pe, Value ptr,
                                           const void *lane) {
   Poly off;
   while (true) {
@@ -2646,15 +2649,422 @@ void FlashMLAMatcher::rewrite() {
   }
 }
 
+// Recognize the shared-KV BF16 forward graph before structured lowering.
+// Validate its addresses, masking, online-softmax recurrence and epilogue;
+// preserve unsupported programs and outline a fallback for runtime rejection.
+static bool lowerSparseMLA(triton::FuncOp f) {
+  auto a = f.getArguments();
+  if (a.size() != 19 || !llvm::hasSingleElement(f.getBody()))
+    return false;
+  Builder types(f.getContext());
+  for (unsigned i = 0; i < a.size(); ++i) {
+    if (i < 5) {
+      auto p = dyn_cast<triton::PointerType>(a[i].getType());
+      if (!p || p.getPointeeType() != (i == 2 ? Type(types.getI32Type())
+                                              : Type(types.getBF16Type())))
+        return false;
+    } else if (!a[i].getType().isInteger(32))
+      return false;
+  }
+  SmallVector<triton::DotOp> dot;
+  SmallVector<triton::LoadOp> load;
+  SmallVector<triton::StoreOp> store;
+  SmallVector<scf::ForOp> loops;
+  SmallVector<scf::IfOp> guards;
+  SmallVector<math::Exp2Op> exp;
+  SmallVector<math::Log2Op> log;
+  Value pid[3];
+  bool effects = false;
+  f.walk([&](Operation *op) {
+    if (auto x = dyn_cast<triton::DotOp>(op))
+      dot.push_back(x);
+    if (auto x = dyn_cast<triton::LoadOp>(op))
+      load.push_back(x);
+    if (auto x = dyn_cast<triton::StoreOp>(op))
+      store.push_back(x);
+    if (auto x = dyn_cast<scf::ForOp>(op))
+      loops.push_back(x);
+    if (auto x = dyn_cast<scf::IfOp>(op))
+      guards.push_back(x);
+    if (auto x = dyn_cast<math::Exp2Op>(op))
+      exp.push_back(x);
+    if (auto x = dyn_cast<math::Log2Op>(op))
+      log.push_back(x);
+    if (auto x = dyn_cast<triton::GetProgramIdOp>(op))
+      pid[unsigned(x.getAxis())] = x;
+    if (isa<CallOpInterface>(op))
+      effects = true;
+    if (op != f.getOperation() && !isa<triton::LoadOp, triton::StoreOp>(op) &&
+        !op->hasTrait<OpTrait::IsTerminator>() &&
+        !op->hasTrait<OpTrait::HasRecursiveMemoryEffects>() &&
+        !isMemoryEffectFree(op))
+      effects = true;
+  });
+  if (effects || dot.size() != 3 || load.size() != 5 || store.size() != 2 ||
+      loops.size() != 1 || guards.size() != 1 || exp.size() != 2 ||
+      log.size() != 1 || !pid[0] || !pid[1] || !pid[2])
+    return false;
+  auto shape = [](Value v, ArrayRef<int64_t> s) {
+    auto t = dyn_cast<RankedTensorType>(v.getType());
+    return t && t.getShape() == s;
+  };
+  if (!shape(dot[0].getA(), {64, 512}) || !shape(dot[0].getB(), {512, 32}) ||
+      !shape(dot[1].getA(), {64, 64}) || !shape(dot[1].getB(), {64, 32}) ||
+      dot[1].getC() != dot[0] || dot[2].getA() != exp[0])
+    return false;
+  auto trans = dot[2].getB().getDefiningOp<triton::TransOp>();
+  if (!trans || trans.getSrc() != dot[0].getB())
+    return false;
+  auto unwrap = [](Value v) -> triton::LoadOp {
+    auto e = v.getDefiningOp<arith::ExtFOp>();
+    return e ? e.getIn().getDefiningOp<triton::LoadOp>() : nullptr;
+  };
+  auto q = unwrap(dot[0].getA()), k = unwrap(dot[0].getB()),
+       tq = unwrap(dot[1].getA()), tk = unwrap(dot[1].getB());
+  if (!q || !k || !tq || !tk)
+    return false;
+  for (auto input : {q, k, tq, tk})
+    if (!input.getOther() || !isFloatSplat(input.getOther(), 0))
+      return false;
+  triton::LoadOp ids;
+  for (auto x : load)
+    if (x != q && x != k && x != tq && x != tk)
+      ids = x;
+  if (!ids)
+    return false;
+  auto loop = loops[0];
+  auto guard = guards[0];
+  auto integer = [](Value v) -> std::optional<int64_t> {
+    Attribute at;
+    if (!matchPattern(v, m_Constant(&at)))
+      return {};
+    if (auto x = dyn_cast<IntegerAttr>(at))
+      return x.getInt();
+    if (auto x = dyn_cast<DenseIntElementsAttr>(at); x && x.isSplat())
+      return x.getSplatValue<APInt>().getSExtValue();
+    return {};
+  };
+  auto mask = ids.getMask().getDefiningOp<arith::CmpIOp>();
+  if (!mask || mask.getPredicate() != arith::CmpIPredicate::slt)
+    return false;
+  int64_t topk = integer(mask.getRhs()).value_or(0);
+  if (topk <= 0 || topk % 32 || topk > 4096 ||
+      integer(loop.getLowerBound()) != 0 || integer(loop.getStep()) != 1 ||
+      integer(loop.getUpperBound()) != topk / 32 ||
+      !isFloatSplat(loop.getInitArgs()[0], -INFINITY) ||
+      !isFloatSplat(loop.getInitArgs()[1], 1) ||
+      !isFloatSplat(loop.getInitArgs()[2], 0))
+    return false;
+  class GatherEval : public PolyEval {
+    Value ids;
+
+  public:
+    GatherEval(Value v) : ids(v) {}
+    std::optional<Poly> tensor(Value v, const void *lane) {
+      if (v == ids)
+        return Poly::atom(v);
+      if (!isa<RankedTensorType>(v.getType()))
+        return scalar(v);
+      if (auto c = getIntSplat(v))
+        return Poly::cst(*c);
+      auto *op = v.getDefiningOp();
+      if (!op)
+        return {};
+      if (auto x = dyn_cast<triton::MakeRangeOp>(op))
+        return Poly::cst(x.getStart()) + Poly::atom(lane);
+      if (auto x = dyn_cast<triton::SplatOp>(op))
+        return scalar(x.getSrc());
+      if (auto x = dyn_cast<triton::ExpandDimsOp>(op))
+        return tensor(x.getSrc(), x.getAxis() == 1 ? DIM_I : DIM_J);
+      if (auto x = dyn_cast<triton::BroadcastOp>(op))
+        return tensor(x.getSrc(), lane);
+      if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(op)) {
+        auto l = tensor(op->getOperand(0), lane),
+             r = tensor(op->getOperand(1), lane);
+        if (!l || !r)
+          return {};
+        if (isa<arith::AddIOp>(op))
+          return *l + *r;
+        if (isa<arith::SubIOp>(op))
+          return *l - *r;
+        return *l * *r;
+      }
+      return {};
+    }
+  } pe(ids);
+  auto atom = [](Value v) { return Poly::atom(v); };
+  Poly batch = atom(pid[0]), row = atom(pid[1]), head = atom(pid[2]),
+       i = Poly::atom(DIM_I), j = Poly::atom(DIM_J);
+  Poly group;
+  bool found = false;
+  f.walk([&](arith::DivSIOp x) {
+    if (x.getLhs() == pid[2] && integer(x.getRhs()) == 128) {
+      group = atom(x);
+      found = true;
+    }
+  });
+  if (!found)
+    return false;
+  auto ptr = [&](Value v, unsigned base, Poly expected) {
+    auto addr = evalAddress(pe, v, DIM_I);
+    if (!addr)
+      return false;
+    while (auto add = addr->base.getDefiningOp<triton::AddPtrOp>()) {
+      auto n = pe.scalar(add.getOffset());
+      if (!n)
+        return false;
+      addr->offset = addr->offset + *n;
+      addr->base = add.getPtr();
+    }
+    return addr->base == a[base] && addr->offset == expected;
+  };
+  Poly qb =
+      batch * atom(a[5]) + row * atom(a[7]) + head * Poly::cst(64) * atom(a[6]);
+  Poly kb = batch * atom(a[8]) + group * atom(a[9]);
+  if (!ptr(q.getPtr(), 0, qb + i * atom(a[6]) + j) ||
+      !ptr(tq.getPtr(), 0, qb + i * atom(a[6]) + j + Poly::cst(512)) ||
+      !ptr(k.getPtr(), 1, kb + i + atom(ids) * atom(a[10])) ||
+      !ptr(tk.getPtr(), 1, kb + i + Poly::cst(512) + atom(ids) * atom(a[10])) ||
+      !ptr(ids.getPtr(), 2,
+           batch * atom(a[11]) + row * atom(a[13]) + group * atom(a[12]) +
+               atom(loop.getInductionVar()) * Poly::cst(32) + i) ||
+      !ptr(store[0].getPtr(), 3,
+           batch * atom(a[14]) + row * atom(a[16]) +
+               (head * Poly::cst(64) + i) * atom(a[15]) + j) ||
+      !ptr(store[1].getPtr(), 4,
+           batch * atom(a[17]) + row * atom(a[18]) + head * Poly::cst(64) + i))
+    return false;
+  auto mul = dot[1]->hasOneUse()
+                 ? dyn_cast<arith::MulFOp>(*dot[1]->user_begin())
+                 : nullptr;
+  auto select = mul && mul->hasOneUse()
+                    ? dyn_cast<arith::SelectOp>(*mul->user_begin())
+                    : nullptr;
+  auto delta = exp[0].getOperand().getDefiningOp<arith::SubFOp>();
+  auto alpha = exp[1].getOperand().getDefiningOp<arith::SubFOp>();
+  if (!mul || !select || select.getTrueValue() != mul ||
+      !isFloatSplat(select.getFalseValue(), -INFINITY) || !delta ||
+      delta.getLhs() != select || !alpha ||
+      alpha.getLhs() != loop.getRegionIterArgs()[0] ||
+      rowVector(delta.getRhs()) != alpha.getRhs())
+    return false;
+  auto scaleValue = otherOperand<arith::MulFOp>(mul, dot[1]);
+  auto scale = getFloatSplat(scaleValue);
+  if (!scale)
+    return false;
+  auto gc = guard.getCondition().getDefiningOp<arith::CmpIOp>();
+  auto guardStart = gc ? pe.scalar(gc.getLhs()) : std::nullopt;
+  auto indexStart = pe.tensor(mask.getLhs(), DIM_I);
+  if (!gc || gc.getPredicate() != arith::CmpIPredicate::sle ||
+      gc.getRhs() != pid[1] || !guardStart ||
+      *guardStart != atom(loop.getInductionVar()) * Poly::cst(32) ||
+      !indexStart ||
+      *indexStart != atom(loop.getInductionVar()) * Poly::cst(32) + i ||
+      ids->getParentOp() != loop || guard->getParentOp() != loop ||
+      dot[0]->getParentOp() != guard || dot[1]->getParentOp() != guard ||
+      dot[2]->getParentOp() != guard || !guard.elseBlock())
+    return false;
+  auto iter = loop.getRegionIterArgs();
+  auto yes = cast<scf::YieldOp>(guard.thenBlock()->getTerminator());
+  auto no = cast<scf::YieldOp>(guard.elseBlock()->getTerminator());
+  auto end = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  Value maximum = otherOperand<arith::MaximumFOp>(alpha.getRhs(), iter[0]);
+  if (!maximum)
+    maximum = otherOperand<arith::MaxNumFOp>(alpha.getRhs(), iter[0]);
+  auto den = yes.getOperand(1).getDefiningOp<arith::AddFOp>();
+  Value scaledDen;
+  if (den)
+    for (Value v : den->getOperands())
+      if (otherOperand<arith::MulFOp>(v, iter[1]) == exp[1])
+        scaledDen = v;
+  Value accScale = otherOperand<arith::MulFOp>(dot[2].getC(), iter[2]);
+  if (!isFloatSplat(dot[0].getC(), 0) || !maximum ||
+      !isReduce(maximum, select, true) || !scaledDen ||
+      !isReduce(otherOperand<arith::AddFOp>(yes.getOperand(1), scaledDen),
+                exp[0], false) ||
+      !accScale || rowVector(accScale) != exp[1] ||
+      yes.getOperand(0) != alpha.getRhs() || yes.getOperand(2) != dot[2] ||
+      !llvm::equal(no.getOperands(), iter) ||
+      !llvm::equal(end.getOperands(), guard.getResults()) ||
+      log[0].getOperand() != loop.getResult(1) || integer(ids.getOther()) != -1)
+    return false;
+  Value remainder;
+  f.walk([&](arith::RemSIOp x) {
+    if (x.getLhs() == pid[2] && integer(x.getRhs()) == 128)
+      remainder = x;
+  });
+  if (!remainder)
+    return false;
+  struct Bound {
+    arith::CmpIPredicate pred;
+    Poly lhs, rhs;
+  };
+  auto checkMask = [&](Value v, std::initializer_list<Bound> bounds) {
+    SmallVector<Cmp> cs;
+    if (!v || !collectCmps<arith::AndIOp>(v, DIM_I, cs) ||
+        cs.size() != bounds.size())
+      return false;
+    SmallVector<bool> used(bounds.size(), false);
+    for (auto &cmp : cs) {
+      auto l = pe.tensor(cmp.lhs, cmp.lane), r = pe.tensor(cmp.rhs, cmp.lane);
+      bool found = false;
+      unsigned n = 0;
+      for (auto &bound : bounds) {
+        if (!used[n] && l && r && cmp.pred == bound.pred && *l == bound.lhs &&
+            *r == bound.rhs) {
+          used[n] = true;
+          found = true;
+          break;
+        }
+        ++n;
+      }
+      if (!found)
+        return false;
+    }
+    return true;
+  };
+  auto slt = arith::CmpIPredicate::slt;
+  Bound headBound{slt, atom(remainder) * Poly::cst(64) + i, Poly::cst(128)};
+  Bound visible{arith::CmpIPredicate::sle, atom(ids), row};
+  Bound positive{arith::CmpIPredicate::sge, atom(ids), Poly::cst(0)};
+  if (!checkMask(q.getMask(), {headBound, {slt, j, Poly::cst(512)}}) ||
+      !checkMask(tq.getMask(), {headBound, {slt, j, Poly::cst(64)}}) ||
+      !checkMask(k.getMask(), {{slt, i, Poly::cst(512)}, visible, positive}) ||
+      !checkMask(tk.getMask(), {{slt, i, Poly::cst(64)}, visible, positive}) ||
+      !checkMask(select.getCondition(), {visible, positive}) ||
+      !checkMask(store[0].getMask(), {headBound, {slt, j, Poly::cst(512)}}) ||
+      !checkMask(store[1].getMask(), {headBound}))
+    return false;
+  auto output = store[0].getValue().getDefiningOp<arith::TruncFOp>();
+  auto division =
+      output ? output.getIn().getDefiningOp<arith::DivFOp>() : nullptr;
+  auto lse = store[1].getValue().getDefiningOp<arith::TruncFOp>();
+  if (!division || division.getLhs() != loop.getResult(2) ||
+      rowVector(division.getRhs()) != loop.getResult(1) || !lse ||
+      otherOperand<arith::AddFOp>(lse.getIn(), loop.getResult(0)) != log[0])
+    return false;
+
+  auto module = f->getParentOfType<ModuleOp>();
+  auto loc = f.getLoc();
+  OpBuilder b(f);
+  SmallVector<Operation *> original;
+  for (auto &op : f.getBody().front().without_terminator())
+    original.push_back(&op);
+  b.setInsertionPointToStart(&f.getBody().front());
+  auto c = [&](int64_t v) -> Value {
+    return b.create<arith::ConstantIntOp>(loc, v, 32);
+  };
+  Value id[3];
+  for (int d = 0; d < 3; ++d)
+    id[d] = b.create<triton::GetProgramIdOp>(
+        loc, static_cast<triton::ProgramIDDim>(d));
+  Value ok =
+      b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, id[2], c(2));
+  for (auto [slot, value] : {std::pair<int, int>{6, 576},
+                             {9, 576},
+                             {10, 576},
+                             {12, int(topk)},
+                             {13, int(topk)},
+                             {15, 512},
+                             {16, 128 * 512},
+                             {18, 128},
+                             {7, 128 * 576}}) {
+    Value eq = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, a[slot],
+                                       c(value));
+    ok = b.create<arith::AndIOp>(loc, ok, eq);
+  }
+  Value minKV = b.create<arith::DivSIOp>(loc, a[5], c(128));
+  Value enoughKV =
+      b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, a[8], minKV);
+  ok = b.create<arith::AndIOp>(loc, ok, enoughKV);
+  auto attempt = b.create<scf::IfOp>(loc, TypeRange{b.getI32Type()}, ok, true);
+  b.setInsertionPointToStart(&attempt.getThenRegion().front());
+  auto address = [&](int base, int bs, int rs, int hs) -> Value {
+    Value off = b.create<arith::MulIOp>(loc, id[0], a[bs]);
+    if (rs >= 0) {
+      Value r = b.create<arith::MulIOp>(loc, id[1], a[rs]);
+      off = b.create<arith::AddIOp>(loc, off, r);
+    }
+    if (hs) {
+      Value h = b.create<arith::MulIOp>(loc, id[2], c(hs));
+      off = b.create<arith::AddIOp>(loc, off, h);
+    }
+    Value p = b.create<triton::AddPtrOp>(loc, a[base].getType(), a[base], off);
+    return b.create<triton::PtrToIntOp>(loc, b.getI64Type(), p);
+  };
+  SmallVector<Value> args{
+      address(0, 5, 7, 64 * 576),
+      address(1, 8, -1, 0),
+      address(2, 11, 13, 0),
+      address(3, 14, 16, 64 * 512),
+      address(4, 17, 18, 64),
+      id[1],
+      c(topk),
+      b.create<arith::ConstantFloatOp>(
+          loc, APFloat(float(*scale / 1.4426950408889634)), b.getF32Type()),
+      b.create<arith::DivSIOp>(loc, a[5], c(128 * 576))};
+  auto name = "kunpeng_sparse_mla_forward_bf16";
+  auto callee = module.lookupSymbol<func::FuncOp>(name);
+  if (!callee) {
+    OpBuilder mb(module.getBody(), module.getBody()->begin());
+    callee = mb.create<func::FuncOp>(
+        loc, name,
+        b.getFunctionType(ValueRange(args).getTypes(), {b.getI32Type()}));
+    callee.setPrivate();
+  }
+  auto call = b.create<func::CallOp>(loc, callee, args);
+  b.create<scf::YieldOp>(loc, call.getResults());
+  b.setInsertionPointToStart(&attempt.getElseRegion().front());
+  b.create<scf::YieldOp>(loc, c(1));
+  b.setInsertionPointAfter(attempt);
+  Value failed = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne,
+                                         attempt.getResult(0), c(0));
+  auto fallback = b.create<scf::IfOp>(loc, failed, false);
+  SmallVector<Type> ts;
+  for (Value v : a)
+    ts.push_back(v.getType());
+  ts.append(3, b.getI32Type());
+  OpBuilder mb(f);
+  mb.setInsertionPointAfter(f);
+  auto helper = mb.create<func::FuncOp>(loc, f.getName().str() + "_fallback",
+                                        b.getFunctionType(ts, {}));
+  helper.setPrivate();
+  helper->setAttr("llvm.linkage", LLVM::LinkageAttr::get(
+                                      f.getContext(), LLVM::Linkage::Internal));
+  helper->setAttr("passthrough", b.getStrArrayAttr({"noinline"}));
+  auto entry = helper.addEntryBlock();
+  OpBuilder hb(entry, entry->begin());
+  IRMapping mapping;
+  for (unsigned n = 0; n < a.size(); ++n)
+    mapping.map(a[n], entry->getArgument(n));
+  for (unsigned n = 0; n < 3; ++n)
+    mapping.map(pid[n], entry->getArgument(a.size() + n));
+  for (auto *op : original)
+    if (!isa<triton::GetProgramIdOp>(op))
+      hb.clone(*op, mapping);
+  hb.create<func::ReturnOp>(loc);
+  b.setInsertionPoint(fallback.thenBlock()->getTerminator());
+  SmallVector<Value> inputs(a.begin(), a.end());
+  inputs.append(id, id + 3);
+  b.create<func::CallOp>(loc, helper, inputs);
+  for (auto *op : llvm::reverse(original))
+    op->erase();
+  return true;
+}
+
 struct TritonFlashAttentionToKunpengLLMPass
     : public impl::TritonFlashAttentionToKunpengLLMBase<
           TritonFlashAttentionToKunpengLLMPass> {
   void runOnOperation() override {
-    getOperation().walk([](triton::FuncOp f) {
+    SmallVector<triton::FuncOp> functions;
+    getOperation().walk([&](triton::FuncOp f) { functions.push_back(f); });
+    for (auto f : functions) {
+      if (lowerSparseMLA(f))
+        continue;
       FlashAttentionMatcher m(f);
       if (m.match())
         m.rewrite();
-    });
+    }
   }
 };
 
