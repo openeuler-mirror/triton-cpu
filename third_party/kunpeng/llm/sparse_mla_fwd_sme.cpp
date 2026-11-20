@@ -120,6 +120,7 @@ template <typename T> struct ScratchBuffer {
 };
 
 struct KVCache {
+  uint64_t epoch = 0;
   const uint16_t *source = nullptr;
   int rows = 0;
   ScratchBuffer<uint16_t> packed;
@@ -127,11 +128,6 @@ struct KVCache {
 
 // Each worker only reuses packed KV from its current launch.
 static thread_local KVCache dense_cache;
-
-extern "C" __attribute__((visibility("default"))) void
-kunpeng_sparse_mla_begin_launch(void) {
-  dense_cache.source = nullptr;
-}
 
 __arm_locally_streaming __arm_new("za") static void pack_dense(
     const uint16_t *kv, uint16_t *packed, uint16_t *values, int rows) {
@@ -338,13 +334,16 @@ kunpeng_sparse_mla_forward_bf16(const uint16_t *q, const uint16_t *kv,
   const uint16_t *packed_keys = kp, *packed_values = vp;
   if (dense_set) {
     auto &cache = dense_cache;
-    if (cache.source != kv || cache.rows != query_rows) {
+    uint64_t epoch = kunpeng_llm_get_launch_epoch();
+    if (cache.epoch != epoch || cache.source != kv ||
+        cache.rows != query_rows) {
       if (!cache.packed.reserve(query_rows * (576 + 512)))
         return 1;
       auto *data = cache.packed.data.get();
       pack_dense(kv, data, data + query_rows * 576, query_rows);
       cache.source = kv;
       cache.rows = query_rows;
+      cache.epoch = epoch;
     }
     keys = (count + 31) / 32 * 32;
     for (int t = 0; t < keys; ++t)
