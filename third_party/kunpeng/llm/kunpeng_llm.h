@@ -103,14 +103,14 @@ void kunpeng_flash_mla_bf16(const void *q, int64_t q_hs, const void *kv,
 // this library: per-thread caches of packed inputs are dropped across
 // launches, because inputs may be rewritten in place between them.
 void kunpeng_llm_begin_launch(void);
+// Shared launch identity for thread-local packed-input caches.
+uint64_t kunpeng_llm_get_launch_epoch(void);
 
 // Sparse MLA: one query row and 64 heads, DQK=576, DV=512.
 // Returns nonzero when the original Triton program must handle this tile.
 int kunpeng_sparse_mla_forward_bf16(const uint16_t *q, const uint16_t *kv,
     const int32_t *indices, uint16_t *output, uint16_t *lse,
     int row, int topk, float scale, int query_rows);
-// Invalidates sparse MLA packed KV before each sparse MLA launch.
-void kunpeng_sparse_mla_begin_launch(void);
 
 // SME streaming vector length in bytes (64 is required).
 int kunpeng_llm_sme_vector_bytes(void);
